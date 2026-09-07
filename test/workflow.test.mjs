@@ -8,18 +8,24 @@ async function agents(options) {
   return config.agent;
 }
 
-test('native permissions restrict writes and delegation by role', async () => {
+test('native permissions restrict writes, delegation and submit tools by role', async () => {
   const definitions = await agents();
   for (const [name, agent] of Object.entries(definitions)) {
     const p = agent.permission;
     assert.equal(p['*'], 'deny');
     assert.deepEqual(p.read, { '*': 'allow', '*.env': 'deny', '*.env.*': 'deny' });
-    for (const tool of ['glob', 'grep', 'list', 'graph_status']) assert.equal(p[tool], 'allow');
+    for (const tool of ['glob', 'grep', 'list', 'graph_status', 'graph_inspect']) assert.equal(p[tool], 'allow');
     assert.equal(p.external_directory, 'ask');
     assert.equal(p.doom_loop, 'ask');
     assert.equal(p.edit ?? p['*'], name === 'graph-implementer' ? 'ask' : 'deny');
     assert.equal(p.bash ?? p['*'], ['graph-implementer', 'graph-verifier'].includes(name) ? 'ask' : 'deny');
     if (name !== 'graph-orchestrator') assert.equal(p.task ?? p['*'], 'deny');
+    assert.equal(p.graph_submit_plan ?? p['*'], name === 'graph-planner' ? 'allow' : 'deny');
+    assert.equal(p.graph_submit_review ?? p['*'], name === 'graph-plan-critic' ? 'allow' : 'deny');
+    assert.equal(p.graph_submit_change ?? p['*'], name === 'graph-implementer' ? 'allow' : 'deny');
+    assert.equal(p.graph_submit_verification ?? p['*'], name === 'graph-verifier' ? 'allow' : 'deny');
+    assert.equal(p.graph_run_resume ?? p['*'], name === 'graph-orchestrator' ? 'allow' : 'deny');
+    if (['graph-explorer', 'graph-multimodal'].includes(name)) assert.equal(p.graph_submit_findings, 'allow');
   }
   const coordinator = definitions['graph-orchestrator'].permission;
   assert.deepEqual(coordinator.task, { '*': 'deny', ...Object.fromEntries(Object.keys(definitions).filter(n => n !== 'graph-orchestrator').map(n => [n, 'allow'])) });
@@ -27,42 +33,47 @@ test('native permissions restrict writes and delegation by role', async () => {
   assert.equal(coordinator.todowrite, 'allow');
 });
 
-test('orchestrator specifies native handoffs, workflow paths and bounded repair', async () => {
+test('orchestrator prompt states gated handoffs, runner rejections, recovery and bounded repair', async () => {
   const definitions = await agents({ maxAttempts: 2, maxParallel: 5, maxImplementerParallel: 3 });
   const p = definitions['graph-orchestrator'].prompt;
   for (const field of ['description', 'prompt', 'subagent_type', 'task_id']) assert.ok(p.includes(field), field);
-  assert.match(p, /graph-explorer → graph-planner → graph-plan-critic → graph-implementer → graph-verifier/);
-  assert.match(p, /graph-plan-critic → graph-planner/);
-  assert.match(p, /graph-verifier → graph-implementer/);
+  const chain = p.replace(/\([^)]*\)/g, '');
+  assert.match(chain, /graph-explorer\s*→\s*graph-planner\s*→\s*graph-plan-critic\s*→\s*graph-implementer\s*→\s*graph-verifier/);
+  assert.match(p, /RUNNER_REJECTED/);
+  assert.match(p, /graph_run_resume/);
+  assert.match(p, /graph_inspect/);
   assert.match(p, /maxAttempts=2/);
+  assert.match(p, /maxPlanRevisions=2/);
   assert.match(p, /maxParallel=5/);
   assert.match(p, /maxImplementerParallel=3/);
-  assert.match(p, /work package/);
-  assert.match(p, /唯讀/);
   assert.match(p, /單一寫入者/);
   assert.match(p, /plan-only/);
-  assert.match(p, /不重複要求確認/);
-  assert.doesNotMatch(p, /workflow execution is blocked/);
+  assert.match(p, /不宣稱成功/);
 });
 
-test('roles provide distinct evidence contracts and capability limits', async () => {
+test('roles provide distinct evidence contracts, submit duties and capability limits', async () => {
   const definitions = await agents();
   assert.equal(new Set(Object.values(definitions).map(a => a.prompt)).size, 7);
   for (const [name, { prompt }] of Object.entries(definitions)) {
     assert.ok(prompt.includes(name));
-    assert.match(prompt, /advisory/);
+    assert.match(prompt, /runner-gated/);
     assert.match(prompt, /證據/);
     assert.match(prompt, /禁止捏造/);
   }
-  assert.match(definitions['graph-verifier'].prompt, /shell.*寫入/);
-  assert.match(definitions['graph-verifier'].prompt, /重疊/);
-  assert.match(definitions['graph-multimodal'].prompt, /不支援/);
-  assert.match(definitions['graph-planner'].prompt, /並行建議/);
+  assert.match(definitions['graph-planner'].prompt, /graph_submit_plan/);
+  assert.match(definitions['graph-planner'].prompt, /writeScope/);
   assert.match(definitions['graph-planner'].prompt, /maxImplementerParallel=1/);
-  assert.match(definitions['graph-plan-critic'].prompt, /分區/);
-  assert.match(definitions['graph-plan-critic'].prompt, /循序/);
-  assert.match(definitions['graph-implementer'].prompt, /專屬檔案清單/);
+  assert.match(definitions['graph-plan-critic'].prompt, /graph_submit_review/);
+  assert.match(definitions['graph-plan-critic'].prompt, /FAIL/);
+  assert.match(definitions['graph-plan-critic'].prompt, /REVISE/);
+  assert.match(definitions['graph-implementer'].prompt, /graph_submit_change/);
+  assert.match(definitions['graph-implementer'].prompt, /writeScope/);
+  assert.match(definitions['graph-verifier'].prompt, /graph_submit_verification/);
+  assert.match(definitions['graph-verifier'].prompt, /exitCode/);
+  assert.match(definitions['graph-verifier'].prompt, /UNVERIFIED/);
+  assert.match(definitions['graph-explorer'].prompt, /graph_submit_findings/);
+  assert.match(definitions['graph-multimodal'].prompt, /不支援/);
   const { createAgentPrompt } = await import('../src/prompts.mjs');
-  assert.equal(createAgentPrompt('graph-orchestrator', { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1 }), definitions['graph-orchestrator'].prompt);
-  assert.throws(() => createAgentPrompt('unknown', { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1 }), /unknown/i);
+  assert.equal(createAgentPrompt('graph-orchestrator', { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1, maxPlanRevisions: 3 }), definitions['graph-orchestrator'].prompt);
+  assert.throws(() => createAgentPrompt('unknown', { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1, maxPlanRevisions: 3 }), /unknown/i);
 });

@@ -59,7 +59,7 @@ test('packed entry imports and runs outside workspace with declared tool depende
     mkdirSync(path.join(temporary, 'node_modules', '@opencode-ai'), { recursive: true });
     cpSync(sdkRoot, path.join(temporary, 'node_modules', '@opencode-ai', 'plugin'), { recursive: true, dereference: true });
     cpSync(zodRoot, path.join(temporary, 'node_modules', 'zod'), { recursive: true, dereference: true });
-    const check = spawnSync(process.execPath, ['--input-type=module', '-e', "const {default:plugin}=await import('./package/src/index.mjs'); const hooks=await plugin({}); const config={}; await hooks.config(config); if(Object.keys(config.agent).length!==7)throw Error('agents'); const status=JSON.parse(await hooks.tool.graph_status.execute({})); if(status.runtimeAvailable!==true||status.workflowMode!=='advisory'||status.limitsEnforced!==false||status.enforcementAttested!==false)throw Error('status');"], { cwd: temporary, encoding: 'utf8', env: { ...process.env, NODE_PATH: '' } });
+    const check = spawnSync(process.execPath, ['--input-type=module', '-e', "const {default:plugin}=await import('./package/src/index.mjs'); const hooks=await plugin({}); const config={}; await hooks.config(config); if(Object.keys(config.agent).length!==7)throw Error('agents'); const status=JSON.parse(await hooks.tool.graph_status.execute({})); if(status.runtimeAvailable!==true||status.workflowMode!=='gated'||status.limitsEnforced!==true||status.managedRuntimeStatus!=='available'||status.enforcementAttested!==false)throw Error('status');"], { cwd: temporary, encoding: 'utf8', env: { ...process.env, NODE_PATH: '' } });
     assert.equal(check.status, 0, check.stderr);
   } finally {
     rmSync(temporary, { recursive: true, force: true });
