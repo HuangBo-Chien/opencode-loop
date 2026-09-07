@@ -66,8 +66,8 @@ test('namespace collisions reject atomically without replacing existing definiti
 
 test('invalid options are rejected even when disabled', async () => {
   const { default: plugin } = await load();
-  const invalid = [null, [], 'enabled', { extra: true }, { enabled: 'false' }, { setDefaultAgent: 1 }, { maxAttempts: 0 }, { maxAttempts: 11 }, { maxAttempts: 1.2 }, { maxParallel: 0 }, { maxParallel: 17 }, { maxParallel: Infinity }, { models: null }, { models: [] }, { models: { build: 'v/m' } }, { models: { 'graph-planner': '' } }, { models: { 'graph-planner': ' model ' } }, { models: { 'graph-planner': () => {} } }, { enabled: false, injectAuthority() {} }];
-  for (const options of invalid) await assert.rejects(plugin({}, options), /option|model|maxAttempts|maxParallel|enabled|setDefaultAgent/i);
+  const invalid = [null, [], 'enabled', { extra: true }, { enabled: 'false' }, { setDefaultAgent: 1 }, { maxAttempts: 0 }, { maxAttempts: 11 }, { maxAttempts: 1.2 }, { maxParallel: 0 }, { maxParallel: 17 }, { maxParallel: Infinity }, { maxImplementerParallel: 0 }, { maxImplementerParallel: 5 }, { maxImplementerParallel: 1.5 }, { models: null }, { models: [] }, { models: { build: 'v/m' } }, { models: { 'graph-planner': '' } }, { models: { 'graph-planner': ' model ' } }, { models: { 'graph-planner': () => {} } }, { enabled: false, injectAuthority() {} }];
+  for (const options of invalid) await assert.rejects(plugin({}, options), /option|model|maxAttempts|maxParallel|maxImplementerParallel|enabled|setDefaultAgent/i);
 });
 
 test('status is read-only, truthful, stable and does not expose host secrets or developer paths', async () => {
@@ -75,14 +75,14 @@ test('status is read-only, truthful, stable and does not expose host secrets or 
   const hooks = await plugin({ directory: 'C:/private/project', secret: 'host-secret' });
   const output = await hooks.tool.graph_status.execute({}, new Proxy({}, { get() { throw new Error('host effects forbidden'); } }));
   const status = JSON.parse(output);
-  assert.equal(status.version, '0.1.0-alpha.2');
+  assert.equal(status.version, '0.1.0-alpha.3');
   assert.equal(status.enforcementScope, 'GRAPH_MANAGED_SESSIONS');
   assert.equal(status.enforcementAttested, false);
   assert.equal(status.runtimeAvailable, true);
   assert.equal(status.workflowMode, 'advisory');
   assert.equal(status.limitsEnforced, false);
   assert.equal(status.managedRuntimeStatus, 'unavailable');
-  assert.deepEqual(status.limits, { maxAttempts: 3, maxParallel: 4 });
+  assert.deepEqual(status.limits, { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1 });
   assert.match(status.reason, /adapter/i);
   assert.doesNotMatch(output, /private|host-secret|b0420/);
   assert.deepEqual(hooks.tool.graph_status.args, {});

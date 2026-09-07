@@ -11,7 +11,7 @@ function record(value, name) {
 
 export function parseOptions(input = {}) {
   record(input, 'plugin');
-  const defaults = { enabled: true, setDefaultAgent: false, models: {}, maxAttempts: 3, maxParallel: 4 };
+  const defaults = { enabled: true, setDefaultAgent: false, models: {}, maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1 };
   for (const key of Reflect.ownKeys(input)) {
     if (typeof key !== 'string' || !Object.hasOwn(defaults, key)) throw new TypeError(`Unknown plugin option: ${String(key)}`);
     if (!Object.hasOwn(Object.getOwnPropertyDescriptor(input, key), 'value')) throw new TypeError('Plugin options must contain values, not getters');
@@ -20,7 +20,7 @@ export function parseOptions(input = {}) {
   for (const name of ['enabled', 'setDefaultAgent']) {
     if (typeof options[name] !== 'boolean') throw new TypeError(`${name} must be a boolean`);
   }
-  for (const [name, upper] of [['maxAttempts', 10], ['maxParallel', 16]]) {
+  for (const [name, upper] of [['maxAttempts', 10], ['maxParallel', 16], ['maxImplementerParallel', 4]]) {
     if (!Number.isInteger(options[name]) || options[name] < 1 || options[name] > upper) throw new TypeError(`${name} must be an integer from 1 to ${upper}`);
   }
   record(options.models, 'models');

@@ -1,19 +1,19 @@
 # opencode-loop
 
-`0.1.0-alpha.2` is a usable seven-agent advisory workflow for the official OpenCode `1.18.25` plugin API. It uses native `task` dispatch and native permissions. The package name is provisional; no public npm release is claimed.
+`0.1.0-alpha.3` is a usable seven-agent advisory workflow for the official OpenCode `1.18.25` plugin API. It uses native `task` dispatch and native permissions. The package name is provisional; no public npm release is claimed.
 
-The coordinator routes read-only requests through exploration (with optional multimodal analysis), then answers. For changes it requests exploration → planning → plan critique → implementation → independent verification, returning critique failures to planning and verification failures to implementation. A plan-only request stops before implementation. Explicitly authorized implementation does not require a redundant conversational confirmation; native permission prompts still apply.
+The coordinator routes read-only requests through exploration (with optional multimodal analysis), then answers. For changes it requests exploration → planning → plan critique → implementation → independent verification, returning critique failures to planning and verification failures to implementation. Implementation is single-writer by default; when `maxImplementerParallel` is enabled, the planner may partition the plan into work packages with exclusive file lists and issue a parallelism recommendation, the plan critic independently reviews partition safety before approving a parallel count, and only then may the coordinator dispatch multiple implementers in one message (bash deferred to the verifier stage). A plan-only request stops before implementation. Explicitly authorized implementation does not require a redundant conversational confirmation; native permission prompts still apply.
 
-Workflow order, retry counts, parallelism and single-writer behavior are **prompt guidance**. The strict production run adapter is unavailable. `graph_status` reports `workflowMode: "advisory"`, `runtimeAvailable: true`, `managedRuntimeStatus: "unavailable"`, `enforcementAttested: false` and `limitsEnforced: false`. `GRAPH_MANAGED_SESSIONS` remains a design target, not an enforcement claim. Native tool availability also depends on the host, model and user permission settings.
+Workflow order, retry counts, parallelism (including implementer partitioning, file-set disjointness and bash deferral) and single-writer behavior are **prompt guidance**. The strict production run adapter is unavailable. `graph_status` reports `workflowMode: "advisory"`, `runtimeAvailable: true`, `managedRuntimeStatus: "unavailable"`, `enforcementAttested: false` and `limitsEnforced: false`. `GRAPH_MANAGED_SESSIONS` remains a design target, not an enforcement claim. Native tool availability also depends on the host, model and user permission settings.
 
 ## Project-local installation
 
-Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.1.0-alpha.2.tgz`; these commands do not publish or install globally.
+Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.1.0-alpha.3.tgz`; these commands do not publish or install globally.
 
 From the project where you want to use the plugin, install that local tarball:
 
 ```powershell
-npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.1.0-alpha.2.tgz
+npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.1.0-alpha.3.tgz
 node --input-type=module -e "import {pathToFileURL} from 'node:url'; import path from 'node:path'; console.log(pathToFileURL(path.resolve('node_modules/opencode-loop/src/index.mjs')).href)"
 ```
 
@@ -25,7 +25,8 @@ Use the printed absolute file URL in the project's `opencode.json` plugin tuple 
   "plugin": [
     ["file:///C:/path/to/project/node_modules/opencode-loop/src/index.mjs", {
       "maxAttempts": 3,
-      "maxParallel": 4
+      "maxParallel": 4,
+      "maxImplementerParallel": 2
     }]
   ]
 }
@@ -41,7 +42,7 @@ Start OpenCode in that project and select `graph-orchestrator`. Example requests
 | `graph-explorer` | subagent | Read source and gather evidence | `webfetch`, `websearch` ask |
 | `graph-planner` | subagent | Plan scoped changes and acceptance checks | `webfetch`, `websearch` ask |
 | `graph-plan-critic` | subagent | Review plan and request revisions | `webfetch`, `websearch` ask |
-| `graph-implementer` | subagent | Sole planned writer | `edit`, `bash` ask |
+| `graph-implementer` | subagent | Planned writer (single by default; parallel per critic-approved disjoint partition) | `edit`, `bash` ask |
 | `graph-verifier` | subagent | Independently validate results | `bash` ask; no edit |
 | `graph-multimodal` | subagent | Analyze supported visual inputs honestly | `webfetch`, `websearch` ask |
 
@@ -60,12 +61,15 @@ The default plugin function accepts `(context, options)`. Supported options are 
 | `models` | `{}` | Map of seven full agent names to nonempty model strings, max 256 characters, no surrounding whitespace or control characters |
 | `maxAttempts` | `3` | Integer 1–10; prompt-guided maximum attempts per critique or implementation/verification loop, including the first attempt |
 | `maxParallel` | `4` | Integer 1–16; prompt-guided maximum independent read-only tasks |
+| `maxImplementerParallel` | `1` | Integer 1–4; prompt-guided maximum parallel implementer work packages. Requires a planner partition with exclusive file lists, a planner parallelism recommendation and plan-critic approval; implementer bash is deferred to the verifier stage while parallel. `1` keeps strict single-writer behavior |
 
-Unknown keys, callbacks and invalid values fail initialization, including when disabled. Options are copied at initialization. These limits are included in the coordinator prompt and status; they are not enforced by a scheduler. The package entry exports only the default plugin function. Internal modules are not supported public APIs, and there are no imports from developer-global scripts or settings.
+Unknown keys, callbacks and invalid values fail initialization, including when disabled. Options are copied at initialization. These limits are included in the coordinator and planner prompts and the status; they are not enforced by a scheduler. The package entry exports only the default plugin function. Internal modules are not supported public APIs, and there are no imports from developer-global scripts or settings.
 
 ## Verification limits
 
 Unit tests cover registration, native preservation, collisions, options, native permission definitions, role prompt contracts and truthful status. A relocation test packs and unpacks the real tarball and imports it with the real SDK/tool dependency closure, without workspace links. Prompt assertions verify supplied instructions, not model compliance or host permission behavior. Real-host workflow acceptance is separate evidence.
+
+Parallel implementation safety is likewise prompt-guided: partition disjointness, bash deferral and file-set confinement are instructions, not mechanical guarantees. A misjudged partition can still produce conflicting writes (last write wins). The verifier's post-hoc overlap detection across packages is the safety net, and detected conflicts fall back to single-writer repair. Parallel dispatch also depends on the host model emitting multiple `task` calls in one message, and permission prompts and token usage scale with the parallel count.
 
 An isolated official OpenCode 1.18.25 host passed scripted-provider integration: plugin status, six actual child sessions and native reads, an edit held until a native once response, a rejected edit leaving its file unchanged, and an explorer edit attempt blocked because its tool was unavailable. The provider was a local deterministic fixture, not a real language model. This verifies those host/tool integration paths, not real-model reasoning, visual understanding, every shell behavior, or strict graph enforcement. No user API credentials or daily profile were used.
 

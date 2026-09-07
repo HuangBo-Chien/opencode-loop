@@ -17,7 +17,7 @@ export function createStatusTool(options) {
         managedRuntimeStatus: 'unavailable',
         reason: 'Native task advisory workflow is available. The strict production run adapter is unavailable; workflow order and limits are prompt-guided, not mechanically enforced. Scope is a design target, not an attested enforcement guarantee.',
         limitsEnforced: false,
-        limits: { maxAttempts: options.maxAttempts, maxParallel: options.maxParallel },
+        limits: { maxAttempts: options.maxAttempts, maxParallel: options.maxParallel, maxImplementerParallel: options.maxImplementerParallel },
       });
     },
   });

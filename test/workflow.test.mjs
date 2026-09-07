@@ -28,7 +28,7 @@ test('native permissions restrict writes and delegation by role', async () => {
 });
 
 test('orchestrator specifies native handoffs, workflow paths and bounded repair', async () => {
-  const definitions = await agents({ maxAttempts: 2, maxParallel: 5 });
+  const definitions = await agents({ maxAttempts: 2, maxParallel: 5, maxImplementerParallel: 3 });
   const p = definitions['graph-orchestrator'].prompt;
   for (const field of ['description', 'prompt', 'subagent_type', 'task_id']) assert.ok(p.includes(field), field);
   assert.match(p, /graph-explorer → graph-planner → graph-plan-critic → graph-implementer → graph-verifier/);
@@ -36,6 +36,8 @@ test('orchestrator specifies native handoffs, workflow paths and bounded repair'
   assert.match(p, /graph-verifier → graph-implementer/);
   assert.match(p, /maxAttempts=2/);
   assert.match(p, /maxParallel=5/);
+  assert.match(p, /maxImplementerParallel=3/);
+  assert.match(p, /work package/);
   assert.match(p, /唯讀/);
   assert.match(p, /單一寫入者/);
   assert.match(p, /plan-only/);
@@ -53,8 +55,14 @@ test('roles provide distinct evidence contracts and capability limits', async ()
     assert.match(prompt, /禁止捏造/);
   }
   assert.match(definitions['graph-verifier'].prompt, /shell.*寫入/);
+  assert.match(definitions['graph-verifier'].prompt, /重疊/);
   assert.match(definitions['graph-multimodal'].prompt, /不支援/);
+  assert.match(definitions['graph-planner'].prompt, /並行建議/);
+  assert.match(definitions['graph-planner'].prompt, /maxImplementerParallel=1/);
+  assert.match(definitions['graph-plan-critic'].prompt, /分區/);
+  assert.match(definitions['graph-plan-critic'].prompt, /循序/);
+  assert.match(definitions['graph-implementer'].prompt, /專屬檔案清單/);
   const { createAgentPrompt } = await import('../src/prompts.mjs');
-  assert.equal(createAgentPrompt('graph-orchestrator', { maxAttempts: 3, maxParallel: 4 }), definitions['graph-orchestrator'].prompt);
-  assert.throws(() => createAgentPrompt('unknown', { maxAttempts: 3, maxParallel: 4 }), /unknown/i);
+  assert.equal(createAgentPrompt('graph-orchestrator', { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1 }), definitions['graph-orchestrator'].prompt);
+  assert.throws(() => createAgentPrompt('unknown', { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1 }), /unknown/i);
 });
