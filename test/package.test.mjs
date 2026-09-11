@@ -66,7 +66,8 @@ test('packed entry imports and runs outside workspace with declared tool depende
     const prefix = process.platform === 'win32' ? [npmCli] : [];
     const packed = spawnSync(npm, [...prefix, 'pack', '--ignore-scripts', '--json', '--pack-destination', temporary], { cwd: root, encoding: 'utf8' });
     assert.equal(packed.status, 0, packed.stderr);
-    const info = JSON.parse(packed.stdout)[0];
+    const parsed = JSON.parse(packed.stdout);
+    const info = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0];
     assert.equal(info.filename, 'opencode-loop-0.3.0-alpha.1.tgz');
     assert.equal(info.version, '0.3.0-alpha.1');
     assert.deepEqual(
