@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createRunStore } from '../src/run-state.mjs';
+import { createRunStore, newRun } from '../src/run-state.mjs';
 import { createRunner } from '../src/runner.mjs';
 import { createSubmitTools } from '../src/submit.mjs';
 import { createEnforcement } from '../src/enforcement.mjs';
@@ -20,7 +20,8 @@ function harness(worktree) {
   const store = createRunStore({ worktree, stateDirectory: '.opencode-loop' });
   const runner = createRunner({ maxAttempts: 3, maxPlanRevisions: 2 });
   const bindings = new Map();
-  const enforcement = createEnforcement({ settings: { worktree }, store, runner, bindings });
+  const journal = { enabled: true, includeUserRequest: true, semanticSearch: true, maxUserRequestChars: 8000 };
+  const enforcement = createEnforcement({ settings: { worktree, journal }, store, runner, bindings });
   const { tools } = createSubmitTools({ store, runner, bindings, worktree });
   return { store, runner, bindings, enforcement, tools };
 }
@@ -43,6 +44,230 @@ async function childIdle(h, sessionId) {
 function ctx(h, sessionId, agent) {
   return { sessionID: sessionId, messageID: 'm1', agent, directory: '/w', worktree: '/w', abort: new AbortController().signal, metadata() {}, ask: async () => {} };
 }
+
+test('only the first graph-orchestrator root request is captured', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-request-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  let h = harness(dir);
+
+  await h.enforcement.onChatMessage(
+    { sessionID: 'subagent-before-root', agent: 'graph-planner' },
+    { parts: [{ type: 'text', text: 'Subagent content must not create a run.' }] },
+  );
+  assert.equal(h.store.getRun('subagent-before-root'), null);
+
+  await h.enforcement.onChatMessage(
+    { sessionID: 'root', agent: 'graph-orchestrator' },
+    { parts: [
+      { type: 'text', text: '  Build the feature\r\nwith token=secret-value  ' },
+      { type: 'file', filename: 'ignored.txt', data: 'attachment-secret' },
+    ] },
+  );
+  const first = structuredClone(h.store.getRun('root').request);
+  assert.equal(first.text, 'Build the feature\nwith token=[REDACTED]');
+  assert.equal(first.truncated, false);
+  assert.equal(first.redactions, 1);
+  assert.equal(typeof first.capturedAt, 'string');
+  assert.ok(Number.isFinite(Date.parse(first.capturedAt)));
+  assert.equal(h.store.getRun('root').requestCaptureCompleted, true);
+
+  await h.enforcement.onChatMessage(
+    { sessionID: 'root', agent: 'graph-orchestrator' },
+    { parts: [{ type: 'text', text: 'Later root request must not replace the first.' }] },
+  );
+  await h.enforcement.onChatMessage(
+    { sessionID: 'child', agent: 'graph-implementer' },
+    { parts: [{ type: 'text', text: 'Subagent request must not replace the first.' }] },
+  );
+  assert.deepEqual(h.store.getRun('root').request, first);
+
+  await h.store.releaseRun('root');
+  h = harness(dir);
+  await h.enforcement.onChatMessage(
+    { sessionID: 'root', agent: 'graph-orchestrator' },
+    { parts: [{ type: 'text', text: 'A request after restart must not replace the first.' }] },
+  );
+  assert.deepEqual(h.store.getRun('root').request, first);
+});
+
+test('request capture hook completes without inspecting a part after the raw cap', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-request-cap-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  const rawCap = 8000 + 4096;
+  const unread = {};
+  Object.defineProperties(unread, {
+    type: {
+      get() { throw new Error('type beyond the bounded raw cap must not be read'); },
+    },
+    text: {
+      get() { throw new Error('text beyond the bounded raw cap must not be read'); },
+    },
+  });
+
+  await assert.doesNotReject(() => h.enforcement.onChatMessage(
+    { sessionID: 'root', agent: 'graph-orchestrator' },
+    { parts: [
+      { type: 'text', text: `token=${'x'.repeat(rawCap - 'token='.length)}` },
+      unread,
+    ] },
+  ));
+
+  const state = h.store.getRun('root');
+  assert.equal(state.request.text, 'token=[REDACTED]');
+  assert.equal(state.request.truncated, true);
+  assert.equal(state.request.redactions, 1);
+  assert.equal(state.requestCaptureCompleted, true);
+  const persisted = JSON.parse(await readFile(join(dir, '.opencode-loop', 'runs', 'root.json'), 'utf8'));
+  assert.equal(persisted.requestCaptureCompleted, true);
+});
+
+test('request capture bounds attachment-only parts and durably completes with null', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-request-parts-cap-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  let tailReads = 0;
+  const unreadTail = {};
+  Object.defineProperty(unreadTail, 'type', {
+    get() {
+      tailReads += 1;
+      throw new Error('attachment beyond the inspection ceiling must not be read');
+    },
+  });
+
+  await assert.doesNotReject(() => h.enforcement.onChatMessage(
+    { sessionID: 'root', agent: 'graph-orchestrator' },
+    { parts: [...Array.from({ length: 256 }, () => ({ type: 'file' })), unreadTail] },
+  ));
+
+  assert.equal(tailReads, 0);
+  assert.equal(h.store.getRun('root').request, null);
+  assert.equal(h.store.getRun('root').requestCaptureCompleted, true);
+  const persisted = JSON.parse(await readFile(join(dir, '.opencode-loop', 'runs', 'root.json'), 'utf8'));
+  assert.equal(persisted.request, null);
+  assert.equal(persisted.requestCaptureCompleted, true);
+});
+
+test('new-run hook persists only a completed initial request representation', async (t) => {
+  const scenarios = [
+    ['sanitized text', [{ type: 'text', text: 'token=raw-secret' }], 'token=[REDACTED]'],
+    ['text-free', [{ type: 'file', filename: 'context.bin' }], null],
+  ];
+
+  for (const [label, parts, expectedText] of scenarios) {
+    await t.test(label, async (t) => {
+      const dir = await mkdtemp(join(tmpdir(), 'loop-request-atomic-'));
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      const baseStore = createRunStore({ worktree: dir, stateDirectory: '.opencode-loop' });
+      const initialDocuments = [];
+      let saveCalls = 0;
+      const store = {
+        loadRun: (runId) => baseStore.loadRun(runId),
+        getRun: (runId) => baseStore.getRun(runId),
+        async createRun(options) {
+          const state = await baseStore.createRun(options);
+          initialDocuments.push(JSON.parse(await readFile(join(dir, '.opencode-loop', 'runs', `${options.runId}.json`), 'utf8')));
+          return state;
+        },
+        async saveRun() {
+          saveCalls += 1;
+          throw new Error('simulated follow-up save failure');
+        },
+      };
+      const runner = createRunner({ maxAttempts: 3, maxPlanRevisions: 2 });
+      const bindings = new Map();
+      const journal = { enabled: true, includeUserRequest: true, semanticSearch: true, maxUserRequestChars: 8000 };
+      const enforcement = createEnforcement({ settings: { worktree: dir, journal }, store, runner, bindings });
+
+      await assert.doesNotReject(() => enforcement.onChatMessage(
+        { sessionID: 'root', agent: 'graph-orchestrator' },
+        { parts },
+      ));
+
+      assert.equal(initialDocuments.length, 1);
+      assert.equal(saveCalls, 0);
+      const [initial] = initialDocuments;
+      assert.equal(initial.requestCaptureCompleted, true);
+      assert.equal(initial.request?.text ?? null, expectedText);
+      if (initial.request) assert.equal(initial.request.redactions, 1);
+    });
+  }
+});
+
+test('chat message input agent takes precedence over the output message agent', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-agent-precedence-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+
+  await h.enforcement.onChatMessage(
+    { sessionID: 'not-an-orchestrator', agent: 'graph-planner' },
+    {
+      message: { agent: 'graph-orchestrator' },
+      parts: [{ type: 'text', text: 'Must not create a root run.' }],
+    },
+  );
+
+  assert.equal(h.store.getRun('not-an-orchestrator'), null);
+  assert.equal(h.bindings.has('not-an-orchestrator'), false);
+});
+
+test('text-free first root messages durably complete request capture', async (t) => {
+  const scenarios = [
+    ['blank', [{ type: 'text', text: ' \r\n ' }]],
+    ['attachment-only', [{ type: 'file', filename: 'context.bin', data: 'not journal text' }]],
+    ['bounded-empty', [{ type: 'text', text: `${' '.repeat(20_000)}text beyond the capture bound` }]],
+  ];
+
+  for (const [label, parts] of scenarios) {
+    await t.test(label, async (t) => {
+      const dir = await mkdtemp(join(tmpdir(), `loop-empty-request-${label}-`));
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      let h = harness(dir);
+
+      await h.enforcement.onChatMessage(
+        { sessionID: 'root', agent: 'graph-orchestrator' },
+        { parts },
+      );
+      assert.equal(h.store.getRun('root').request, null);
+      assert.equal(h.store.getRun('root').requestCaptureCompleted, true);
+      const persisted = JSON.parse(await readFile(join(dir, '.opencode-loop', 'runs', 'root.json'), 'utf8'));
+      assert.equal(persisted.request, null);
+      assert.equal(persisted.requestCaptureCompleted, true);
+
+      await h.store.releaseRun('root');
+      h = harness(dir);
+      await h.enforcement.onChatMessage(
+        { sessionID: 'root', agent: 'graph-orchestrator' },
+        { parts: [{ type: 'text', text: 'Later text must not become the initial request.' }] },
+      );
+      assert.equal(h.store.getRun('root').request, null);
+      assert.equal(h.store.getRun('root').requestCaptureCompleted, true);
+    });
+  }
+});
+
+test('historical schema v1 runs never capture a post-upgrade message as their initial request', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-v1-request-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsDir = join(dir, '.opencode-loop', 'runs');
+  await mkdir(runsDir, { recursive: true });
+  const legacy = newRun({ runId: 'root', rootSessionId: 'root', now: '2026-09-06T00:00:00.000Z' });
+  legacy.schemaVersion = 1;
+  delete legacy.request;
+  delete legacy.requestCaptureCompleted;
+  await writeFile(join(runsDir, 'root.json'), JSON.stringify(legacy));
+  const h = harness(dir);
+
+  await h.enforcement.onChatMessage(
+    { sessionID: 'root', agent: 'graph-orchestrator' },
+    { parts: [{ type: 'text', text: 'This post-upgrade message is not the historical initial request.' }] },
+  );
+
+  const migrated = h.store.getRun('root');
+  assert.equal(migrated.schemaVersion, 2);
+  assert.equal(migrated.request, null);
+  assert.equal(migrated.requestCaptureCompleted, true);
+});
 
 test('full gated flow: plan → FAIL terminates; blocked dispatch is rewritten as RUNNER_REJECTED', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'loop-ef1-'));

@@ -1,10 +1,10 @@
 # opencode-loop
 
-`0.2.0-alpha.1` is a seven-agent **runner-gated** graph workflow for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner now owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
+`0.3.0-alpha.1` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
 
 ## How the gate works
 
-The model proposes; the runner decides. Every hook decision is persisted to a run document under `<worktree>/.opencode-loop/runs/<runId>.json` (atomic writes, cross-instance lock file), where `runId` is the orchestrator session id — a restart reloads it and continues with counters intact.
+The model proposes; the runner decides. Every hook decision is persisted to a run document under `<worktree>/<stateDirectory>/runs/<runId>.json` (atomic writes, cross-instance lock file), where `runId` is the orchestrator session id — a restart reloads it and continues with counters intact.
 
 | Gate | Mechanism |
 | --- | --- |
@@ -21,14 +21,35 @@ Read-only specialists (explorer, planner, critic, multimodal) dispatch freely on
 
 Work packages are `TaskSpec` nodes (`id`, `kind`, `agent`, `dependsOn`, `inputs`/`outputs` artifact refs, `writeScope`, `acceptance`, optional `maxAttempts`/`allowShell`). `graph_submit_plan` validates the graph — unique ids, resolvable dependencies, no cycles, pairwise-disjoint write scopes, mandatory review-before-implement and implement-before-verify gates, and no write nodes for plan-only intents — before it ever reaches run state. Each role then delivers through its own tool: `graph_submit_review`, `graph_submit_change`, `graph_submit_verification`, `graph_submit_findings`; `graph_inspect` reports node states, attempts, blockers, artifact versions and a Mermaid diagram; `graph_run_resume` performs crash recovery.
 
+## Run journal
+
+After authoritative run state is saved, terminal `SUCCEEDED` and `FAILED` runs are automatically projected into deterministic project `run-summary` entries. Projection is advisory and idempotent: it cannot change a verdict or block dispatch, recovery or persistence. Before each journal search, bounded backfill inspects at most 64 run IDs and projects missing terminal summaries; corrupt or nonterminal runs are skipped. `graph_status` reports bounded pending-backfill metadata without writing or projecting.
+
+The journal is historical, non-authoritative context. It cannot satisfy any current runner, review or verification gate. The explorer must revalidate journal claims against current source; the planner and critic cite journal IDs and treat unconfirmed claims as assumptions; the verifier ignores journal content as PASS evidence and requires current worktree evidence, including an actually executed successful command.
+
+Storage is local plaintext:
+
+| Scope | Entries | Embedding index |
+| --- | --- | --- |
+| Project | `<worktree>/<stateDirectory>/journal/entries/` | `<worktree>/<stateDirectory>/journal/index/` |
+| Global | `~/.config/opencode/opencode-loop/journal/entries/` | `~/.config/opencode/opencode-loop/journal/index/` |
+
+Project entries are Markdown with JSON-compatible frontmatter; embedding vectors are JSON sidecars. Project run state remains under `<worktree>/<stateDirectory>/runs/`.
+
+With semantic search enabled, the first semantic use lazily downloads the pinned `Xenova/all-MiniLM-L6-v2` model from Hugging Face at revision `751bff37182d3f1213fa05d7196b954e230abad9` and runs q8 inference locally through `@huggingface/transformers` `3.8.1`. Journal queries and content are not sent to a remote inference service. Model/download/inference failures do not block startup or the runner: searches without a query remain metadata-only, and text queries use `text-fallback`; `graph_status` reports `hybrid`, `text-fallback` or `disabled` as the current search mode.
+
+By default, the first user request is retained in run state and terminal summaries, capped at 8,000 characters. Set `journal.includeUserRequest` to `false` before the first request to opt out, or adjust `journal.maxUserRequestChars` within its documented range. Requests, commands and insights receive best-effort redaction for common key, token, bearer, JWT, password and secret patterns, but this is not a guarantee: avoid placing secrets in requests and protect or remove the plaintext state directories according to local retention policy.
+
+Global promotion never copies a project entry. It accepts only a project `insight` and requires separately supplied, project-neutral title/body/tags plus native permission `ask`. Run summaries, raw requests, project paths, run IDs and file lists are never written to the global journal.
+
 ## Project-local installation
 
-Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.2.0-alpha.1.tgz`; these commands do not publish or install globally.
+Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.1.tgz`; these commands do not publish or install globally.
 
 From the project where you want to use the plugin, install that local tarball:
 
 ```powershell
-npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.2.0-alpha.1.tgz
+npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.1.tgz
 node --input-type=module -e "import {pathToFileURL} from 'node:url'; import path from 'node:path'; console.log(pathToFileURL(path.resolve('node_modules/opencode-loop/src/index.mjs')).href)"
 ```
 
@@ -43,7 +64,13 @@ Use the printed absolute file URL in the project's `opencode.json` plugin tuple 
       "maxParallel": 4,
       "maxImplementerParallel": 2,
       "maxPlanRevisions": 3,
-      "stateDirectory": ".opencode-loop"
+      "stateDirectory": ".opencode-loop",
+      "journal": {
+        "enabled": true,
+        "includeUserRequest": true,
+        "semanticSearch": true,
+        "maxUserRequestChars": 8000
+      }
     }]
   ]
 }
@@ -65,6 +92,17 @@ Consider adding the state directory to `.gitignore`. Start OpenCode in that proj
 
 All graph agents may call `graph_status` and `graph_inspect`; unknown tools (including arbitrary MCP tools) default to deny, and `read` explicitly denies `*.env`/`*.env.*`. Native agent definitions and the default agent remain intact unless `setDefaultAgent` is true. Any existing definition with one of the seven reserved names causes an atomic collision error.
 
+Journal access is intentionally narrower. Prefer native `ask` when a journal operation, especially global promotion, needs user approval.
+
+| Journal tool | Allowed roles | Behavior |
+| --- | --- | --- |
+| `graph_journal_search` | orchestrator, explorer, planner, plan critic | Bounded project/global search; performs bounded backfill first |
+| `graph_journal_read` | orchestrator, explorer, planner, plan critic | Read one entry by scope and stable journal ID |
+| `graph_journal_write_insight` | root orchestrator only | Write a project insight linked to the current terminal run summary |
+| `graph_journal_promote` | root orchestrator only, native `ask` | Write separately supplied project-neutral content to global scope |
+
+Implementer, verifier and multimodal roles receive none of the journal tools.
+
 ## Options
 
 The default plugin function accepts `(context, options)`. Supported options are plain data:
@@ -80,12 +118,16 @@ The default plugin function accepts `(context, options)`. Supported options are 
 | `maxPlanRevisions` | = `maxAttempts` | Integer 1–10; enforced cap on REVISE loops before the run fails |
 | `stateDirectory` | `.opencode-loop` | 1–4 forward-slash separated segments (`[A-Za-z0-9.][A-Za-z0-9._-]`), no `.`/`..`/backslashes |
 | `enforcement` | `hooks` | The literal `'hooks'` (only supported mode) |
+| `journal.enabled` | `true` | Boolean; disables projection/backfill/search/writes when false; registered journal tools reject with `JOURNAL_DISABLED` |
+| `journal.includeUserRequest` | `true` | Boolean; retain the first user request when true, or opt out before capture when false |
+| `journal.semanticSearch` | `true` | Boolean; local hybrid semantic/text search when true, text fallback when false |
+| `journal.maxUserRequestChars` | `8000` | Integer 1–32000; maximum retained first-request characters |
 
 Unknown keys, callbacks and invalid values fail initialization, including when disabled. Options are copied at initialization. The package entry exports only the default plugin function; internal modules are not supported public APIs.
 
 ## Verification limits
 
-Unit tests (66) cover the sanitizer, TaskSpec/graph validation, the run store (atomicity, locking, fail-closed loading), every runner transition table entry, the five consultant scenarios (FAIL-then-dispatch rejected; attempts surviving reload; stale evidence rejected; crash-window recovery; out-of-scope writes denied pre-execution), hook simulation of the full dispatch→submit→resume flow, prompt contracts and truthful status. A relocation test packs and unpacks the real tarball and imports it with the real SDK/tool dependency closure outside the workspace.
+The unit suite covers the sanitizer, TaskSpec/graph validation, the run and journal stores, terminal projection and bounded backfill, injected semantic ranking and text fallback, journal permissions and trust rules, every runner transition table entry, the five consultant scenarios (FAIL-then-dispatch rejected; attempts surviving reload; stale evidence rejected; crash-window recovery; out-of-scope writes denied pre-execution), full hook simulation, prompt contracts and truthful status. A relocation test packs and unpacks the real tarball and imports it with the real SDK/tool dependency closure outside the workspace without loading or downloading the embedding model.
 
 What remains explicitly **not** claimed:
 
@@ -94,6 +136,7 @@ What remains explicitly **not** claimed:
 - Submit-tool caller binding relies on the host-provided tool context (`sessionID`/`agent`) and child-session parentage events; a host that changes those semantics needs re-verification on the pinned build.
 - Verifier `bash` remains a native `ask`; the runner never answers prompts on the user's behalf except to DENY rule violations.
 - Real-model workflow acceptance (does the graph reduce errors versus the advisory loop at fixed budget) is separate evidence; `graph_status` keeps `enforcementAttested: false` until a locked-host scripted integration passes.
+- Journal redaction is best-effort, storage is plaintext, and historical entries can be stale; journal output is never current gate evidence.
 - The internal effect boundary (`effect-boundary.mjs`) remains a tested but unwired design sketch; its replay protection is still single-instance.
 
 Multi-writer parallelism is future work: the runner enforces one RUNNING implement node at a time. `maxImplementerParallel` currently only shapes planner/critic recommendations.

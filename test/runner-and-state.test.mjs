@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, rm, mkdir } from 'node:fs/promises';
+import fsPromises, { lstat, mkdtemp, readFile, writeFile, rm, mkdir } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createRunStore, newRun } from '../src/run-state.mjs';
+import { createRunStore, newRun, SCHEMA_VERSION } from '../src/run-state.mjs';
 import { createRunner } from '../src/runner.mjs';
 import { validateTaskGraph } from '../src/task-spec.mjs';
 
@@ -55,6 +56,46 @@ async function dispatchVerifier(state, verdict, commands = [{ command: 'npm test
   return result;
 }
 
+test('new runs use schema v2 and initialize request capture as incomplete', () => {
+  const state = newRun({ runId: 'schema-v2', rootSessionId: 'schema-v2', now: NOW });
+  assert.equal(SCHEMA_VERSION, 2);
+  assert.equal(state.schemaVersion, 2);
+  assert.equal(state.request, null);
+  assert.equal(state.requestCaptureCompleted, false);
+});
+
+test('newRun and createRun accept completed initial request metadata', async (t) => {
+  const request = {
+    text: 'Sanitized initial request',
+    truncated: true,
+    redactions: 2,
+    capturedAt: NOW,
+  };
+  const state = newRun({
+    runId: 'initial-request',
+    rootSessionId: 'initial-request',
+    now: NOW,
+    request,
+    requestCaptureCompleted: true,
+  });
+  assert.deepEqual(state.request, request);
+  assert.equal(state.requestCaptureCompleted, true);
+
+  const dir = await mkdtemp(join(tmpdir(), 'loop-store-initial-request-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const store = createRunStore({ worktree: dir });
+  await store.createRun({
+    runId: 'initial-request',
+    rootSessionId: 'initial-request',
+    now: NOW,
+    request,
+    requestCaptureCompleted: true,
+  });
+  const persisted = JSON.parse(await readFile(join(dir, '.opencode-loop', 'runs', 'initial-request.json'), 'utf8'));
+  assert.deepEqual(persisted.request, request);
+  assert.equal(persisted.requestCaptureCompleted, true);
+});
+
 test('run-state persists atomically, reloads, and locks across instances', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'loop-store-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -83,6 +124,199 @@ test('run-state persists atomically, reloads, and locks across instances', async
   await assert.rejects(store.createRun({ runId: '../escape', rootSessionId: 'x', now: NOW }), TypeError);
   assert.equal(await store.loadRun('../escape'), null);
   assert.equal(await store.loadRun('missing-run'), null);
+});
+
+test('listRunIds offsets valid in-memory run ids and validates the bounded offset', async () => {
+  const store = createRunStore();
+  const runIds = Array.from({ length: 6 }, (_, index) => `memory-offset-${index}`);
+  for (const runId of runIds) await store.createRun({ runId, rootSessionId: runId, now: NOW });
+
+  assert.deepEqual(await store.listRunIds({ limit: 3, offset: 2 }), runIds.slice(2, 5));
+  assert.deepEqual(await store.listRunIds({ limit: 3, offset: 6 }), []);
+  assert.deepEqual(await store.listRunIds({ limit: 3, offset: 1_000_000 }), []);
+  for (const offset of [-1, 1_000_001, 1.5, Number.POSITIVE_INFINITY, '1', null]) {
+    await assert.rejects(() => store.listRunIds({ offset }), TypeError);
+  }
+});
+
+test('persistent listRunIds skips valid run ids by offset and still bounds the page', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-store-offset-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsDir = join(dir, '.opencode-loop', 'runs');
+  await mkdir(runsDir, { recursive: true });
+  await Promise.all([
+    writeFile(join(runsDir, 'alpha.json'), '{}'),
+    writeFile(join(runsDir, 'invalid name.json'), '{}'),
+    writeFile(join(runsDir, 'noise.txt'), '{}'),
+    writeFile(join(runsDir, 'bravo.json'), '{}'),
+    writeFile(join(runsDir, 'charlie.json'), '{}'),
+    mkdir(join(runsDir, 'directory.json')),
+  ]);
+  const store = createRunStore({ worktree: dir });
+  const all = await store.listRunIds({ limit: 64 });
+
+  assert.equal(all.length, 3);
+  assert.deepEqual(await store.listRunIds({ limit: 2, offset: 1 }), all.slice(1, 3));
+  assert.deepEqual(await store.listRunIds({ limit: 2, offset: 3 }), []);
+});
+
+test('run-state atomic writes request private temp mode and preserve it after rename', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-store-mode-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const originalWriteFile = fsPromises.writeFile;
+  const temporaryModes = [];
+  fsPromises.writeFile = async (path, data, options) => {
+    if (String(path).includes('.tmp-')) temporaryModes.push(typeof options === 'object' ? options.mode : undefined);
+    return originalWriteFile(path, data, options);
+  };
+  syncBuiltinESMExports();
+
+  try {
+    const store = createRunStore({ worktree: dir });
+    await store.createRun({ runId: 'private-mode', rootSessionId: 'private-mode', now: NOW });
+  } finally {
+    fsPromises.writeFile = originalWriteFile;
+    syncBuiltinESMExports();
+  }
+
+  assert.deepEqual(temporaryModes, [0o600]);
+  if (process.platform !== 'win32') {
+    const target = join(dir, '.opencode-loop', 'runs', 'private-mode.json');
+    assert.equal((await lstat(target)).mode & 0o777, 0o600);
+  }
+});
+
+test('run-state migrates historical schema v1 without a request as capture-complete v2', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-store-v1-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsDir = join(dir, '.opencode-loop', 'runs');
+  await mkdir(runsDir, { recursive: true });
+  const legacy = newRun({ runId: 'legacy1', rootSessionId: 'legacy1', now: NOW });
+  legacy.schemaVersion = 1;
+  delete legacy.request;
+  delete legacy.requestCaptureCompleted;
+  legacy.mode = 'plan-only';
+  legacy.revisionCounters['plan-review'] = 2;
+  legacy.violations.push({ nodeId: null, kind: 'legacy', detail: 'preserve me', at: NOW });
+  await writeFile(join(runsDir, 'legacy1.json'), JSON.stringify(legacy));
+
+  const store = createRunStore({ worktree: dir });
+  const migrated = await store.loadRun('legacy1');
+  assert.equal(migrated.schemaVersion, 2);
+  assert.equal(migrated.request, null);
+  assert.equal(migrated.requestCaptureCompleted, true);
+  assert.equal(migrated.mode, 'plan-only');
+  assert.equal(migrated.revisionCounters['plan-review'], 2);
+  assert.deepEqual(migrated.violations, legacy.violations);
+  assert.equal(store.getRun('legacy1'), migrated);
+
+  await store.saveRun(migrated);
+  const saved = JSON.parse(await readFile(join(runsDir, 'legacy1.json'), 'utf8'));
+  assert.equal(saved.schemaVersion, 2);
+  assert.equal(saved.request, null);
+  assert.equal(saved.requestCaptureCompleted, true);
+  assert.equal(saved.mode, 'plan-only');
+  assert.equal(saved.revisionCounters['plan-review'], 2);
+  assert.deepEqual(saved.violations, legacy.violations);
+});
+
+test('run-state migration discards an unexpected historical request and marks capture complete', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-store-v1-request-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsDir = join(dir, '.opencode-loop', 'runs');
+  await mkdir(runsDir, { recursive: true });
+  const request = { text: 'token=raw-legacy-secret', truncated: false, redactions: 0, capturedAt: NOW };
+  const legacy = newRun({ runId: 'legacy_request', rootSessionId: 'legacy_request', now: NOW });
+  legacy.schemaVersion = 1;
+  legacy.request = request;
+  delete legacy.requestCaptureCompleted;
+  await writeFile(join(runsDir, 'legacy_request.json'), JSON.stringify(legacy));
+
+  const store = createRunStore({ worktree: dir });
+  const migrated = await store.loadRun('legacy_request');
+  assert.equal(migrated.schemaVersion, 2);
+  assert.equal(migrated.request, null);
+  assert.equal(migrated.requestCaptureCompleted, true);
+  assert.equal(JSON.stringify(migrated).includes('raw-legacy-secret'), false);
+
+  await store.saveRun(migrated);
+  const saved = await readFile(join(runsDir, 'legacy_request.json'), 'utf8');
+  assert.equal(saved.includes('raw-legacy-secret'), false);
+});
+
+test('run-state rejects v2 documents with omitted or malformed request metadata', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-store-request-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsDir = join(dir, '.opencode-loop', 'runs');
+  await mkdir(runsDir, { recursive: true });
+  const store = createRunStore({ worktree: dir });
+  const valid = { text: 'request', truncated: false, redactions: 0, capturedAt: NOW };
+  const invalid = [
+    ['omitted request', undefined],
+    ['non-object request', 'request'],
+    ['missing text', { truncated: false, redactions: 0, capturedAt: NOW }],
+    ['empty text', { ...valid, text: '' }],
+    ['non-string text', { ...valid, text: 1 }],
+    ['missing truncated', { text: 'request', redactions: 0, capturedAt: NOW }],
+    ['non-boolean truncated', { ...valid, truncated: 'false' }],
+    ['missing redactions', { text: 'request', truncated: false, capturedAt: NOW }],
+    ['negative redactions', { ...valid, redactions: -1 }],
+    ['fractional redactions', { ...valid, redactions: 1.5 }],
+    ['missing capturedAt', { text: 'request', truncated: false, redactions: 0 }],
+    ['empty capturedAt', { ...valid, capturedAt: '' }],
+    ['non-string capturedAt', { ...valid, capturedAt: 1 }],
+  ];
+
+  for (const [index, [name, request]] of invalid.entries()) {
+    await t.test(name, async () => {
+      const runId = `bad_request_${index}`;
+      const document = newRun({ runId, rootSessionId: runId, now: NOW });
+      if (request === undefined) delete document.request;
+      else document.request = request;
+      await writeFile(join(runsDir, `${runId}.json`), JSON.stringify(document));
+      await assert.rejects(store.loadRun(runId), TypeError);
+    });
+  }
+});
+
+test('run-state rejects v2 documents with omitted, malformed, or inconsistent request capture markers', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-store-request-marker-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsDir = join(dir, '.opencode-loop', 'runs');
+  await mkdir(runsDir, { recursive: true });
+  const store = createRunStore({ worktree: dir });
+  const request = { text: 'request', truncated: false, redactions: 0, capturedAt: NOW };
+  const invalid = [
+    ['omitted marker', undefined, null],
+    ['null marker', null, null],
+    ['string marker', 'false', null],
+    ['request with incomplete capture', false, request],
+  ];
+
+  for (const [index, [name, marker, storedRequest]] of invalid.entries()) {
+    await t.test(name, async () => {
+      const runId = `bad_request_marker_${index}`;
+      const document = newRun({ runId, rootSessionId: runId, now: NOW });
+      document.request = storedRequest;
+      if (marker === undefined) delete document.requestCaptureCompleted;
+      else document.requestCaptureCompleted = marker;
+      await writeFile(join(runsDir, `${runId}.json`), JSON.stringify(document));
+      await assert.rejects(store.loadRun(runId), TypeError);
+    });
+  }
+});
+
+test('run-state validates request metadata before saving v2 documents', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-save-request-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const store = createRunStore({ worktree: dir });
+  const state = await store.createRun({ runId: 'bad_save_request', rootSessionId: 'bad_save_request', now: NOW });
+  state.request = { text: 'request', truncated: false, redactions: -1, capturedAt: NOW };
+  await assert.rejects(store.saveRun(state), TypeError);
+
+  const markerState = await store.createRun({ runId: 'bad_save_request_marker', rootSessionId: 'bad_save_request_marker', now: NOW });
+  markerState.requestCaptureCompleted = 'false';
+  await assert.rejects(store.saveRun(markerState), TypeError);
 });
 
 test('run-state fails closed on corrupted or foreign schema documents', async (t) => {
@@ -364,6 +598,114 @@ test('read-only agents dispatch freely on healthy runs and need no node', () => 
   assert.deepEqual({ allowed: free.allowed, nodeId: free.nodeId, free: free.free }, { allowed: true, nodeId: null, free: true });
   const invalid = runner.admitDispatch(state, { agent: 'build', now: NOW });
   assert.equal(invalid.code, 'INVALID_AGENT');
+});
+
+test('captureRequest stores only the first request without changing runner gates', () => {
+  const state = freshRun();
+  const before = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
+  const first = {
+    text: 'Implement durable journal memory.',
+    truncated: false,
+    redactions: 0,
+    capturedAt: '2026-09-07T00:01:00.000Z',
+  };
+  assert.deepEqual(runner.captureRequest(state, first), { changed: true });
+  assert.deepEqual(state.request, first);
+  assert.equal(state.requestCaptureCompleted, true);
+  assert.equal(state.updatedAt, first.capturedAt);
+  assert.deepEqual(runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW }), before);
+
+  const second = {
+    text: 'Do not replace the original request.',
+    truncated: true,
+    redactions: 2,
+    capturedAt: '2026-09-07T00:02:00.000Z',
+  };
+  assert.deepEqual(runner.captureRequest(state, second), { changed: false });
+  assert.deepEqual(state.request, first);
+  assert.equal(state.requestCaptureCompleted, true);
+  assert.equal(state.updatedAt, first.capturedAt);
+  assert.deepEqual(runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW }), before);
+});
+
+test('completeRequestCapture consumes a text-free first attempt without storing a request', () => {
+  const state = newRun({ runId: 'empty-request', rootSessionId: 'empty-request', now: NOW });
+  const completedAt = '2026-09-07T00:01:00.000Z';
+  assert.deepEqual(runner.completeRequestCapture(state, { now: completedAt }), { changed: true });
+  assert.equal(state.request, null);
+  assert.equal(state.requestCaptureCompleted, true);
+  assert.equal(state.updatedAt, completedAt);
+
+  const later = {
+    text: 'This later message is not the initial request.',
+    truncated: false,
+    redactions: 0,
+    capturedAt: '2026-09-07T00:02:00.000Z',
+  };
+  assert.deepEqual(runner.captureRequest(state, later), { changed: false });
+  assert.equal(state.request, null);
+  assert.equal(state.updatedAt, completedAt);
+});
+
+test('captureRequest rejects malformed request metadata', () => {
+  const valid = {
+    text: 'request',
+    truncated: false,
+    redactions: 0,
+    capturedAt: NOW,
+  };
+  const invalid = [
+    null,
+    { ...valid, text: '' },
+    { ...valid, text: 1 },
+    { ...valid, truncated: 'false' },
+    { ...valid, redactions: -1 },
+    { ...valid, redactions: 1.5 },
+    { ...valid, capturedAt: '' },
+    { ...valid, capturedAt: 1 },
+  ];
+  for (const request of invalid) {
+    const state = newRun({ runId: 'invalid-request', rootSessionId: 'invalid-request', now: NOW });
+    assert.throws(() => runner.captureRequest(state, request), TypeError);
+    assert.equal(state.request, null);
+    assert.equal(state.updatedAt, NOW);
+  }
+});
+
+test('captureRequest rejects accessor metadata without invoking getters', () => {
+  const state = newRun({ runId: 'accessor-request', rootSessionId: 'accessor-request', now: NOW });
+  const request = {};
+  let reads = 0;
+  for (const [key, value] of Object.entries({ text: 'request', truncated: false, redactions: 0, capturedAt: NOW })) {
+    Object.defineProperty(request, key, {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return value;
+      },
+    });
+  }
+
+  assert.throws(() => runner.captureRequest(state, request), TypeError);
+  assert.equal(reads, 0);
+  assert.equal(state.request, null);
+  assert.equal(state.updatedAt, NOW);
+});
+
+test('captureRequest rejects non-plain request metadata', () => {
+  class RequestMetadata {
+    constructor() {
+      this.text = 'request';
+      this.truncated = false;
+      this.redactions = 0;
+      this.capturedAt = NOW;
+    }
+  }
+  const state = newRun({ runId: 'class-request', rootSessionId: 'class-request', now: NOW });
+
+  assert.throws(() => runner.captureRequest(state, new RequestMetadata()), TypeError);
+  assert.equal(state.request, null);
+  assert.equal(state.updatedAt, NOW);
 });
 
 test('inspect reports blockers, counters, artifacts and a mermaid graph', async () => {

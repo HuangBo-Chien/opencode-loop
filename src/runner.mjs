@@ -9,6 +9,7 @@
 // - Evidence binds to artifact versions; superseded or hash-mismatched
 //   artifacts invalidate downstream results conservatively.
 
+import { cleanJson } from './json-safe.mjs';
 import { matchScopePath, normalizeScopePath } from './task-spec.mjs';
 
 const READ_ONLY_AGENTS = new Set(['graph-explorer', 'graph-multimodal', 'graph-planner', 'graph-plan-critic']);
@@ -221,6 +222,30 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
   function recordViolation(state, { nodeId = null, kind, detail, now }) {
     state.violations.push({ nodeId, kind, detail, at: now });
     state.updatedAt = now;
+  }
+
+  function captureRequest(state, request) {
+    if (request === null || typeof request !== 'object') throw new TypeError('request must be an object');
+    const { text, truncated, redactions, capturedAt } = cleanJson(request);
+    if (typeof text !== 'string' || !text.length) throw new TypeError('request.text must be a nonempty string');
+    if (typeof truncated !== 'boolean') throw new TypeError('request.truncated must be a boolean');
+    if (!Number.isInteger(redactions) || redactions < 0) throw new TypeError('request.redactions must be a nonnegative integer');
+    if (typeof capturedAt !== 'string' || !capturedAt.length) throw new TypeError('request.capturedAt must be a nonempty string');
+    if (state.requestCaptureCompleted) return { changed: false };
+    state.request = { text, truncated, redactions, capturedAt };
+    state.requestCaptureCompleted = true;
+    state.updatedAt = capturedAt;
+    return { changed: true };
+  }
+
+  function completeRequestCapture(state, input) {
+    if (input === null || typeof input !== 'object') throw new TypeError('request capture completion must be an object');
+    const { now } = cleanJson(input);
+    if (typeof now !== 'string' || !now.length) throw new TypeError('request capture completion time must be a nonempty string');
+    if (state.requestCaptureCompleted) return { changed: false };
+    state.requestCaptureCompleted = true;
+    state.updatedAt = now;
+    return { changed: true };
   }
 
   function submitChange(state, { nodeId, filesTouched, summary, checksRun = [], unresolved = [], snapshot = {}, now }) {
@@ -440,6 +465,6 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
 
   return Object.freeze({
     admitDispatch, beginNode, attachSession, submitPlan, submitReview, submitChange, submitVerification,
-    recordSideEffect, recordViolation, markIncomplete, resumeRun, reconcileNode, revalidateArtifacts, inspect,
+    recordSideEffect, recordViolation, captureRequest, completeRequestCapture, markIncomplete, resumeRun, reconcileNode, revalidateArtifacts, inspect,
   });
 }

@@ -26,6 +26,7 @@ export function parseOptions(input = {}) {
     enabled: true, setDefaultAgent: false, models: {},
     maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1,
     stateDirectory: '.opencode-loop', maxPlanRevisions: undefined, enforcement: 'hooks',
+    journal: { enabled: true, includeUserRequest: true, semanticSearch: true, maxUserRequestChars: 8000 },
   };
   for (const key of Reflect.ownKeys(input)) {
     if (typeof key !== 'string' || !Object.hasOwn(defaults, key)) throw new TypeError(`Unknown plugin option: ${String(key)}`);
@@ -55,5 +56,19 @@ export function parseOptions(input = {}) {
     }
     models[name] = value;
   }
-  return Object.freeze({ ...options, models: Object.freeze(models) });
+  record(options.journal, 'journal');
+  const journal = { ...defaults.journal };
+  for (const name of Reflect.ownKeys(options.journal)) {
+    if (typeof name !== 'string' || !Object.hasOwn(journal, name)) throw new TypeError(`Unknown journal option: ${String(name)}`);
+    const descriptor = Object.getOwnPropertyDescriptor(options.journal, name);
+    if (!Object.hasOwn(descriptor, 'value')) throw new TypeError('Journal options must contain values, not getters');
+    journal[name] = descriptor.value;
+  }
+  for (const name of ['enabled', 'includeUserRequest', 'semanticSearch']) {
+    if (typeof journal[name] !== 'boolean') throw new TypeError(`journal.${name} must be a boolean`);
+  }
+  if (!Number.isInteger(journal.maxUserRequestChars) || journal.maxUserRequestChars < 1 || journal.maxUserRequestChars > 32000) {
+    throw new TypeError('journal.maxUserRequestChars must be an integer from 1 to 32000');
+  }
+  return Object.freeze({ ...options, models: Object.freeze(models), journal: Object.freeze(journal) });
 }

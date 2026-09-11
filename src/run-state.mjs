@@ -4,19 +4,34 @@
 // When no worktree is available the store degrades to in-memory only.
 
 import { createHash } from 'node:crypto';
-import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, open, opendir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { cleanJson } from './json-safe.mjs';
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export const RUN_STATUSES = Object.freeze(['RUNNING', 'BLOCKED', 'FAILED', 'SUCCEEDED', 'RECOVERY_REQUIRED']);
 export const NODE_STATES = Object.freeze(['PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'SKIPPED', 'STALE', 'INCOMPLETE', 'RECOVERY_REQUIRED']);
 export const ARTIFACT_STATUSES = Object.freeze(['valid', 'stale', 'superseded']);
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const RUN_MAX_BYTES = 1_048_576;
+const RUN_LIST_MAX_OFFSET = 1_000_000;
 
-export function newRun({ runId, rootSessionId, now }) {
+function validateRequestCapture(request, requestCaptureCompleted) {
+  if (typeof requestCaptureCompleted !== 'boolean') throw new TypeError('Run state has invalid request capture marker');
+  if (request !== null) {
+    if (!request || typeof request !== 'object' || Array.isArray(request)) throw new TypeError('Run state has invalid request');
+    if (typeof request.text !== 'string' || !request.text.length) throw new TypeError('Run state has invalid request text');
+    if (typeof request.truncated !== 'boolean') throw new TypeError('Run state has invalid request truncation metadata');
+    if (!Number.isInteger(request.redactions) || request.redactions < 0) throw new TypeError('Run state has invalid request redaction metadata');
+    if (typeof request.capturedAt !== 'string' || !request.capturedAt.length) throw new TypeError('Run state has invalid request capture timestamp');
+    if (!requestCaptureCompleted) throw new TypeError('Run state request capture must be complete when a request is stored');
+  }
+}
+
+export function newRun({ runId, rootSessionId, now, request = null, requestCaptureCompleted = false }) {
   if (typeof runId !== 'string' || !RUN_ID_PATTERN.test(runId)) throw new TypeError('Invalid run id');
   if (typeof rootSessionId !== 'string' || !RUN_ID_PATTERN.test(rootSessionId)) throw new TypeError('Invalid root session id');
+  const initialRequest = request === null ? null : cleanJson(request);
+  validateRequestCapture(initialRequest, requestCaptureCompleted);
   return {
     schemaVersion: SCHEMA_VERSION,
     runId,
@@ -27,6 +42,8 @@ export function newRun({ runId, rootSessionId, now }) {
     status: 'RUNNING',
     blockedReason: null,
     failReason: null,
+    request: initialRequest,
+    requestCaptureCompleted,
     revisionCounters: { 'plan-review': 0, 'implement-verify': 0 },
     nodes: {},
     artifacts: {},
@@ -36,8 +53,12 @@ export function newRun({ runId, rootSessionId, now }) {
 }
 
 function sanitizeRun(state) {
-  const cleaned = cleanJson(state, { maxBytes: RUN_MAX_BYTES, maxValues: 20_000, maxDepth: 32 });
-  if (cleaned.schemaVersion !== SCHEMA_VERSION) throw new TypeError('Run state schema version mismatch');
+  let cleaned = cleanJson(state, { maxBytes: RUN_MAX_BYTES, maxValues: 20_000, maxDepth: 32 });
+  if (cleaned.schemaVersion === 1) {
+    cleaned = { ...cleaned, schemaVersion: SCHEMA_VERSION, request: null, requestCaptureCompleted: true };
+  }
+  else if (cleaned.schemaVersion !== SCHEMA_VERSION) throw new TypeError('Run state schema version mismatch');
+  validateRequestCapture(cleaned.request, cleaned.requestCaptureCompleted);
   if (!RUN_STATUSES.includes(cleaned.status)) throw new TypeError('Run state has invalid status');
   for (const node of Object.values(cleaned.nodes ?? {})) {
     if (!NODE_STATES.includes(node.state)) throw new TypeError('Run state has invalid node state');
@@ -53,8 +74,8 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } =
     return join(runsDir, `${runId}.json`);
   };
 
-  async function createRun({ runId, rootSessionId, now }) {
-    const state = newRun({ runId, rootSessionId, now });
+  async function createRun({ runId, rootSessionId, now, request = null, requestCaptureCompleted = false }) {
+    const state = newRun({ runId, rootSessionId, now, request, requestCaptureCompleted });
     memory.set(runId, state);
     if (runsDir) {
       await mkdir(runsDir, { recursive: true });
@@ -74,7 +95,7 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } =
     const frozen = sanitizeRun(state);
     const target = runFile(state.runId);
     const temporary = `${target}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
-    await writeFile(temporary, `${JSON.stringify(frozen, null, 2)}\n`, 'utf8');
+    await writeFile(temporary, `${JSON.stringify(frozen, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     await rename(temporary, target);
   }
 
@@ -111,6 +132,42 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } =
     if (runsDir) await rm(`${runFile(runId)}.lock`, { force: true });
   }
 
+  async function listRunIds({ limit = 64, offset = 0 } = {}) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new TypeError('limit must be an integer from 1 to 1000');
+    if (!Number.isInteger(offset) || offset < 0 || offset > RUN_LIST_MAX_OFFSET) {
+      throw new TypeError(`offset must be an integer from 0 to ${RUN_LIST_MAX_OFFSET}`);
+    }
+    if (!runsDir) return [...memory.keys()].slice(offset, offset + limit);
+
+    let handle;
+    try {
+      handle = await opendir(runsDir);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return [];
+      throw error;
+    }
+    const runIds = [];
+    let skipped = 0;
+    try {
+      for await (const entry of handle) {
+        if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+        const runId = entry.name.slice(0, -5);
+        if (!RUN_ID_PATTERN.test(runId)) continue;
+        if (skipped < offset) {
+          skipped += 1;
+          continue;
+        }
+        runIds.push(runId);
+        if (runIds.length >= limit) break;
+      }
+    } finally {
+      await handle.close().catch((error) => {
+        if (error?.code !== 'ERR_DIR_CLOSED') throw error;
+      });
+    }
+    return runIds;
+  }
+
   // Snapshot helper: sha256 of literal files; globs and unreadable entries are
   // reported conservatively so invalidation logic can treat them as unverifiable.
   async function hashFiles(files) {
@@ -135,5 +192,5 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } =
     return typeof worktree === 'string' && worktree.length > 0;
   }
 
-  return Object.freeze({ createRun, loadRun, getRun, saveRun, releaseRun, hashFiles, get persistent() { return runsDir !== null; } });
+  return Object.freeze({ createRun, loadRun, getRun, saveRun, releaseRun, listRunIds, hashFiles, get persistent() { return runsDir !== null; } });
 }

@@ -2,6 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import plugin from '../src/index.mjs';
 
+const JOURNAL_TOOL_NAMES = [
+  'graph_journal_search',
+  'graph_journal_read',
+  'graph_journal_write_insight',
+  'graph_journal_promote',
+];
+
 async function agents(options) {
   const config = {};
   await (await plugin({}, options)).config(config);
@@ -10,6 +17,7 @@ async function agents(options) {
 
 test('native permissions restrict writes, delegation and submit tools by role', async () => {
   const definitions = await agents();
+  const journalReaders = new Set(['graph-orchestrator', 'graph-explorer', 'graph-planner', 'graph-plan-critic']);
   for (const [name, agent] of Object.entries(definitions)) {
     const p = agent.permission;
     assert.equal(p['*'], 'deny');
@@ -25,6 +33,10 @@ test('native permissions restrict writes, delegation and submit tools by role', 
     assert.equal(p.graph_submit_change ?? p['*'], name === 'graph-implementer' ? 'allow' : 'deny');
     assert.equal(p.graph_submit_verification ?? p['*'], name === 'graph-verifier' ? 'allow' : 'deny');
     assert.equal(p.graph_run_resume ?? p['*'], name === 'graph-orchestrator' ? 'allow' : 'deny');
+    assert.equal(p.graph_journal_search ?? p['*'], journalReaders.has(name) ? 'allow' : 'deny');
+    assert.equal(p.graph_journal_read ?? p['*'], journalReaders.has(name) ? 'allow' : 'deny');
+    assert.equal(p.graph_journal_write_insight ?? p['*'], name === 'graph-orchestrator' ? 'allow' : 'deny');
+    assert.equal(p.graph_journal_promote ?? p['*'], name === 'graph-orchestrator' ? 'ask' : 'deny');
     if (['graph-explorer', 'graph-multimodal'].includes(name)) assert.equal(p.graph_submit_findings, 'allow');
   }
   const coordinator = definitions['graph-orchestrator'].permission;
@@ -73,6 +85,21 @@ test('roles provide distinct evidence contracts, submit duties and capability li
   assert.match(definitions['graph-verifier'].prompt, /UNVERIFIED/);
   assert.match(definitions['graph-explorer'].prompt, /graph_submit_findings/);
   assert.match(definitions['graph-multimodal'].prompt, /不支援/);
+  for (const { prompt } of Object.values(definitions)) {
+    assert.match(prompt, /journal.*非權威.*歷史/i);
+    assert.match(prompt, /journal.*不能.*閘門/i);
+  }
+  const orchestrator = definitions['graph-orchestrator'].prompt;
+  for (const name of JOURNAL_TOOL_NAMES) assert.match(orchestrator, new RegExp(name));
+  assert.match(orchestrator, /終止|terminal/i);
+  assert.match(orchestrator, /明確.*promot|explicit.*promot/i);
+  assert.match(definitions['graph-explorer'].prompt, /journal.*目前.*原始碼|revalidate.*current source/i);
+  for (const name of ['graph-planner', 'graph-plan-critic']) {
+    assert.match(definitions[name].prompt, /journal ID/i);
+    assert.match(definitions[name].prompt, /假設|assumption/i);
+  }
+  assert.match(definitions['graph-verifier'].prompt, /journal.*PASS/i);
+  for (const name of ['graph-implementer', 'graph-multimodal']) assert.doesNotMatch(definitions[name].prompt, /graph_journal_/);
   const { createAgentPrompt } = await import('../src/prompts.mjs');
   assert.equal(createAgentPrompt('graph-orchestrator', { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1, maxPlanRevisions: 3 }), definitions['graph-orchestrator'].prompt);
   assert.throws(() => createAgentPrompt('unknown', { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1, maxPlanRevisions: 3 }), /unknown/i);

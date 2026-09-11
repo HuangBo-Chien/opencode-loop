@@ -10,6 +10,7 @@ const SUBMIT_TOOL_BY_AGENT = Object.freeze({
   'graph-verifier': ['graph_submit_verification'],
   'graph-multimodal': ['graph_submit_findings'],
 });
+const JOURNAL_READ_AGENTS = new Set(['graph-orchestrator', 'graph-explorer', 'graph-planner', 'graph-plan-critic']);
 
 function createPermission(name) {
   const permission = {
@@ -26,6 +27,14 @@ function createPermission(name) {
     permission.task = 'deny';
   }
   for (const tool of SUBMIT_TOOL_BY_AGENT[name] ?? []) permission[tool] = 'allow';
+  if (JOURNAL_READ_AGENTS.has(name)) {
+    permission.graph_journal_search = 'allow';
+    permission.graph_journal_read = 'allow';
+  }
+  if (name === 'graph-orchestrator') {
+    permission.graph_journal_write_insight = 'allow';
+    permission.graph_journal_promote = 'ask';
+  }
   if (name === 'graph-implementer') permission.edit = 'ask';
   if (['graph-implementer', 'graph-verifier'].includes(name)) permission.bash = 'ask';
   if (['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-multimodal'].includes(name)) {

@@ -4,6 +4,7 @@
 // never answered on the user's behalf except to DENY rule violations.
 
 import { isAbsolute, relative, sep } from 'node:path';
+import { captureRequest } from './journal-text.mjs';
 import { matchScopePath, normalizeScopePath } from './task-spec.mjs';
 
 const SUBMIT_TOOLS = new Set(['graph_submit_plan', 'graph_submit_review', 'graph_submit_change', 'graph_submit_verification', 'graph_submit_findings', 'graph_inspect', 'graph_run_resume']);
@@ -46,22 +47,47 @@ export function createEnforcement({ settings, store, runner, bindings, pendingDi
     return { state, result };
   }
 
-  async function onChatMessage(input) {
-    const { sessionID, agent } = input ?? {};
+  async function onChatMessage(input, output) {
+    const { sessionID, agent: inputAgent } = input ?? {};
+    const agent = inputAgent ?? output?.message?.agent;
     if (agent !== 'graph-orchestrator' || typeof sessionID !== 'string' || !sessionID.length) return;
-    if (bindings.has(sessionID)) return;
-    const existing = await store.loadRun(sessionID);
-    if (existing) {
-      // Restart recovery: in-flight nodes cannot be trusted; resume classifies.
-      if (Object.values(existing.nodes).some((node) => node.state === 'RUNNING') && existing.status === 'RUNNING') {
-        existing.status = 'RECOVERY_REQUIRED';
-        await store.saveRun(existing);
+    let state;
+    const binding = bindings.get(sessionID);
+    if (binding) {
+      if (!binding.root) return;
+      state = store.getRun(binding.runId);
+    } else {
+      state = await store.loadRun(sessionID);
+      if (state) {
+        // Restart recovery: in-flight nodes cannot be trusted; resume classifies.
+        if (Object.values(state.nodes).some((node) => node.state === 'RUNNING') && state.status === 'RUNNING') {
+          state.status = 'RECOVERY_REQUIRED';
+          await store.saveRun(state);
+        }
+        bindings.set(sessionID, { runId: state.runId, agent, nodeId: null, root: true });
+      } else {
+        const capturedAt = NOW();
+        const captured = captureRequest(output?.parts, settings.journal);
+        const request = captured ? { ...captured, capturedAt } : null;
+        state = await store.createRun({
+          runId: sessionID,
+          rootSessionId: sessionID,
+          now: capturedAt,
+          request,
+          requestCaptureCompleted: true,
+        });
+        bindings.set(sessionID, { runId: sessionID, agent, nodeId: null, root: true });
+        return;
       }
-      bindings.set(sessionID, { runId: existing.runId, agent, nodeId: null, root: true });
-      return;
     }
-    await store.createRun({ runId: sessionID, rootSessionId: sessionID, now: NOW() });
-    bindings.set(sessionID, { runId: sessionID, agent, nodeId: null, root: true });
+    if (state?.requestCaptureCompleted === false) {
+      const captured = captureRequest(output?.parts, settings.journal);
+      const capturedAt = NOW();
+      const result = captured
+        ? runner.captureRequest(state, { ...captured, capturedAt })
+        : runner.completeRequestCapture(state, { now: capturedAt });
+      if (result.changed) await store.saveRun(state);
+    }
   }
 
   function decideWriteBinding(sessionID, tool, args) {

@@ -10,8 +10,14 @@ import { types } from 'node:util';
 const MAX_DEPTH_DEFAULT = 24;
 const MAX_VALUES_DEFAULT = 4000;
 const MAX_BYTES_DEFAULT = 262_144;
+const MAX_KEYS_DEFAULT = 1001;
 
-export function cleanJson(input, { maxDepth = MAX_DEPTH_DEFAULT, maxValues = MAX_VALUES_DEFAULT, maxBytes = MAX_BYTES_DEFAULT } = {}) {
+export function cleanJson(input, {
+  maxDepth = MAX_DEPTH_DEFAULT,
+  maxValues = MAX_VALUES_DEFAULT,
+  maxBytes = MAX_BYTES_DEFAULT,
+  maxKeys = MAX_KEYS_DEFAULT,
+} = {}) {
   let nodes = 0;
   let bytes = 0;
   const ancestors = new Set();
@@ -38,7 +44,7 @@ export function cleanJson(input, { maxDepth = MAX_DEPTH_DEFAULT, maxValues = MAX
     ancestors.add(value);
     const keys = Reflect.ownKeys(value);
     if (keys.some((key) => typeof key !== 'string')) throw new TypeError('JSON symbol keys are unsupported');
-    if (keys.length > 1001) throw new TypeError('JSON payload exceeds property limit');
+    if (keys.length > maxKeys) throw new TypeError('JSON payload exceeds property limit');
     const fields = array ? keys.filter((key) => key !== 'length') : [...keys].sort();
     if (array && (value.length > maxValues || fields.length !== value.length || fields.some((key, index) => key !== String(index)))) {
       throw new TypeError('Expected dense JSON array without extra properties');
