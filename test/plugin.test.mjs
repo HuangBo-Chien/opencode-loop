@@ -330,3 +330,31 @@ test('status is read-only, truthful, stable and does not expose host secrets or 
   assert.doesNotMatch(output, /private|host-secret|b0420/);
   assert.deepEqual(hooks.tool.graph_status.args, {});
 });
+
+test('resolveWorktree avoids the filesystem root outside git repositories', async () => {
+  const { resolveWorktree } = await import('../src/config.mjs');
+  assert.equal(resolveWorktree({ worktree: '/', directory: '/proj' }), '/proj');
+  assert.equal(resolveWorktree({ worktree: '/wt', directory: '/proj' }), '/wt');
+  assert.equal(resolveWorktree({ worktree: '', directory: '/proj' }), '/proj');
+  assert.equal(resolveWorktree({ directory: '/proj' }), '/proj');
+  assert.equal(resolveWorktree({ worktree: '/' }), null);
+  assert.equal(resolveWorktree({}), null);
+});
+
+test('root worktree falls back to directory so a fresh session stores state without a server error', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-root-wt-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const { default: plugin } = await load();
+  const hooks = await plugin({ worktree: '/', directory: dir });
+  const sessionID = 'non-git-root';
+
+  await hooks['chat.message'](
+    { sessionID, messageID: 'message-1', agent: 'graph-orchestrator' },
+    { parts: [{ type: 'text', text: 'First message in a non-git project.' }] },
+  );
+
+  const runFile = join(dir, '.opencode-loop', 'runs', `${sessionID}.json`);
+  const run = JSON.parse(await readFile(runFile, 'utf8'));
+  assert.equal(run.runId, sessionID);
+  assert.equal(run.request.text, 'First message in a non-git project.');
+});

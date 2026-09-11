@@ -64,6 +64,16 @@ test('new runs use schema v2 and initialize request capture as incomplete', () =
   assert.equal(state.requestCaptureCompleted, false);
 });
 
+test('createRun leaves no in-memory residue when persistence fails', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-persist-fail-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const blocker = join(dir, 'blocker');
+  await writeFile(blocker, 'x');
+  const store = createRunStore({ worktree: blocker });
+  await assert.rejects(store.createRun({ runId: 'residue', rootSessionId: 'residue', now: NOW }));
+  assert.equal(store.getRun('residue'), null);
+});
+
 test('newRun and createRun accept completed initial request metadata', async (t) => {
   const request = {
     text: 'Sanitized initial request',

@@ -78,7 +78,12 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } =
     const state = newRun({ runId, rootSessionId, now, request, requestCaptureCompleted });
     memory.set(runId, state);
     if (runsDir) {
-      await mkdir(runsDir, { recursive: true });
+      try {
+        await mkdir(runsDir, { recursive: true });
+      } catch (error) {
+        memory.delete(runId);
+        throw error;
+      }
       try {
         await open(`${runFile(runId)}.lock`, 'wx').then((handle) => handle.close());
       } catch (error) {

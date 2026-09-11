@@ -9,6 +9,15 @@ function record(value, name) {
   }
 }
 
+// Hosts report the git worktree path; outside a git repository that value
+// degrades to the filesystem root, which is never a usable state root.
+export function resolveWorktree(context) {
+  for (const candidate of [context?.worktree, context?.directory]) {
+    if (typeof candidate === 'string' && candidate && candidate !== '/') return candidate;
+  }
+  return null;
+}
+
 const STATE_DIRECTORY_PATTERN = /^(?!\.+$)[A-Za-z0-9.][A-Za-z0-9._-]{0,63}$/;
 
 function validateStateDirectory(value) {

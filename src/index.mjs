@@ -1,4 +1,4 @@
-import { parseOptions } from './config.mjs';
+import { parseOptions, resolveWorktree } from './config.mjs';
 import { registerAgents } from './agents.mjs';
 import { createStatusTool } from './status.mjs';
 import { createRunStore } from './run-state.mjs';
@@ -14,9 +14,7 @@ import { createJournalTools } from './journal-tools.mjs';
 export default async function GraphPlugin(context, options = {}) {
   const settings = parseOptions(options);
   if (!settings.enabled) return {};
-  const worktree = typeof context?.worktree === 'string' && context.worktree
-    ? context.worktree
-    : (typeof context?.directory === 'string' && context.directory ? context.directory : null);
+  const worktree = resolveWorktree(context);
 
   const baseStore = createRunStore({ worktree, stateDirectory: settings.stateDirectory });
   const journalStore = createJournalStore({ worktree, stateDirectory: settings.stateDirectory });
