@@ -21,6 +21,14 @@ function nodeMaxAttempts(node, fallback) {
   return Number.isInteger(node.spec.maxAttempts) ? node.spec.maxAttempts : fallback;
 }
 
+// Appended to dependency denials so a naming mismatch points straight at the
+// contract instead of looking like a missing deliverable.
+function artifactNameHint(entries) {
+  return entries.some((entry) => typeof entry === 'string' && entry.includes('does not exist'))
+    ? ' (runner artifact names are findings, plan, review, change:<implement node id>, verification:<verify node id>; resubmit a corrected plan if an input name is wrong)'
+    : '';
+}
+
 function artifactRef(state, ref) {
   const atIndex = ref.lastIndexOf('@');
   const name = atIndex === -1 ? ref : ref.slice(0, atIndex);
@@ -80,7 +88,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
     }
     const deps = depsSatisfied(state, chosen);
     if (!deps.ok) {
-      return { allowed: false, code: 'NODE_NOT_ADMISSIBLE', detail: `${chosen.spec.id} is not yet admissible: ${deps.missing.join(', ')}` };
+      return { allowed: false, code: 'NODE_NOT_ADMISSIBLE', detail: `${chosen.spec.id} is not yet admissible: ${deps.missing.join(', ')}${artifactNameHint(deps.missing)}` };
     }
     if (chosen.attempt >= nodeMaxAttempts(chosen, maxAttempts)) {
       chosen.state = 'FAILED';
@@ -132,12 +140,17 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
       .filter((entry) => entry.deps.ok)
       .sort((a, b) => a.node.attempt - b.node.attempt || a.node.spec.id.localeCompare(b.node.spec.id));
     if (!ready.length) {
-      if (READ_ONLY_AGENTS.has(agent)) return { allowed: true, nodeId: null, free: true };
+      // Free consultation applies only to roles whose submissions never
+      // require a node binding (explorer, planner and multimodal deliver
+      // findings or plans unbound). The critic can only deliver through a
+      // bound review node, so an inadmissible review is rejected up front
+      // instead of stranding a child that could never submit.
+      if (READ_ONLY_AGENTS.has(agent) && agent !== 'graph-plan-critic') return { allowed: true, nodeId: null, free: true };
       const waiting = mine.filter((node) => ELIGIBLE_STATES.has(node.state)).map((node) => `${node.spec.id}(${depsSatisfied(state, node).missing.join(', ') || 'no attempts left'})`);
       return {
         allowed: false,
         code: 'NO_READY_NODE',
-        detail: waiting.length ? `not yet admissible: ${waiting.join('; ')}` : `no ${agent} node exists in the current task graph`,
+        detail: waiting.length ? `not yet admissible: ${waiting.join('; ')}${artifactNameHint(waiting)}` : `no admissible ${agent} node exists in the current task graph`,
       };
     }
     return admissibleNode(state, ready[0].node, agent, now);

@@ -675,3 +675,93 @@ test('terminal runs keep read-only tools alive for children and graph_run_new st
   await startRun(h2);
   assert.equal(h2.bindings.get('root').runId, 'root:2');
 });
+
+const PLAN_ONLY_SPECS = (reviewInputs = ['plan']) => [
+  { id: 'explore-1', kind: 'explore', agent: 'graph-explorer', dependsOn: [], inputs: [], outputs: ['findings'], acceptance: ['evidence'] },
+  { id: 'plan-1', kind: 'plan', agent: 'graph-planner', dependsOn: ['explore-1'], inputs: ['findings@1'], outputs: ['plan'], acceptance: ['plan'] },
+  { id: 'review-1', kind: 'review', agent: 'graph-plan-critic', dependsOn: ['plan-1'], inputs: reviewInputs, outputs: ['review'], acceptance: ['review'] },
+];
+
+test('plan-only loop completes: findings → plan → critic review PASS (regression)', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-planonly-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  const findings = JSON.parse(await h.tools.graph_submit_findings.execute({ summary: 'located evidence', evidence: ['a.ts:1'] }, ctx(h, 'child-explore', 'graph-explorer')));
+  assert.equal(findings.ok, true, JSON.stringify(findings));
+  await childIdle(h, 'child-explore');
+
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(plan.ok, true, JSON.stringify(plan));
+
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  assert.equal(h.bindings.get('child-critic').nodeId, 'review-1');
+  const verdict = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic')));
+  assert.equal(verdict.ok, true, JSON.stringify(verdict));
+  assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
+});
+
+test('custom artifact names are rejected at plan submission, not stranded at dispatch', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-naming-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  await h.tools.graph_submit_findings.execute({ summary: 'evidence', evidence: [] }, ctx(h, 'child-explore', 'graph-explorer'));
+  await childIdle(h, 'child-explore');
+
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  const failedRunShape = await h.tools.graph_submit_plan.execute({
+    intent: 'plan-only',
+    specs: [
+      { id: 'explore-1', kind: 'explore', agent: 'graph-explorer', dependsOn: [], inputs: [], outputs: ['findings'], acceptance: ['evidence'] },
+      { id: 'design-isolated-efficientnet-run', kind: 'plan', agent: 'graph-planner', dependsOn: ['explore-1'], inputs: ['findings@1'], outputs: ['isolated-efficientnet-runbook'], acceptance: ['runbook'] },
+      { id: 'review-isolated-efficientnet-runbook', kind: 'review', agent: 'graph-plan-critic', dependsOn: ['design-isolated-efficientnet-run'], inputs: ['isolated-efficientnet-runbook'], outputs: ['review'], acceptance: ['review'] },
+    ],
+  }, ctx(h, 'child-planner', 'graph-planner'));
+  const rejection = JSON.parse(failedRunShape);
+  assert.equal(rejection.code, 'INVALID_GRAPH');
+  assert.match(rejection.detail, /outputs must be \[plan\]/);
+  assert.match(rejection.detail, /inputs reference isolated-efficientnet-runbook/);
+  assert.match(rejection.hint, /Artifact names are runner-assigned/);
+  // The run was never left with a permanently inadmissible review node.
+  const state = h.store.getRun('root');
+  assert.equal(Object.keys(state.nodes).length, 0);
+});
+
+test('critic dispatch before findings exist is rejected up front with NO_READY_NODE', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-critic-notready-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS(['findings']) }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(plan.ok, true, JSON.stringify(plan));
+
+  const blocked = await dispatch(h, 'graph-plan-critic');
+  assert.match(blocked.args.prompt, /RUNNER_REJECTED/);
+  assert.match(blocked.args.prompt, /NO_READY_NODE/);
+  assert.match(blocked.args.prompt, /resubmit a corrected plan/);
+
+  // Registering findings unblocks the same dispatch path to completion.
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  await h.tools.graph_submit_findings.execute({ summary: 'late evidence', evidence: [] }, ctx(h, 'child-explore', 'graph-explorer'));
+  await childIdle(h, 'child-explore');
+  const admitted = await dispatch(h, 'graph-plan-critic');
+  assert.ok(!admitted.args.prompt.includes('RUNNER_REJECTED'));
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  const verdict = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic')));
+  assert.equal(verdict.ok, true, JSON.stringify(verdict));
+  assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
+});

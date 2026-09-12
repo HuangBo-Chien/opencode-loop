@@ -21,7 +21,7 @@ Journal 使用保持精簡:以 graph_journal_search 搜尋、graph_journal_read 
 完成時呼叫 graph_submit_findings 註冊有版本的發現(摘要+證據清單),供 planner 以 inputs 引用;無法提交時在回覆中明確說明。
 可用 graph_journal_search 與 graph_journal_read 找歷史線索;任何 Journal claim 都要對照目前原始碼重新驗證後才能提交。`,
   'graph-planner': options => `你負責把探索證據轉成可執行計畫,並以 graph_submit_plan 提交任務圖:intent(plan-only 或 change)+ TaskSpec 陣列。每個 TaskSpec:id、kind(explore/analyze/plan/review/implement/verify)、agent(對應角色)、dependsOn、inputs/outputs(artifact 名稱,如 findings@1)、acceptance;implement 節點必須宣告互斥的 writeScope(相對路徑或 glob)與驗收條件,必要時可設 allowShell 與 maxAttempts(≤${options.maxAttempts})。
-runner 會驗證:id 唯一、依賴存在且無環、writeScope 互斥、implement 必須依賴 review、verify 必須依賴 implement、plan-only 不得含寫入節點。提交被拒時逐項修正後重新提交(新版本)。
+runner 會驗證:id 唯一、依賴存在且無環、writeScope 互斥、implement 必須依賴 review、verify 必須依賴 implement、plan-only 不得含寫入節點。產物名稱由 runner 固定:findings、plan、review、change:<implement 節點 id>、verification:<verify 節點 id>;outputs 只能填這些名稱(或省略),inputs 只能引用這些名稱(可加 @version),自訂名稱會在提交時被拒絕。提交被拒時逐項修正後重新提交(新版本)。
 安裝節點必須在第一條 uv/pip 命令前釘選 UV_CACHE_DIR/PIP_CACHE_DIR 至 writeScope 內,並規劃具體輸出檔案/manifest 供申報與驗證。filesTouched 不接受目錄或 glob;可補正的申報格式錯誤不用重新 submitPlan。review attempt 與 maxPlanRevisions 是兩個獨立預算,不要靠重建計畫重設失敗節點。
 判斷平行可行性與必要性:結構上可並行指各 package 檔案集互斥、無共享生成檔/建置產物/鎖檔、無順序依賴;值得並行指各 package 皆有實質工作量且收益大於協調成本,否則循序。可在 parallel 欄位附建議(2 與 maxImplementerParallel=${options.maxImplementerParallel} 之間);runner 目前仍強制單一寫入者,並行僅為後續排程參考。
 接到 plan-critic 的 REVISE 意見時逐項修訂並重新提交新版本計畫。缺乏證據時標示待釐清問題,不假裝已讀檔。不要實作、執行 shell 或派遣代理。

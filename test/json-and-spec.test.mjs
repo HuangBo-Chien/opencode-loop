@@ -43,7 +43,7 @@ const implement = (overrides = {}) => baseSpec({
   writeScope: ['src/a.ts'], outputs: ['change:impl-1'], acceptance: ['returns 401'],
   ...overrides,
 });
-const verify = (overrides = {}) => baseSpec({ id: 'verify-1', agent: 'graph-verifier', kind: 'verify', dependsOn: ['impl-1'], outputs: ['verification:impl-1'], ...overrides });
+const verify = (overrides = {}) => baseSpec({ id: 'verify-1', agent: 'graph-verifier', kind: 'verify', dependsOn: ['impl-1'], outputs: ['verification:verify-1'], ...overrides });
 
 test('validateTaskSpec accepts a minimal spec and normalizes nothing silently', () => {
   const { ok, errors } = validateTaskSpec(baseSpec());
@@ -136,4 +136,42 @@ test('scope path matching supports * and ** conservatively', () => {
 
 test('kind agents cover every kind with exactly one specialist', () => {
   for (const kind of Object.keys(KIND_AGENTS)) assert.equal(KIND_AGENTS[kind].length, 1);
+});
+
+test('artifact naming contract: outputs must be runner-assigned and inputs producible', () => {
+  // The failed-run shape: a plan node with a custom output name feeds a
+  // review input that no runner-managed artifact can ever satisfy.
+  const failedRunShape = validateTaskGraph([
+    baseSpec(),
+    plan({ outputs: ['isolated-efficientnet-runbook'] }),
+    review({ inputs: ['isolated-efficientnet-runbook'] }),
+  ]);
+  assert.equal(failedRunShape.ok, false);
+  assert.match(failedRunShape.errors.join('; '), /plan-1: outputs must be \[plan\]/);
+  assert.match(failedRunShape.errors.join('; '), /review-1: inputs reference isolated-efficientnet-runbook/);
+  assert.match(failedRunShape.errors.join('; '), /allowed names are findings, plan, review/);
+
+  const wrongVerifyOutput = validateTaskGraph([baseSpec(), plan(), review(), implement(), verify({ outputs: ['verification:impl-1'] })]);
+  assert.equal(wrongVerifyOutput.ok, false);
+  assert.match(wrongVerifyOutput.errors.join('; '), /verify-1: outputs must be \[verification:verify-1\]/);
+
+  const foreignChangeInput = validateTaskGraph([
+    baseSpec(), plan(), review(),
+    implement({ inputs: ['change:review-1'] }),
+    implement({ id: 'impl-2', writeScope: ['docs/b.md'], outputs: ['change:impl-2'] }),
+    verify({ dependsOn: ['impl-1', 'impl-2'], inputs: ['verification:verify-1', 'ghost-report'] }),
+  ]);
+  assert.equal(foreignChangeInput.ok, false);
+  assert.match(foreignChangeInput.errors.join('; '), /impl-1: inputs reference change:review-1/);
+  assert.match(foreignChangeInput.errors.join('; '), /verify-1: inputs reference ghost-report/);
+
+  // Canonical names, omissions and version pins are all accepted.
+  const canonical = validateTaskGraph([
+    baseSpec({ outputs: [] }),
+    plan({ inputs: ['findings@1'] }),
+    review({ inputs: ['plan'] }),
+    implement({ inputs: ['review@1', 'findings'] }),
+    verify({ dependsOn: ['impl-1'], inputs: ['change:impl-1', 'verification:verify-1'] }),
+  ]);
+  assert.equal(canonical.ok, true, canonical.errors.join('; '));
 });

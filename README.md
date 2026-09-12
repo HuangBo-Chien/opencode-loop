@@ -1,6 +1,6 @@
 # opencode-loop
 
-`0.3.0-alpha.2` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
+`0.3.0-alpha.3` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
 
 ## How the gate works
 
@@ -20,7 +20,7 @@ Read-only specialists (explorer, planner, critic, multimodal) dispatch freely on
 
 ## Structured handoff
 
-Work packages are `TaskSpec` nodes (`id`, `kind`, `agent`, `dependsOn`, `inputs`/`outputs` artifact refs, `writeScope`, `acceptance`, optional `maxAttempts`/`allowShell`). `graph_submit_plan` validates the graph — unique ids, resolvable dependencies, no cycles, pairwise-disjoint write scopes, mandatory review-before-implement and implement-before-verify gates, and no write nodes for plan-only intents — before it ever reaches run state; an `INVALID_GRAPH` rejection carries a compact TaskSpec schema summary (kind↔agent mapping, bare artifact `outputs`, gate rules) so the planner can fix the submission without guessing. Each role then delivers through its own tool: `graph_submit_review`, `graph_submit_change`, `graph_submit_verification`, `graph_submit_findings`; `graph_inspect` reports node states, attempts, blockers, artifact versions and a Mermaid diagram; `graph_run_resume` performs crash recovery; `graph_run_new` starts a successor run after a terminal one.
+Work packages are `TaskSpec` nodes (`id`, `kind`, `agent`, `dependsOn`, `inputs`/`outputs` artifact refs, `writeScope`, `acceptance`, optional `maxAttempts`/`allowShell`). `graph_submit_plan` validates the graph — unique ids, resolvable dependencies, no cycles, pairwise-disjoint write scopes, mandatory review-before-implement and implement-before-verify gates, no write nodes for plan-only intents, and the **artifact naming contract** (declared `outputs` must equal the runner-assigned name for the kind — `findings`, `plan`, `review`, `change:<id>`, `verification:<id>` — or be omitted, and `inputs` may only reference names some runner-managed artifact can satisfy, so a node can never wait on a name nothing produces) — before it ever reaches run state; an `INVALID_GRAPH` rejection carries a compact TaskSpec schema summary (kind↔agent mapping, bare artifact `outputs`, naming rules, gate rules) so the planner can fix the submission without guessing. Each role then delivers through its own tool: `graph_submit_review`, `graph_submit_change`, `graph_submit_verification`, `graph_submit_findings`; `graph_inspect` reports node states, attempts, blockers, artifact versions and a Mermaid diagram; `graph_run_resume` performs crash recovery; `graph_run_new` starts a successor run after a terminal one.
 
 ### File claims and correction
 
@@ -42,6 +42,7 @@ Work packages are `TaskSpec` nodes (`id`, `kind`, `agent`, `dependsOn`, `inputs`
 ### Dispatch and recovery
 
 - The coordinator can steer dispatch: an explicit `nodeId` task argument, or a single `[nodeId: implement-setup]` marker on the first prompt line, targets a specific node. The runner validates exactly that node (existence, role match, admissibility, attempts, single-writer) and either binds it or rejects the dispatch with the precise reason (`NODE_NOT_FOUND`, `NODE_NOT_ADMISSIBLE`, `ATTEMPTS_EXHAUSTED`, `SINGLE_WRITER`); it never silently reassigns the request to a different node. Unmarked dispatches keep the runner's own ordering, and every bound dispatch confirms the assignment with a `[RUNNER] Assigned nodeId` prompt line.
+- The critic is never freely admitted: its verdict can only travel through a bound review node, so when the review node exists but is not yet admissible the dispatch is rejected up front with `NO_READY_NODE` and the waiting reasons (plus the artifact-naming hint when an input references a name nothing produces) instead of stranding a child session that could never submit. Explorer, planner and multimodal keep free consultation because their findings/plan submissions do not require a node binding.
 - `task_id` may continue the same active RUNNING attempt and role in the same run without charging another attempt. It may also **resume the unfinished node the session last worked on** when that node is `INCOMPLETE`/`PENDING`/`STALE` with attempts left: a new attempt is charged, the recorded side-effect ledger travels with the dispatch, and the old inactive binding is superseded. Completed nodes, foreign sessions and exhausted attempts still require a fresh session (`FRESH_SESSION_REQUIRED`, and rejection messages name the bound node).
 - Read-only tools (`read`, `glob`, `grep`, `list`, `graph_status`, `graph_inspect`, `graph_journal_search`, `graph_journal_read`) are never collaterally blocked by the dispatch-binding gate. Rejected or finished children resolve the owning run through the host-verified parent chain, so inspection and journal history stay available even after a run reaches a terminal state. Write paths keep failing closed.
 - `graph_run_new` starts a successor run in the same orchestrator session once the current run is `SUCCEEDED` or `FAILED` (write journal insights first). The successor run id is `<session>:<n>`; the finished run records `successorRunId`, and a restart follows the chain so the orchestrator rebinds to the newest run instead of the terminal one.
@@ -79,12 +80,12 @@ Global promotion never copies a project entry. It accepts only a project `insigh
 
 ## Project-local installation
 
-Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.2.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
+Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.3.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
 
 From the project where you want to use the plugin, install that local tarball:
 
 ```powershell
-npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.2.tgz
+npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.3.tgz
 node --input-type=module -e "import {pathToFileURL} from 'node:url'; import path from 'node:path'; console.log(pathToFileURL(path.resolve('node_modules/opencode-loop/src/index.mjs')).href)"
 ```
 

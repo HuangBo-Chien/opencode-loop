@@ -20,7 +20,7 @@ function changeGraph({ writeScope = ['src/a.ts'] } = {}) {
     spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'], outputs: ['plan'] }),
     spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'], outputs: ['review'] }),
     spec('impl-1', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope, outputs: ['change:impl-1'] }),
-    spec('verify-1', 'verify', 'graph-verifier', { dependsOn: ['impl-1'], outputs: ['verification:impl-1'] }),
+    spec('verify-1', 'verify', 'graph-verifier', { dependsOn: ['impl-1'], outputs: ['verification:verify-1'] }),
   ];
   return validateTaskGraph(specs);
 }
@@ -792,4 +792,32 @@ test('recorded side effects mark redispatches as reconcile work', async () => {
   const redispatch = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-1' });
   assert.equal(redispatch.allowed, true);
   assert.equal(redispatch.reconcile, true);
+});
+
+test('critics are never freely admitted; a not-ready review rejects dispatch up front', () => {
+  const state = newRun({ runId: 'critic-free', rootSessionId: 'critic-free', now: NOW });
+  const graph = validateTaskGraph([
+    spec('explore-1', 'explore', 'graph-explorer'),
+    spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'], inputs: ['findings'] }),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'], inputs: ['findings'] }),
+  ]);
+  runner.submitPlan(state, { intent: 'plan-only', nodes: graph.nodes, now: NOW });
+
+  // The review node waits on findings that were never registered.
+  const denied = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
+  assert.equal(denied.code, 'NO_READY_NODE');
+  assert.match(denied.detail, /review-1\(.*findings/);
+  assert.match(denied.detail, /resubmit a corrected plan/);
+
+  // Other read-only roles keep free consultation.
+  const explorer = runner.admitDispatch(state, { agent: 'graph-explorer', now: NOW });
+  assert.deepEqual({ allowed: explorer.allowed, nodeId: explorer.nodeId, free: explorer.free }, { allowed: true, nodeId: null, free: true });
+  const planner = runner.admitDispatch(state, { agent: 'graph-planner', now: NOW });
+  assert.deepEqual({ allowed: planner.allowed, nodeId: planner.nodeId, free: planner.free }, { allowed: true, nodeId: null, free: true });
+
+  // Once findings exist the review becomes admissible and binds.
+  state.artifacts.findings = { kind: 'findings', nodeId: 'free', version: 1, basedOn: [], payload: {}, status: 'valid', createdAt: NOW };
+  const admitted = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
+  assert.equal(admitted.allowed, true);
+  assert.equal(admitted.nodeId, 'review-1');
 });

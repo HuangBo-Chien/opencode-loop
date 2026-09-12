@@ -155,6 +155,33 @@ export function validateTaskGraph(specs, { planOnly = false, maxAttemptsCeiling 
   }
   if (errors.length) return { ok: false, errors, order: null, nodes: null };
 
+  // Artifact naming contract. The runner always stores evidence under fixed
+  // names (findings, plan, review, change:<id>, verification:<id>); declared
+  // `outputs` must match them and `inputs` may only reference them, so an
+  // input can never chase a name that nothing produces and strand a node.
+  const canonicalOutput = (spec) => spec.kind === 'implement' ? `change:${spec.id}`
+    : spec.kind === 'verify' ? `verification:${spec.id}`
+    : spec.kind === 'plan' ? 'plan' : spec.kind === 'review' ? 'review' : 'findings';
+  for (const [id, spec] of byId) {
+    const canonical = canonicalOutput(spec);
+    for (const entry of spec.outputs ?? []) {
+      if (entry !== canonical) {
+        errors.push(`${id}: outputs must be [${canonical}] (the runner-assigned artifact name for ${spec.kind} nodes) or omitted; custom artifact names are never produced`);
+      }
+    }
+    for (const ref of spec.inputs ?? []) {
+      const name = ref.split('@', 1)[0];
+      const changeTarget = name.startsWith('change:') ? byId.get(name.slice('change:'.length)) : null;
+      const verificationTarget = name.startsWith('verification:') ? byId.get(name.slice('verification:'.length)) : null;
+      const producible = name === 'findings' || name === 'plan' || name === 'review'
+        || changeTarget?.kind === 'implement' || verificationTarget?.kind === 'verify';
+      if (!producible) {
+        errors.push(`${id}: inputs reference ${ref}, which no runner-managed artifact can satisfy; allowed names are findings, plan, review, change:<implement node id>, verification:<verify node id> (optional @version)`);
+      }
+    }
+  }
+  if (errors.length) return { ok: false, errors, order: null, nodes: null };
+
   // Kahn topological sort rejects cycles and yields a deterministic order.
   const indegree = new Map([...byId.keys()].map((id) => [id, 0]));
   const dependents = new Map([...byId.keys()].map((id) => [id, []]));
