@@ -1268,3 +1268,52 @@ test('declared deliverables surface as mechanical progress through graph_inspect
   impl = inspected.nodes.find((node) => node.id === 'impl-1');
   assert.deepEqual(impl.deliverables, { total: 2, done: 2, pending: [] });
 });
+
+test('{{run}} tokens expand before validation and reach the bound implementer', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-runtoken-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+  const TOKEN_SPECS = SPECS.map((spec) => spec.id === 'impl-1'
+    ? { ...spec, writeScope: ['lanes/{{run}}/**'], deliverables: ['lanes/{{run}}/out.txt'], allowShell: true }
+    : spec);
+
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs: TOKEN_SPECS }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(plan.ok, true, JSON.stringify(plan));
+  assert.equal(plan.runToken, 'root');
+  assert.deepEqual(plan.lanes, [{ id: 'impl-1', writeScope: ['lanes/root/**'], deliverables: ['lanes/root/out.txt'] }]);
+
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
+
+  // The dispatch ack carries the runner-expanded authoritative scope.
+  const out = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-1] build lane' });
+  assert.match(out.args.prompt, /\[RUNNER\] writeScope: lanes\/root\/\*\*\. Write only inside these literal paths\./);
+  assert.match(out.args.prompt, /\[RUNNER\] deliverables: lanes\/root\/out\.txt\./);
+  await bindChild(h, 'child-impl', 'graph-implementer');
+
+  // Shell screening matches the expanded scope: inside passes, outside is denied.
+  const fine = await h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-impl', callID: 'tk1' }, { args: { command: 'mkdir -p lanes/root && echo hi > lanes/root/out.txt' } });
+  assert.equal(fine ?? null, null);
+  await h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-impl', callID: 'tk2' }, { args: { command: 'echo hi > lanes/other/out.txt' } });
+  assert.ok(h.store.getRun('root').violations.some((entry) => entry.kind === 'out-of-scope-bash' && entry.detail.includes('lanes/other/out.txt')));
+});
+
+test('plans with unsubstituted placeholders are rejected at submission', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-runtoken-reject-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+  const BAD_SPECS = SPECS.map((spec) => spec.id === 'impl-1'
+    ? { ...spec, writeScope: ['lanes/<run>/**'] }
+    : spec);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs: BAD_SPECS }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(plan.ok, false);
+  assert.equal(plan.code, 'INVALID_GRAPH');
+  assert.match(plan.detail, /unsubstituted template placeholder/);
+});

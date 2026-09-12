@@ -78,3 +78,11 @@ test('empty and malformed commands never report escapes', () => {
   assert.equal(screen(undefined, []), null);
   assert.equal(screen('&&& ||| ;;;', []), null);
 });
+
+test('fd duplicator redirects are not file write targets', () => {
+  const targets = extractShellWriteTargets('python3 x.py 1>&2 2>&1 | tee log.txt', () => null);
+  assert.equal(targets.includes('2') || targets.includes('1'), false);
+  assert.ok(targets.includes('log.txt'));
+  const screened = firstOutOfScopeShellWrite('echo hi 1>&2 2>&1 >lanes/root/out.txt', ['lanes/root/**'], () => null);
+  assert.equal(screened, null);
+});

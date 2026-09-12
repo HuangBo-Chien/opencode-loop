@@ -222,7 +222,14 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       }
       let prompt = typeof args.prompt === 'string' ? args.prompt : '';
       if (decision.nodeId) {
-        prompt = `[RUNNER] Assigned nodeId: ${decision.nodeId}. Submit only this node.\n${prompt}`;
+        // The runner echoes the node's authoritative (token-expanded) scope
+        // and deliverables: the bound implementer's ground truth comes from
+        // the runner, never from planner prose that may still carry tokens.
+        const spec = state.nodes[decision.nodeId]?.spec ?? null;
+        const authoritative = [];
+        if (spec && Array.isArray(spec.writeScope) && spec.writeScope.length) authoritative.push(`[RUNNER] writeScope: ${spec.writeScope.join(', ')}. Write only inside these literal paths.`);
+        if (spec && Array.isArray(spec.deliverables) && spec.deliverables.length) authoritative.push(`[RUNNER] deliverables: ${spec.deliverables.join(', ')}.`);
+        prompt = `[RUNNER] Assigned nodeId: ${decision.nodeId}. Submit only this node.${authoritative.length ? `\n${authoritative.join('\n')}` : ''}\n${prompt}`;
         if (decision.reconcile) prompt = `${reconcilePrompt(state, decision.nodeId)}\n\n${prompt}`;
         const guidance = revisionPrompt(decision);
         if (guidance) prompt = `${guidance}\n\n${prompt}`;

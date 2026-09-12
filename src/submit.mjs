@@ -5,7 +5,7 @@
 
 import { tool } from '@opencode-ai/plugin/tool';
 import { cleanJson } from './json-safe.mjs';
-import { validateTaskGraph } from './task-spec.mjs';
+import { validateTaskGraph, expandRunTokens, runToken } from './task-spec.mjs';
 
 const z = tool.schema;
 const NOW = () => new Date().toISOString();
@@ -54,10 +54,13 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (Object.values(located.state.nodes).some((node) => node.state === 'RUNNING' && ['review', 'implement', 'verify'].includes(node.spec.kind))) {
         return rejected('RUN_BUSY', 'finish or recover in-flight review/implementation/verification before replacing the plan');
       }
-      const graph = validateTaskGraph(args.specs, { planOnly: args.intent === 'plan-only', maxAttemptsCeiling: 20 });
+      // {{run}} expands to this run's unique token before validation, so
+      // run-unique lanes never depend on the planner guessing the run id.
+      const expanded = expandRunTokens(args.specs, located.state.runId);
+      const graph = validateTaskGraph(expanded, { planOnly: args.intent === 'plan-only', maxAttemptsCeiling: 20 });
       if (!graph.ok) {
         return rejected('INVALID_GRAPH', graph.errors.join('; '), [
-          'TaskSpec schema: {id, kind(explore|analyze|plan|review|implement|verify), agent — must be the kind-mapped graph-* specialist (explore→graph-explorer, analyze→graph-multimodal, plan→graph-planner, review→graph-plan-critic, implement→graph-implementer, verify→graph-verifier), dependsOn:[node ids] (required), inputs:[artifact refs like findings@1], outputs:[bare artifact names only — versions are runner-assigned], writeScope:[relative workspace paths/globs] (implement nodes only, non-empty, pairwise disjoint), deliverables:[literal expected files within writeScope] (implement nodes, optional, enables progress reporting), acceptance:[criteria] (implement nodes required), maxAttempts?, allowShell?}',
+          'TaskSpec schema: {id, kind(explore|analyze|plan|review|implement|verify), agent — must be the kind-mapped graph-* specialist (explore→graph-explorer, analyze→graph-multimodal, plan→graph-planner, review→graph-plan-critic, implement→graph-implementer, verify→graph-verifier), dependsOn:[node ids] (required), inputs:[artifact refs like findings@1], outputs:[bare artifact names only — versions are runner-assigned], writeScope:[relative workspace paths/globs] (implement nodes only, non-empty, pairwise disjoint; use the {{run}} token for run-unique lanes — the runner expands it before validation), deliverables:[literal expected files within writeScope] (implement nodes, optional, enables progress reporting), acceptance:[criteria] (implement nodes required), maxAttempts?, allowShell?}',
           'Gates: exactly one plan node; review depends on plan; implement depends on review; verify depends on implement; plan-only intents contain no implement/verify nodes.',
           'Artifact names are runner-assigned: outputs must be findings (explore/analyze), plan (plan), review (review), change:<own id> (implement) or verification:<own id> (verify) — or omitted; inputs may only reference those names, with an optional @version.',
         ].join(' '));
@@ -73,7 +76,11 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         if (!result.ok) return rejected(result.code, result.detail);
         await store.saveRun(located.state);
         dispatches?.invalidate(located.state.runId);
-        return reply({ ok: true, planVersion: result.version, mode: result.mode, order: graph.order, next: args.intent === 'plan-only' ? 'await plan critique; no implementation will be admitted' : 'await plan critique before implementation' });
+        // Echo the expanded literal paths so planner/orchestrator prose
+        // (acceptance text, dispatch prompts) quotes real paths, not tokens.
+        const lanes = [...graph.nodes.values()].filter((spec) => spec.kind === 'implement')
+          .map((spec) => ({ id: spec.id, writeScope: spec.writeScope ?? [], deliverables: spec.deliverables ?? [] }));
+        return reply({ ok: true, planVersion: result.version, mode: result.mode, runToken: runToken(located.state.runId), order: graph.order, lanes, next: args.intent === 'plan-only' ? 'await plan critique; no implementation will be admitted' : 'await plan critique before implementation' });
       } catch (error) {
         return rejected('PAYLOAD_INVALID', error.message);
       }

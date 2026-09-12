@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { cleanJson, stableHash } from '../src/json-safe.mjs';
-import { validateTaskGraph, validateTaskSpec, matchScopePath, normalizeScopePath, KIND_AGENTS } from '../src/task-spec.mjs';
+import { validateTaskGraph, validateTaskSpec, matchScopePath, normalizeScopePath, runToken, expandRunTokens, KIND_AGENTS } from '../src/task-spec.mjs';
 
 test('cleanJson freezes, sorts keys and rejects unsafe shapes', () => {
   const cleaned = cleanJson({ b: 1, a: { c: [1, 'x', null, true] } });
@@ -201,4 +201,25 @@ test('deliverables: optional literal files within writeScope, implement nodes on
   const tooMany = validateTaskGraph([baseSpec(), plan(), review(), implement({ deliverables: Array.from({ length: 33 }, (_, index) => `src/f${index}.ts`) }), verify()]);
   assert.equal(tooMany.ok, false);
   assert.match(tooMany.errors.join('; '), /deliverables must be an array of strings \(max 32\)/);
+});
+
+test('runToken and expandRunTokens substitute {{run}} in enforced path fields only', () => {
+  assert.equal(runToken('ses_x:3'), 'ses_x-3');
+  const specs = [{ id: 'impl-1', kind: 'implement', agent: 'graph-implementer', writeScope: ['lanes/{{run}}-a/**'], deliverables: ['lanes/{{run}}-a/out.json'], acceptance: ['write lanes/{{run}}-a/out.json'] }];
+  const [expanded] = expandRunTokens(specs, 'ses_x:3');
+  assert.equal(expanded.writeScope[0], 'lanes/ses_x-3-a/**');
+  assert.equal(expanded.deliverables[0], 'lanes/ses_x-3-a/out.json');
+  assert.equal(expanded.acceptance[0], 'write lanes/{{run}}-a/out.json');
+  // Non-objects and missing fields pass through untouched.
+  assert.deepEqual(expandRunTokens([null, { id: 'x' }], 'r'), [null, { id: 'x' }]);
+});
+
+test('writeScope and deliverables reject unsubstituted template placeholders', () => {
+  const angle = validateTaskGraph([baseSpec(), plan(), review(), implement({ writeScope: ['lanes/<run>-a/**'] }), verify()]);
+  assert.equal(angle.ok, false);
+  assert.match(angle.errors.join(';'), /unsubstituted template placeholder/);
+
+  const brace = validateTaskGraph([baseSpec(), plan(), review(), implement({ deliverables: ['src/<run>.json'] }), verify()]);
+  assert.equal(brace.ok, false);
+  assert.match(brace.errors.join(';'), /unsubstituted template placeholder/);
 });
