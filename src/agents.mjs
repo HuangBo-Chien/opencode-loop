@@ -1,11 +1,22 @@
 import { AGENT_NAMES } from './config.mjs';
 import { createAgentPrompt } from './prompts.mjs';
 
+const SUBMIT_TOOL_BY_AGENT = Object.freeze({
+  'graph-orchestrator': ['graph_run_resume', 'graph_run_new', 'graph_run_decide'],
+  'graph-explorer': ['graph_submit_findings'],
+  'graph-planner': ['graph_submit_plan'],
+  'graph-plan-critic': ['graph_submit_review'],
+  'graph-implementer': ['graph_submit_change'],
+  'graph-verifier': ['graph_submit_verification'],
+  'graph-multimodal': ['graph_submit_findings'],
+});
+const JOURNAL_READ_AGENTS = new Set(['graph-orchestrator', 'graph-explorer', 'graph-planner', 'graph-plan-critic']);
+
 function createPermission(name) {
   const permission = {
     '*': 'deny',
     read: { '*': 'allow', '*.env': 'deny', '*.env.*': 'deny' },
-    glob: 'allow', grep: 'allow', list: 'allow', graph_status: 'allow',
+    glob: 'allow', grep: 'allow', list: 'allow', graph_status: 'allow', graph_inspect: 'allow',
     external_directory: 'ask', doom_loop: 'ask',
   };
   if (name === 'graph-orchestrator') {
@@ -15,8 +26,21 @@ function createPermission(name) {
   } else {
     permission.task = 'deny';
   }
-  if (name === 'graph-implementer') permission.edit = 'ask';
-  if (['graph-implementer', 'graph-verifier'].includes(name)) permission.bash = 'ask';
+  for (const tool of SUBMIT_TOOL_BY_AGENT[name] ?? []) permission[tool] = 'allow';
+  if (JOURNAL_READ_AGENTS.has(name)) {
+    permission.graph_journal_search = 'allow';
+    permission.graph_journal_read = 'allow';
+  }
+  if (name === 'graph-orchestrator') {
+    permission.graph_journal_write_insight = 'allow';
+    permission.graph_journal_promote = 'ask';
+    permission.graph_run_decide = 'ask';
+  }
+  if (name === 'graph-implementer') {
+    permission.edit = 'ask';
+    permission.write = 'ask';
+  }
+  if (['graph-implementer', 'graph-verifier', 'graph-explorer'].includes(name)) permission.bash = 'ask';
   if (['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-multimodal'].includes(name)) {
     permission.webfetch = 'ask';
     permission.websearch = 'ask';
@@ -30,7 +54,7 @@ export function registerAgents(config, options) {
     if (name in existing) throw new Error(`Graph agent namespace collision: ${name}`);
   }
   const additions = Object.fromEntries(AGENT_NAMES.map(name => [name, {
-    description: `${name.slice(6)} role for the advisory graph workflow`,
+    description: `${name.slice(6)} role for the runner-gated graph workflow`,
     mode: name === 'graph-orchestrator' ? 'primary' : 'subagent',
     prompt: createAgentPrompt(name, options),
     permission: createPermission(name),
