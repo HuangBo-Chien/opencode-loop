@@ -306,7 +306,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     const binding = bindings.get(sessionID);
     const work = () => {
       if (requireActive && !binding?.root && dispatches.managed(sessionID) && !dispatches.current(binding)) {
-        throw new Error('BINDING_UNAVAILABLE: managed child must have an active, verified dispatch before work');
+        throw new Error('BINDING_UNAVAILABLE: this session has no active, verified dispatch (its previous dispatch finished, was rejected, or was revoked); stop working, report this reason back, and let the coordinator re-dispatch');
       }
       return operation(input, output);
     };

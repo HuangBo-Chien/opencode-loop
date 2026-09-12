@@ -351,3 +351,50 @@ test('parallel implementer reservations occupy distinct nodes up to writer capac
   assert.equal(next.allowed, true, JSON.stringify(next));
   assert.equal(next.nodeId, 'impl-a');
 });
+
+test('round-1 free-role sessions continue their next task through task_id', async () => {
+  const store = createRunStore();
+  const runner = createRunner({ maxAttempts: 3, maxPlanRevisions: 3 });
+  const state = await store.createRun({ runId: 'root', rootSessionId: 'root', now: 'now' });
+  state.nodes['plan-1'] = { spec: { id: 'plan-1', kind: 'plan', agent: 'graph-planner', dependsOn: [], inputs: [], outputs: ['plan'] }, state: 'PENDING', attempt: 0 };
+  // A round-1 planner finished free-bound: inactive binding without a node.
+  const bindings = new Map([
+    ['root', { runId: 'root', root: true, agent: 'graph-orchestrator' }],
+    ['p1', { runId: 'root', root: false, agent: 'graph-planner', nodeId: null, sessionId: 'p1', dispatchId: 'd0', active: false }],
+  ]);
+  const dispatches = createDispatchBindings({ store, runner, bindings });
+  const part = (call, session) => ({
+    type: 'tool', tool: 'task', callID: call, sessionID: 'root',
+    state: { status: 'running', input: { subagent_type: 'graph-planner' }, metadata: { parentSessionId: 'root', sessionId: session } },
+  });
+
+  const continuation = await dispatches.admit('root', 'c2', { subagent_type: 'graph-planner', task_id: 'p1' });
+  assert.equal(continuation.allowed, true, JSON.stringify(continuation));
+  assert.equal(continuation.nodeId, 'plan-1'); // ready plan node binds the session
+  assert.equal(continuation.continuation, true);
+
+  // The stale inactive binding is replaced, and the resumed session begins
+  // the plan node with its own identity.
+  await dispatches.onSession({ id: 'p1', parentID: 'root' });
+  await dispatches.onPart(part('c2', 'p1'));
+  assert.equal(state.nodes['plan-1'].state, 'RUNNING');
+  assert.equal(state.nodes['plan-1'].attempt, 1);
+  assert.equal(state.nodes['plan-1'].sessionId, 'p1');
+  assert.equal(bindings.get('p1').active, true);
+  assert.equal(bindings.get('p1').nodeId, 'plan-1');
+
+  // A free-role continuation without any ready node (explorer) re-establishes
+  // a free binding for the same session instead of failing.
+  const idle = await harness();
+  idle.bindings.set('e1', { runId: 'root', root: false, agent: 'graph-explorer', nodeId: null, sessionId: 'e1', dispatchId: 'd1', active: false });
+  const freeContinuation = await idle.dispatches.admit('root', 'cx', { subagent_type: 'graph-explorer', task_id: 'e1' });
+  assert.equal(freeContinuation.allowed, true, JSON.stringify(freeContinuation));
+  assert.equal(freeContinuation.free, true);
+  await idle.dispatches.onSession({ id: 'e1', parentID: 'root' });
+  await idle.dispatches.onPart({
+    type: 'tool', tool: 'task', callID: 'cx', sessionID: 'root',
+    state: { status: 'running', input: { subagent_type: 'graph-explorer' }, metadata: { parentSessionId: 'root', sessionId: 'e1' } },
+  });
+  assert.equal(idle.bindings.get('e1').active, true);
+  assert.equal(idle.bindings.get('e1').nodeId, null);
+});

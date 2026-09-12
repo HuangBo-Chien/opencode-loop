@@ -1180,3 +1180,55 @@ test('repair dispatches carry the verifier failure evidence', async (t) => {
   // The failed verification is durable evidence, not a dropped verdict.
   assert.equal(h.store.getRun('root').artifacts['verification:verify-1'].payload.verdict, 'FAIL');
 });
+
+test('round-1 planner continues through task_id after REVISE and submits v2 (field regression)', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-free-continue-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  await h.tools.graph_submit_findings.execute({ summary: 'evidence', evidence: ['a.ts:1'] }, ctx(h, 'child-explore', 'graph-explorer'));
+  await childIdle(h, 'child-explore');
+
+  // Round 1: a FREE-bound planner session submits v1, then goes idle.
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'p1', 'graph-planner');
+  const v1 = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'p1', 'graph-planner')));
+  assert.equal(v1.ok, true, JSON.stringify(v1));
+  await childIdle(h, 'p1');
+  // A successful plan submission invalidates old dispatch bindings: the
+  // round-1 session has neither a binding nor a node sessionId to resume.
+  assert.equal(h.bindings.has('p1'), false);
+
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'c1', 'graph-plan-critic');
+  const revise = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'REVISE', findings: ['cover token rotation'] }, ctx(h, 'c1', 'graph-plan-critic')));
+  assert.equal(revise.ok, true, JSON.stringify(revise));
+  await childIdle(h, 'c1');
+
+  // The SAME round-1 session continues its next task: the plan node binds,
+  // the attempt is charged and the critic's findings are injected. Before
+  // this fix the continuation was rejected (FRESH_SESSION_REQUIRED) and the
+  // leftover stale binding turned graph_submit_plan into BINDING_UNAVAILABLE.
+  const continuation = await dispatch(h, 'graph-planner', { prompt: 'revise the plan', task_id: 'p1' });
+  assert.ok(!continuation.args.prompt.includes('RUNNER_REJECTED'), continuation.args.prompt);
+  assert.match(continuation.args.prompt, /Assigned nodeId: plan-1/);
+  assert.match(continuation.args.prompt, /修訂要求/);
+  assert.match(continuation.args.prompt, /cover token rotation/);
+  await bindChild(h, 'p1', 'graph-planner');
+  const state = h.store.getRun('root');
+  assert.equal(state.nodes['plan-1'].state, 'RUNNING');
+  assert.equal(state.nodes['plan-1'].sessionId, 'p1');
+  assert.equal(h.bindings.get('p1').active, true);
+  const v2 = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'p1', 'graph-planner')));
+  assert.equal(v2.ok, true, JSON.stringify(v2));
+  await childIdle(h, 'p1');
+
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'c2', 'graph-plan-critic');
+  const pass = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 2, verdict: 'PASS', findings: [] }, ctx(h, 'c2', 'graph-plan-critic')));
+  assert.equal(pass.ok, true, JSON.stringify(pass));
+  assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
+});
