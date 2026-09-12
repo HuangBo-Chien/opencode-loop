@@ -86,3 +86,20 @@ test('fd duplicator redirects are not file write targets', () => {
   const screened = firstOutOfScopeShellWrite('echo hi 1>&2 2>&1 >lanes/root/out.txt', ['lanes/root/**'], () => null);
   assert.equal(screened, null);
 });
+
+test('mid-token tildes are literal; only leading tildes mean expansion', () => {
+  // Windows 8.3 short names (C:\Users\RUNNER~1\...) are literal paths and
+  // must resolve through the caller's workspace mapper instead of failing
+  // open just because the username contains a tilde.
+  const shortName = 'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\w\\pkg-a\\steal.sh';
+  const resolver = (absolute) => absolute.replace(/\\/g, '/').endsWith('/w/pkg-a/steal.sh') ? 'pkg-a/steal.sh' : null;
+  const targets = extractShellWriteTargets(`cat > ${shortName} <<'EOF'\nboom\nEOF`, resolver);
+  assert.deepEqual(targets, ['pkg-a/steal.sh']);
+  assert.equal(firstOutOfScopeShellWrite(`cat > ${shortName}`, ['pkg-b/**'], resolver), 'pkg-a/steal.sh');
+
+  // A leading tilde is shell expansion the screen cannot evaluate: it
+  // stays unresolvable and the screen fails open (returns null).
+  const expanded = extractShellWriteTargets('echo hi > ~/steal.sh', resolver);
+  assert.deepEqual(expanded, [null]);
+  assert.equal(firstOutOfScopeShellWrite('echo hi > ~/steal.sh', ['pkg-b/**'], resolver), null);
+});

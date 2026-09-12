@@ -12,7 +12,16 @@ import { matchScopePath, normalizeScopePath } from './task-spec.mjs';
 const MAX_SCAN_CHARS = 100_000;
 const WRITE_COMMANDS = new Set(['cp', 'mv', 'install', 'rm', 'tee', 'dd', 'sed', 'truncate']);
 const SKIP_TARGETS = /^\/dev\/(null|zero|full|stdout|stderr|tty)/;
-const UNRESOLVABLE = /[$*`~]/;
+// '$', '*' and backtick indicate expansion or unexpanded globs anywhere in
+// a token; '~' only means tilde expansion at the start of one. Mid-token
+// tildes are literal characters (notably Windows 8.3 short names like
+// C:\Users\RUNNER~1\...), so treating them as unresolvable would fail open
+// on real runner paths.
+const UNRESOLVABLE = /[$*`]/;
+const TILDE_EXPANSION = /^~/;
+function unresolvableToken(raw) {
+  return UNRESOLVABLE.test(raw) || TILDE_EXPANSION.test(raw);
+}
 const SEGMENT_SPLIT = /\s*(?:&&|\|\||;|\||\n)\s*/;
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
@@ -53,7 +62,7 @@ function joinRelative(cwd, relativePath) {
 // Absolute paths map through the caller's workspace-relative resolver; paths
 // outside the workspace or containing unresolvable tokens return null.
 function resolveCandidate(raw, cwd, toWorkspaceRelative) {
-  if (typeof raw !== 'string' || !raw.length || SKIP_TARGETS.test(raw) || UNRESOLVABLE.test(raw)) return null;
+  if (typeof raw !== 'string' || !raw.length || SKIP_TARGETS.test(raw) || unresolvableToken(raw)) return null;
   if (/^[a-zA-Z]:/.test(raw) || raw.startsWith('/')) {
     return toWorkspaceRelative(raw);
   }
@@ -107,7 +116,7 @@ export function extractShellWriteTargets(command, toWorkspaceRelative) {
         const relative = toWorkspaceRelative(destination);
         if (relative === null) outside = true;
         else { cwd = relative; outside = false; }
-      } else if (!UNRESOLVABLE.test(destination)) {
+      } else if (!unresolvableToken(destination)) {
         const joined = cwd.length ? `${cwd}/${destination}` : destination;
         const normalized = normalizeScopePath(joined);
         if (normalized) cwd = normalized;
