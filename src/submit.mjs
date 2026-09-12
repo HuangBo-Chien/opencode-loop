@@ -54,7 +54,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (Object.values(located.state.nodes).some((node) => node.state === 'RUNNING' && ['review', 'implement', 'verify'].includes(node.spec.kind))) {
         return rejected('RUN_BUSY', 'finish or recover in-flight review/implementation/verification before replacing the plan');
       }
-      const graph = validateTaskGraph(args.specs, { planOnly: args.intent === 'plan-only', maxAttemptsCeiling: 10 });
+      const graph = validateTaskGraph(args.specs, { planOnly: args.intent === 'plan-only', maxAttemptsCeiling: 20 });
       if (!graph.ok) {
         return rejected('INVALID_GRAPH', graph.errors.join('; '), [
           'TaskSpec schema: {id, kind(explore|analyze|plan|review|implement|verify), agent — must be the kind-mapped graph-* specialist (explore→graph-explorer, analyze→graph-multimodal, plan→graph-planner, review→graph-plan-critic, implement→graph-implementer, verify→graph-verifier), dependsOn:[node ids] (required), inputs:[artifact refs like findings@1], outputs:[bare artifact names only — versions are runner-assigned], writeScope:[relative workspace paths/globs] (implement nodes only, non-empty, pairwise disjoint), acceptance:[criteria] (implement nodes required), maxAttempts?, allowShell?}',

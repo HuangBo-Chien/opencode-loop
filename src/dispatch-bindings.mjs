@@ -84,11 +84,32 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
         }
         return denied('FRESH_SESSION_REQUIRED', 'task_id may only continue an active attempt or resume the unfinished node this session last worked on; other nodes, finished work and retries need a fresh session');
       }
-      const pending = [...records.values()].some((r) => r.runId === root.runId && !r.bound && r.nodeId &&
-        (r.agent === agent || (agent === 'graph-implementer' && r.agent === 'graph-implementer')));
-      if (pending) return denied('DISPATCH_PENDING', 'a task for this role is reserved and awaiting host session binding');
-      const decision = runner.admitDispatch(state, { agent, now: NOW(), nodeId: target });
-      if (!decision.allowed) { await store.saveRun(state); return decision; }
+      // Reservations are node-level: a fresh dispatch may not target a node
+      // that another in-flight reservation already holds. Implementer
+      // admission is additionally bounded by the writer capacity gate
+      // (unbound reservations + RUNNING nodes); other roles keep single-flight
+      // per-role pending semantics.
+      const reserved = new Set([...records.values()].filter((r) => r.runId === root.runId && !r.bound && !r.terminal && r.nodeId && r.agent === agent).map((r) => r.nodeId));
+      if (agent === 'graph-implementer') {
+        if (target !== null && reserved.has(target)) return denied('DISPATCH_PENDING', `${target} is reserved and awaiting host session binding`);
+        const running = Object.values(state.nodes).filter((node) => node.spec.kind === 'implement' && node.state === 'RUNNING').length;
+        const capacity = runner.implementerCapacity(state);
+        if (running + reserved.size >= capacity) {
+          return denied('WRITER_CAPACITY', `${running} implement node(s) RUNNING and ${reserved.size} reservation(s) in flight; writer capacity ${running + reserved.size}/${capacity} is full`);
+        }
+      } else if (reserved.size > 0) {
+        return denied('DISPATCH_PENDING', 'a task for this role is reserved and awaiting host session binding');
+      }
+      const decision = runner.admitDispatch(state, { agent, now: NOW(), nodeId: target, excludeNodeIds: reserved });
+      if (!decision.allowed) {
+        // A sorted pick that found nothing because every candidate is already
+        // reserved is a pending reservation, not a missing graph.
+        if (decision.code === 'NO_READY_NODE' && agent === 'graph-implementer' && reserved.size > 0) {
+          return denied('DISPATCH_PENDING', `implement nodes are reserved and awaiting host session binding: ${[...reserved].join(', ')}`);
+        }
+        await store.saveRun(state);
+        return decision;
+      }
       records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent, nodeId: decision.nodeId,
         dispatchId: randomUUID(), sessionId: null, bound: false, continuation: false,
         acknowledged: false, idleSeen: false, terminal: false, targeted: target !== null,

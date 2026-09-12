@@ -302,3 +302,52 @@ test('terminal events retain failed binding recovery until it can be durably rec
   assert.equal(state.nodes.impl.attempt, 1);
   assert.equal((await dispatches.admit('root', 'fresh', { subagent_type: 'graph-implementer' })).allowed, true);
 });
+
+test('parallel implementer reservations occupy distinct nodes up to writer capacity', async () => {
+  const store = createRunStore();
+  const runner = createRunner({ maxAttempts: 3, maxPlanRevisions: 3 });
+  const state = await store.createRun({ runId: 'root', rootSessionId: 'root', now: 'now' });
+  const node = (id, scope) => ({ spec: { id, kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: [scope] }, state: 'PENDING', attempt: 0 });
+  state.nodes['impl-a'] = node('impl-a', 'pkg-a/**');
+  state.nodes['impl-b'] = node('impl-b', 'pkg-b/**');
+  const bindings = new Map([['root', { runId: 'root', root: true, agent: 'graph-orchestrator' }]]);
+  const dispatches = createDispatchBindings({ store, runner, bindings });
+  const part = (call, session) => ({
+    type: 'tool', tool: 'task', callID: call, sessionID: 'root',
+    state: { status: 'running', input: { subagent_type: 'graph-implementer' }, metadata: { parentSessionId: 'root', sessionId: session } },
+  });
+
+  // Two concurrent admissions reserve DIFFERENT nodes before either binds.
+  const first = await dispatches.admit('root', 'a', { subagent_type: 'graph-implementer' });
+  assert.equal(first.allowed, true, JSON.stringify(first));
+  assert.equal(first.nodeId, 'impl-a');
+  const second = await dispatches.admit('root', 'b', { subagent_type: 'graph-implementer' });
+  assert.equal(second.allowed, true, JSON.stringify(second));
+  assert.equal(second.nodeId, 'impl-b');
+
+  // Capacity 2 is fully reserved: a third admission is refused up front,
+  // and a targeted duplicate of a reserved node reports DISPATCH_PENDING.
+  const third = await dispatches.admit('root', 'c', { subagent_type: 'graph-implementer' });
+  assert.equal(third.code, 'WRITER_CAPACITY');
+  const duplicate = await dispatches.admit('root', 'd', { subagent_type: 'graph-implementer' }, 'impl-a');
+  assert.equal(duplicate.code, 'DISPATCH_PENDING');
+  assert.match(duplicate.detail, /impl-a is reserved/);
+
+  // Both sessions bind and both nodes run concurrently.
+  await dispatches.onSession({ id: 'child-a', parentID: 'root' });
+  await dispatches.onSession({ id: 'child-b', parentID: 'root' });
+  await dispatches.onPart(part('a', 'child-a'));
+  await dispatches.onPart(part('b', 'child-b'));
+  assert.equal(state.nodes['impl-a'].state, 'RUNNING');
+  assert.equal(state.nodes['impl-b'].state, 'RUNNING');
+  assert.equal(state.nodes['impl-a'].sessionId, 'child-a');
+  assert.equal(state.nodes['impl-b'].sessionId, 'child-b');
+
+  // Finishing one writer frees a capacity slot for the next dispatch.
+  await dispatches.onIdle('child-a', 'idle-a1');
+  await dispatches.onIdle('child-a', 'idle-a2');
+  assert.equal(state.nodes['impl-a'].state, 'INCOMPLETE');
+  const next = await dispatches.admit('root', 'e', { subagent_type: 'graph-implementer' });
+  assert.equal(next.allowed, true, JSON.stringify(next));
+  assert.equal(next.nodeId, 'impl-a');
+});

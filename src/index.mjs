@@ -32,7 +32,7 @@ export default async function GraphPlugin(context, options = {}) {
     worktree,
   });
   const store = createJournaledRunStore(baseStore, journalService);
-  const runner = createRunner({ maxAttempts: settings.maxAttempts, maxPlanRevisions: settings.maxPlanRevisions });
+  const runner = createRunner({ maxAttempts: settings.maxAttempts, maxPlanRevisions: settings.maxPlanRevisions, implementerParallel: settings.maxImplementerParallel });
   const bindings = new Map();
   const enforcement = createEnforcement({ settings: { worktree, journal: settings.journal }, store, runner, bindings, client: context.client });
   const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches });

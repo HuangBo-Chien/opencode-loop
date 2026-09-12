@@ -1,6 +1,6 @@
 # opencode-loop
 
-`0.3.0-alpha.4` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
+`0.3.0-alpha.5` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
 
 ## How the gate works
 
@@ -41,7 +41,8 @@ Work packages are `TaskSpec` nodes (`id`, `kind`, `agent`, `dependsOn`, `inputs`
 
 ### Dispatch and recovery
 
-- The coordinator can steer dispatch: an explicit `nodeId` task argument, or a single `[nodeId: implement-setup]` marker on the first prompt line, targets a specific node. The runner validates exactly that node (existence, role match, admissibility, attempts, single-writer) and either binds it or rejects the dispatch with the precise reason (`NODE_NOT_FOUND`, `NODE_NOT_ADMISSIBLE`, `ATTEMPTS_EXHAUSTED`, `SINGLE_WRITER`); it never silently reassigns the request to a different node. Unmarked dispatches keep the runner's own ordering, and every bound dispatch confirms the assignment with a `[RUNNER] Assigned nodeId` prompt line.
+- The coordinator can steer dispatch: an explicit `nodeId` task argument, or a single `[nodeId: implement-setup]` marker on the first prompt line, targets a specific node. The runner validates exactly that node (existence, role match, admissibility, attempts, writer capacity) and either binds it or rejects the dispatch with the precise reason (`NODE_NOT_FOUND`, `NODE_NOT_ADMISSIBLE`, `ATTEMPTS_EXHAUSTED`, `WRITER_CAPACITY`); it never silently reassigns the request to a different node. Unmarked dispatches keep the runner's own ordering, and every bound dispatch confirms the assignment with a `[RUNNER] Assigned nodeId` prompt line.
+- Implementers run in parallel under a bounded writer-capacity gate: at most `min(maxImplementerParallel, critic approvedParallel)` implement nodes may be RUNNING (or reserved) at once, and their write scopes are pairwise disjoint by plan validation. Concurrent dispatch reservations always occupy **distinct** nodes (reserved nodes are excluded from the sorted pick and a targeted duplicate reports `DISPATCH_PENDING`), so parallel `[nodeId:...]` dispatches never collide. Verifiers, critics and planners keep one-in-flight semantics.
 - The critic is never freely admitted: its verdict can only travel through a bound review node, so when the review node exists but is not yet admissible the dispatch is rejected up front with `NO_READY_NODE` and the waiting reasons (plus the artifact-naming hint when an input references a name nothing produces) instead of stranding a child session that could never submit. Explorer, planner and multimodal keep free consultation because their findings/plan submissions do not require a node binding.
 - `task_id` may continue the same active RUNNING attempt and role in the same run without charging another attempt. It may also **resume the unfinished node the session last worked on** when that node is `INCOMPLETE`/`PENDING`/`STALE` with attempts left: a new attempt is charged, the recorded side-effect ledger travels with the dispatch, and the old inactive binding is superseded. Completed nodes, foreign sessions and exhausted attempts still require a fresh session (`FRESH_SESSION_REQUIRED`, and rejection messages name the bound node).
 - Read-only tools (`read`, `glob`, `grep`, `list`, `graph_status`, `graph_inspect`, `graph_journal_search`, `graph_journal_read`) are never collaterally blocked by the dispatch-binding gate. Rejected or finished children resolve the owning run through the host-verified parent chain, so inspection and journal history stay available even after a run reaches a terminal state. Write paths keep failing closed.
@@ -81,12 +82,12 @@ Global promotion never copies a project entry. It accepts only a project `insigh
 
 ## Project-local installation
 
-Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.4.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
+Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.5.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
 
 From the project where you want to use the plugin, install that local tarball:
 
 ```powershell
-npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.4.tgz
+npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.5.tgz
 node --input-type=module -e "import {pathToFileURL} from 'node:url'; import path from 'node:path'; console.log(pathToFileURL(path.resolve('node_modules/opencode-loop/src/index.mjs')).href)"
 ```
 
@@ -149,10 +150,10 @@ The default plugin function accepts `(context, options)`. Supported options are 
 | `enabled` | `true` | Boolean; false returns no hooks |
 | `setDefaultAgent` | `false` | Boolean; true selects `graph-orchestrator` |
 | `models` | `{}` | Map of seven full agent names to nonempty model strings, max 256 characters, no surrounding whitespace or control characters |
-| `maxAttempts` | `3` | Integer 1–10; enforced per-node attempt budget (including the first attempt) and the verification repair loop cap |
-| `maxParallel` | `4` | Integer 1–16; maximum independent read-only tasks (prompt-guided; writes are mechanically single-writer) |
-| `maxImplementerParallel` | `1` | Integer 1–4; planner/critic parallelism ceiling (advisory for scheduling; the runner still serializes write nodes in this version) |
-| `maxPlanRevisions` | = `maxAttempts` | Integer 1–10; enforced cap on REVISE loops before the run fails |
+| `maxAttempts` | `3` | Integer 1–20; enforced per-node attempt budget (including the first attempt) and the verification repair loop cap |
+| `maxParallel` | `4` | Integer 1–16; maximum independent read-only tasks (prompt-guided) |
+| `maxImplementerParallel` | `2` | Integer 1–4; enforced cap on concurrently RUNNING (or reserved) implement nodes, narrowed by the critic's `approvedParallel`; write scopes stay pairwise disjoint by plan validation |
+| `maxPlanRevisions` | = `maxAttempts` | Integer 1–20; enforced cap on REVISE loops before the run pauses for a user decision |
 | `stateDirectory` | `.opencode-loop` | 1–4 forward-slash separated segments (`[A-Za-z0-9.][A-Za-z0-9._-]`), no `.`/`..`/backslashes |
 | `enforcement` | `hooks` | The literal `'hooks'` (only supported mode) |
 | `journal.enabled` | `true` | Boolean; disables projection/backfill/search/writes when false; registered journal tools reject with `JOURNAL_DISABLED` |
@@ -176,4 +177,4 @@ What remains explicitly **not** claimed:
 - Journal redaction is best-effort, storage is plaintext, and historical entries can be stale; journal output is never current gate evidence.
 - The internal effect boundary (`effect-boundary.mjs`) remains a tested but unwired design sketch; its replay protection is still single-instance.
 
-Multi-writer parallelism is future work: the runner enforces one RUNNING implement node at a time. `maxImplementerParallel` currently only shapes planner/critic recommendations.
+Parallel implementers are gated at **admission time** (dispatch capacity over reserved + RUNNING nodes), unlike creation-time worker pools in team-style plugins; the gate sees the run's live DAG state, and per-node side-effect ledgers, file claims and scope enforcement are already per-writer. A per-member git-worktree isolation option (stronger than scope globs, at the cost of merge-back) is a possible future TaskSpec field. Attempt ceilings are per-node structured-submission budgets — much coarser than conversation-turn budgets — and exhaustion now pauses for a user reset decision rather than terminating, which is the intended pressure valve instead of larger budgets.

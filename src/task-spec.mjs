@@ -85,7 +85,7 @@ function scopePathsOverlap(patternA, patternB) {
   return shorter.length > 0 && (longer === shorter || longer.startsWith(`${shorter}/`));
 }
 
-export function validateTaskSpec(spec, { maxAttemptsCeiling = 10 } = {}) {
+export function validateTaskSpec(spec, { maxAttemptsCeiling = 20 } = {}) {
   const errors = [];
   const fail = (detail) => errors.push(detail);
   if (!isPlainObject(spec)) return { ok: false, errors: ['task spec must be a plain object'], spec: null };
@@ -132,7 +132,7 @@ export function validateTaskSpec(spec, { maxAttemptsCeiling = 10 } = {}) {
   return { ok: errors.length === 0, errors, spec: { ...spec } };
 }
 
-export function validateTaskGraph(specs, { planOnly = false, maxAttemptsCeiling = 10 } = {}) {
+export function validateTaskGraph(specs, { planOnly = false, maxAttemptsCeiling = 20 } = {}) {
   const errors = [];
   if (!Array.isArray(specs) || specs.length < 1 || specs.length > MAX_SPECS) {
     return { ok: false, errors: [`specs must be a non-empty array (max ${MAX_SPECS})`], order: null, nodes: null };

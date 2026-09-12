@@ -908,3 +908,80 @@ test('graph_run_decide preconditions: role, root, in-flight nodes and dispatches
   const next = JSON.parse(await h.tools.graph_run_new.execute({}, ctx(h, 'root', 'graph-orchestrator')));
   assert.equal(next.ok, true, JSON.stringify(next));
 });
+
+test('parallel writers: two [nodeId:] implementers run concurrently and complete end to end', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-parallel-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await setupSteerableRun(h);
+
+  const first = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-a]\nwork a' });
+  const second = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-b]\nwork b' });
+  assert.ok(!first.args.prompt.includes('RUNNER_REJECTED'));
+  assert.ok(!second.args.prompt.includes('RUNNER_REJECTED'));
+  await bindChild(h, 'child-a', 'graph-implementer');
+  await bindChild(h, 'child-b', 'graph-implementer');
+
+  // Both writers are RUNNING at the same time with disjoint scopes.
+  const state = h.store.getRun('root');
+  assert.equal(state.nodes['impl-a'].state, 'RUNNING');
+  assert.equal(state.nodes['impl-b'].state, 'RUNNING');
+
+  // A third implementer is refused while both capacity slots are taken.
+  const third = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-a]\nagain' });
+  assert.match(third.args.prompt, /RUNNER_REJECTED/);
+  assert.match(third.args.prompt, /WRITER_CAPACITY/);
+
+  // Scope enforcement stays per-node while running in parallel.
+  const escape = { args: { filePath: join(dir, 'pkg-b', 'from-a.ts'), content: 'x' } };
+  await h.enforcement.onToolBefore({ tool: 'write', sessionID: 'child-a', callID: 'w1' }, escape);
+  const permission = { status: 'ask' };
+  await h.enforcement.onPermissionAsk({ type: 'write', sessionID: 'child-a', callID: 'w1', pattern: join(dir, 'pkg-b', 'from-a.ts') }, permission);
+  assert.equal(permission.status, 'deny');
+  assert.ok(h.store.getRun('root').violations.some((entry) => entry.kind === 'out-of-scope-write'));
+
+  await mkdir(join(dir, 'pkg-a'), { recursive: true });
+  await mkdir(join(dir, 'pkg-b'), { recursive: true });
+  await writeFile(join(dir, 'pkg-a', 'a.ts'), 'a');
+  await writeFile(join(dir, 'pkg-b', 'b.ts'), 'b');
+  const changeA = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-a', filesTouched: ['pkg-a/a.ts'], summary: 'a' }, ctx(h, 'child-a', 'graph-implementer')));
+  const changeB = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-b', filesTouched: ['pkg-b/b.ts'], summary: 'b' }, ctx(h, 'child-b', 'graph-implementer')));
+  assert.equal(changeA.ok, true, JSON.stringify(changeA));
+  assert.equal(changeB.ok, true, JSON.stringify(changeB));
+  await childIdle(h, 'child-a');
+  await childIdle(h, 'child-b');
+
+  await dispatch(h, 'graph-verifier');
+  await bindChild(h, 'child-verify', 'graph-verifier');
+  const verdict = JSON.parse(await h.tools.graph_submit_verification.execute(
+    { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }] },
+    ctx(h, 'child-verify', 'graph-verifier'),
+  ));
+  assert.equal(verdict.ok, true, JSON.stringify(verdict));
+  assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
+});
+
+test('critic approvedParallel downgrade mechanically serializes writers', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-parallel-capped-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  await h.tools.graph_submit_plan.execute({ intent: 'change', specs: STEER_SPECS }, ctx(h, 'child-planner', 'graph-planner'));
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  const capped = JSON.parse(await h.tools.graph_submit_review.execute(
+    { planVersion: 1, verdict: 'PASS', findings: [], approvedParallel: 1 },
+    ctx(h, 'child-critic', 'graph-plan-critic'),
+  ));
+  assert.equal(capped.ok, true, JSON.stringify(capped));
+
+  const first = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-a]\nwork a' });
+  assert.ok(!first.args.prompt.includes('RUNNER_REJECTED'));
+  await bindChild(h, 'child-a', 'graph-implementer');
+  const second = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-b]\nwork b' });
+  assert.match(second.args.prompt, /RUNNER_REJECTED/);
+  assert.match(second.args.prompt, /WRITER_CAPACITY/);
+  assert.match(second.args.prompt, /1\/1/);
+});

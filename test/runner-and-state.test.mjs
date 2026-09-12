@@ -30,11 +30,11 @@ function freshRun(graph = changeGraph()) {
   assert.equal(submission.ok, true, JSON.stringify(submission));
   return state;
 }
-async function dispatchCriticAndPass(state, planVersion = 1) {
+async function dispatchCriticAndPass(state, planVersion = 1, approvedParallel = null) {
   const admit = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
   assert.equal(admit.allowed, true, JSON.stringify(admit));
   runner.beginNode(state, admit.nodeId, { now: NOW, sessionId: 'sess-critic' });
-  const review = runner.submitReview(state, { planVersion, verdict: 'PASS', findings: [], now: NOW });
+  const review = runner.submitReview(state, { planVersion, verdict: 'PASS', findings: [], approvedParallel, now: NOW });
   assert.equal(review.ok, true, JSON.stringify(review));
   return admit;
 }
@@ -539,7 +539,7 @@ test('attempts persist across reload and are not reset by restarts', async (t) =
   assert.match(reloaded.pendingDecision.detail, /never delivered/);
 });
 
-test('single-writer: second implementer node cannot run while one is RUNNING', async () => {
+test('writer capacity: disjoint implement nodes run in parallel up to the cap', async () => {
   const graph = validateTaskGraph([
     spec('explore-1', 'explore', 'graph-explorer'),
     spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'] }),
@@ -551,12 +551,51 @@ test('single-writer: second implementer node cannot run while one is RUNNING', a
   const state = newRun({ runId: 'r2', rootSessionId: 'r2', now: NOW });
   runner.submitPlan(state, { intent: 'change', nodes: graph.nodes, now: NOW });
   await dispatchCriticAndPass(state);
+  assert.equal(runner.implementerCapacity(state), 2);
+
   const first = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
   assert.equal(first.nodeId, 'impl-1');
   runner.beginNode(state, 'impl-1', { now: NOW, sessionId: 'i1' });
+  // Default capacity 2: a second disjoint writer is admitted while the first runs.
   const second = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
-  assert.equal(second.allowed, false);
-  assert.equal(second.code, 'ALREADY_RUNNING');
+  assert.equal(second.allowed, true);
+  assert.equal(second.nodeId, 'impl-2');
+  runner.beginNode(state, 'impl-2', { now: NOW, sessionId: 'i2' });
+  assert.equal(state.nodes['impl-1'].state, 'RUNNING');
+  assert.equal(state.nodes['impl-2'].state, 'RUNNING');
+  const third = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
+  assert.equal(third.allowed, false);
+  assert.equal(third.code, 'WRITER_CAPACITY');
+  assert.match(third.detail, /2\/2/);
+
+  // A critic downgrade to approvedParallel=1 mechanically narrows the gate.
+  const capped = newRun({ runId: 'r2b', rootSessionId: 'r2b', now: NOW });
+  runner.submitPlan(capped, { intent: 'change', nodes: graph.nodes, now: NOW });
+  await dispatchCriticAndPass(capped, 1, 1);
+  assert.equal(runner.implementerCapacity(capped), 1);
+  const cappedFirst = runner.admitDispatch(capped, { agent: 'graph-implementer', now: NOW });
+  assert.equal(cappedFirst.allowed, true);
+  runner.beginNode(capped, cappedFirst.nodeId, { now: NOW, sessionId: 'i3' });
+  const cappedSecond = runner.admitDispatch(capped, { agent: 'graph-implementer', now: NOW });
+  assert.equal(cappedSecond.allowed, false);
+  assert.equal(cappedSecond.code, 'WRITER_CAPACITY');
+  assert.match(cappedSecond.detail, /1\/1/);
+
+  // A runner explicitly configured for single-writer keeps the old semantics.
+  const single = createRunner({ maxAttempts: 3, maxPlanRevisions: 2, implementerParallel: 1 });
+  const solo = newRun({ runId: 'r2c', rootSessionId: 'r2c', now: NOW });
+  runner.submitPlan(solo, { intent: 'change', nodes: graph.nodes, now: NOW });
+  const soloCritic = single.admitDispatch(solo, { agent: 'graph-plan-critic', now: NOW });
+  single.beginNode(solo, soloCritic.nodeId, { now: NOW, sessionId: 'c' });
+  single.submitReview(solo, { planVersion: 1, verdict: 'PASS', findings: [], now: NOW });
+  const soloFirst = single.admitDispatch(solo, { agent: 'graph-implementer', now: NOW });
+  single.beginNode(solo, soloFirst.nodeId, { now: NOW, sessionId: 'i4' });
+  const soloSecond = single.admitDispatch(solo, { agent: 'graph-implementer', now: NOW });
+  assert.equal(soloSecond.code, 'WRITER_CAPACITY');
+
+  // Verifiers keep one-in-flight semantics regardless of writer capacity.
+  const verifierBusy = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  assert.equal(verifierBusy.code, 'NO_READY_NODE'); // impl deps not SUCCEEDED yet
 });
 
 test('resume: crash windows classify conservatively and keep counters', async () => {
@@ -787,10 +826,18 @@ test('coordinator-targeted dispatch validates the requested node specifically', 
   const unknown = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-zzz' });
   assert.equal(unknown.code, 'NODE_NOT_FOUND');
 
-  // Targeting a node that is RUNNING is rejected, not silently reassigned.
+  // Targeting a node that is RUNNING is rejected, not silently reassigned;
+  // a different free node within capacity is admitted alongside.
   runner.beginNode(state, 'impl-b', { now: NOW, sessionId: 'sess-b' });
-  const running = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-a' });
-  assert.equal(running.code, 'ALREADY_RUNNING');
+  const running = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-b' });
+  assert.equal(running.code, 'NODE_NOT_ADMISSIBLE');
+  assert.match(running.detail, /RUNNING/);
+  const alongside = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-a' });
+  assert.equal(alongside.allowed, true);
+  assert.equal(alongside.nodeId, 'impl-a');
+  runner.beginNode(state, 'impl-a', { now: NOW, sessionId: 'sess-a' });
+  const full = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-a' });
+  assert.equal(full.code, 'WRITER_CAPACITY');
 });
 
 test('targeted dispatch of an exhausted node keeps sorted-path failure semantics', async () => {
@@ -841,4 +888,23 @@ test('critics are never freely admitted; a not-ready review rejects dispatch up 
   const admitted = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
   assert.equal(admitted.allowed, true);
   assert.equal(admitted.nodeId, 'review-1');
+});
+
+test('excludeNodeIds steers the sorted pick away from reserved nodes', async () => {
+  const graph = validateTaskGraph([
+    spec('plan-1', 'plan', 'graph-planner'),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'] }),
+    spec('impl-a', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['a/**'] }),
+    spec('impl-b', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['b/**'] }),
+  ]);
+  const state = newRun({ runId: 'excl', rootSessionId: 'excl', now: NOW });
+  runner.submitPlan(state, { intent: 'change', nodes: graph.nodes, now: NOW });
+  await dispatchCriticAndPass(state);
+
+  const skipped = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, excludeNodeIds: new Set(['impl-a']) });
+  assert.equal(skipped.allowed, true);
+  assert.equal(skipped.nodeId, 'impl-b');
+
+  const bothExcluded = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, excludeNodeIds: ['impl-a', 'impl-b'] });
+  assert.equal(bothExcluded.code, 'NO_READY_NODE');
 });

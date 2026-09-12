@@ -191,7 +191,7 @@ test('namespace collisions reject atomically without replacing existing definiti
 
 test('invalid options are rejected even when disabled', async () => {
   const { default: plugin } = await load();
-  const invalid = [null, [], 'enabled', { extra: true }, { enabled: 'false' }, { setDefaultAgent: 1 }, { maxAttempts: 0 }, { maxAttempts: 11 }, { maxAttempts: 1.2 }, { maxParallel: 0 }, { maxParallel: 17 }, { maxParallel: Infinity }, { maxImplementerParallel: 0 }, { maxImplementerParallel: 5 }, { maxImplementerParallel: 1.5 }, { maxPlanRevisions: 0 }, { maxPlanRevisions: 11 }, { maxPlanRevisions: 2.5 }, { stateDirectory: '../escape' }, { stateDirectory: 'a/b/c/d/e' }, { stateDirectory: '' }, { stateDirectory: 'dir\\win' }, { enforcement: 'strict' }, { enforcement: null }, { models: null }, { models: [] }, { models: { build: 'v/m' } }, { models: { 'graph-planner': '' } }, { models: { 'graph-planner': ' model ' } }, { models: { 'graph-planner': () => {} } }, { enabled: false, injectAuthority() {} }];
+  const invalid = [null, [], 'enabled', { extra: true }, { enabled: 'false' }, { setDefaultAgent: 1 }, { maxAttempts: 0 }, { maxAttempts: 21 }, { maxAttempts: 1.2 }, { maxParallel: 0 }, { maxParallel: 17 }, { maxParallel: Infinity }, { maxImplementerParallel: 0 }, { maxImplementerParallel: 5 }, { maxImplementerParallel: 1.5 }, { maxPlanRevisions: 0 }, { maxPlanRevisions: 21 }, { maxPlanRevisions: 2.5 }, { stateDirectory: '../escape' }, { stateDirectory: 'a/b/c/d/e' }, { stateDirectory: '' }, { stateDirectory: 'dir\\win' }, { enforcement: 'strict' }, { enforcement: null }, { models: null }, { models: [] }, { models: { build: 'v/m' } }, { models: { 'graph-planner': '' } }, { models: { 'graph-planner': ' model ' } }, { models: { 'graph-planner': () => {} } }, { enabled: false, injectAuthority() {} }];
   for (const options of invalid) await assert.rejects(plugin({}, options), /option|model|maxAttempts|maxParallel|maxImplementerParallel|maxPlanRevisions|stateDirectory|enforcement|enabled|setDefaultAgent/i);
   const { default: plugin2 } = await load();
   const hooks = await plugin2({}, { maxPlanRevisions: 5 });
@@ -234,7 +234,7 @@ test('status projects healthy journal capabilities and dynamic counts without se
 
   assert.equal(calls, 1);
   assert.equal(status.workflowMode, 'gated');
-  assert.deepEqual(status.limits, { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1, maxPlanRevisions: 3 });
+  assert.deepEqual(status.limits, { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 2, maxPlanRevisions: 3 });
   assert.equal(status.stateDirectory, 'runtime-state');
   assert.equal(status.journal.enabled, true);
   assert.equal(status.journal.includeUserRequest, false);
@@ -308,14 +308,14 @@ test('status is read-only, truthful, stable and does not expose host secrets or 
   const hooks = await plugin({ directory: 'C:/private/project', secret: 'host-secret' });
   const output = await hooks.tool.graph_status.execute({}, new Proxy({}, { get() { throw new Error('host effects forbidden'); } }));
   const status = JSON.parse(output);
-  assert.equal(status.version, '0.3.0-alpha.4');
+  assert.equal(status.version, '0.3.0-alpha.5');
   assert.equal(status.enforcementScope, 'GRAPH_MANAGED_SESSIONS');
   assert.equal(status.enforcementAttested, false);
   assert.equal(status.runtimeAvailable, true);
   assert.equal(status.workflowMode, 'gated');
   assert.equal(status.limitsEnforced, true);
   assert.equal(status.managedRuntimeStatus, 'available');
-  assert.deepEqual(status.limits, { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1, maxPlanRevisions: 3 });
+  assert.deepEqual(status.limits, { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 2, maxPlanRevisions: 3 });
   assert.equal(status.stateDirectory, '.opencode-loop');
   assert.match(status.reason, /real-model/i);
   assert.match(status.enforcementDetail, /tool\.execute/i);

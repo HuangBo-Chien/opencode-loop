@@ -93,9 +93,19 @@ function completeIfDone(state, now) {
   return false;
 }
 
-export function createRunner({ maxAttempts, maxPlanRevisions }) {
+export function createRunner({ maxAttempts, maxPlanRevisions, implementerParallel = 2 }) {
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1) throw new TypeError('maxAttempts must be a positive integer');
   if (!Number.isInteger(maxPlanRevisions) || maxPlanRevisions < 1) throw new TypeError('maxPlanRevisions must be a positive integer');
+  if (!Number.isInteger(implementerParallel) || implementerParallel < 1 || implementerParallel > 4) throw new TypeError('implementerParallel must be an integer from 1 to 4');
+
+  // Effective writer capacity: the configured ceiling, narrowed by the
+  // critic's approvedParallel when the current valid review provides one.
+  function implementerCapacity(state) {
+    const review = state.artifacts.review;
+    const approved = review && review.status === 'valid' && Number.isInteger(review.payload?.approvedParallel) && review.payload.approvedParallel >= 1
+      ? review.payload.approvedParallel : null;
+    return Math.max(1, Math.min(implementerParallel, approved ?? implementerParallel));
+  }
 
   // Per-node admissibility shared by the sorted and coordinator-targeted paths.
   // Attempt exhaustion keeps sorted-path semantics: the node fails, and write
@@ -117,7 +127,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
     return { allowed: true, nodeId: chosen.spec.id, reconcile: chosen.reconcile === true || state.sideEffects.some((effect) => effect.nodeId === chosen.spec.id) };
   }
 
-  function admitDispatch(state, { agent, now, nodeId = null }) {
+  function admitDispatch(state, { agent, now, nodeId = null, excludeNodeIds = null }) {
     if (TERMINAL_RUN.has(state.status)) {
       return { allowed: false, code: 'RUN_TERMINATED', detail: state.failReason ? `run failed: ${state.failReason}` : 'run already finished' };
     }
@@ -136,14 +146,18 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
     }
 
     const mine = Object.values(state.nodes).filter((node) => node.spec.agent === agent);
-    if (mine.some((node) => node.state === 'RUNNING')) {
-      return { allowed: false, code: 'ALREADY_RUNNING', detail: `a ${agent} task for this run is still in flight` };
-    }
-    if (WRITE_AGENTS.has(agent)) {
-      const writerBusy = Object.values(state.nodes).some((node) => node.spec.kind === 'implement' && node.state === 'RUNNING');
-      if (writerBusy && agent === 'graph-implementer') {
-        return { allowed: false, code: 'SINGLE_WRITER', detail: 'another implement node is RUNNING; single-writer is enforced' };
+    // Implementers run under a bounded-capacity gate: several write nodes with
+    // pairwise-disjoint writeScopes may be RUNNING at once, up to
+    // min(implementerParallel, critic-approvedParallel). Every other role
+    // keeps one-in-flight semantics.
+    if (agent === 'graph-implementer') {
+      const running = Object.values(state.nodes).filter((node) => node.spec.kind === 'implement' && node.state === 'RUNNING').length;
+      const capacity = implementerCapacity(state);
+      if (running >= capacity) {
+        return { allowed: false, code: 'WRITER_CAPACITY', detail: `${running}/${capacity} implement nodes are in flight; wait for one to finish before dispatching another` };
       }
+    } else if (mine.some((node) => node.state === 'RUNNING')) {
+      return { allowed: false, code: 'ALREADY_RUNNING', detail: `a ${agent} task for this run is still in flight` };
     }
 
     // Coordinator-targeted dispatch: validate exactly the requested node so
@@ -156,8 +170,12 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
       return admissibleNode(state, chosen, agent, now);
     }
 
+    // Concurrent reservations for the same role must not collide on one node:
+    // the dispatcher passes already-reserved node ids to skip here.
+    const exclude = excludeNodeIds instanceof Set ? excludeNodeIds
+      : Array.isArray(excludeNodeIds) ? new Set(excludeNodeIds) : null;
     const ready = mine
-      .filter((node) => ELIGIBLE_STATES.has(node.state))
+      .filter((node) => ELIGIBLE_STATES.has(node.state) && !(exclude?.has(node.spec.id) ?? false))
       .map((node) => ({ node, deps: depsSatisfied(state, node) }))
       .filter((entry) => entry.deps.ok)
       .sort((a, b) => a.node.attempt - b.node.attempt || a.node.spec.id.localeCompare(b.node.spec.id));
@@ -563,6 +581,6 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
   return Object.freeze({
     admitDispatch, beginNode, attachSession, submitPlan, submitReview, checkChange, submitChange, submitVerification,
     recordSideEffect, recordViolation, captureRequest, completeRequestCapture, markIncomplete, resumeRun, reconcileNode, revalidateArtifacts, inspect,
-    abortRun, archiveForReset,
+    abortRun, archiveForReset, implementerCapacity,
   });
 }
