@@ -1032,7 +1032,7 @@ test('run ids with colons persist to platform-safe encoded filenames', async (t)
   assert.ok((await fresh.listRunIds()).includes('root:2'));
 });
 
-test('legacy colon filenames are lazily migrated and never duplicated', async (t) => {
+test('legacy colon filenames are lazily migrated and never duplicated', { skip: process.platform === 'win32' ? 'raw colon filenames are only representable on POSIX' : false }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'loop-legacy-migrate-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const runsDir = join(dir, '.opencode-loop', 'runs');
@@ -1060,4 +1060,23 @@ test('runFileKey output is Windows-filename safe for every representable id', as
     assert.equal(key.includes(':'), false);
     assert.equal(decodeURIComponent(key), id);
   }
+});
+
+test('pre-existing encoded run files are discovered and read by logical id', async (t) => {
+  // Windows-safe companion to the POSIX-only migration test: a hand-written
+  // encoded file (the canonical name since the filename split) must be
+  // decoded by listRunIds and loadable without any rename.
+  const dir = await mkdtemp(join(tmpdir(), 'loop-encoded-discovery-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsDir = join(dir, '.opencode-loop', 'runs');
+  await mkdir(runsDir, { recursive: true });
+  const state = newRun({ runId: 'old:1', rootSessionId: 'root', now: NOW });
+  await writeFile(join(runsDir, 'old%3A1.json'), JSON.stringify(state));
+
+  const store = createRunStore({ worktree: dir });
+  assert.deepEqual(await store.listRunIds(), ['old:1']);
+  const loaded = await store.loadRun('old:1');
+  assert.equal(loaded.runId, 'old:1');
+  const names = await fsPromises.readdir(runsDir);
+  assert.deepEqual(names.filter((name) => name.endsWith('.json')), ['old%3A1.json']);
 });
