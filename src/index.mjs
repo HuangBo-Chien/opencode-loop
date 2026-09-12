@@ -40,6 +40,7 @@ export default async function GraphPlugin(context, options = {}) {
     journalService,
     store,
     bindings,
+    dispatches: enforcement.dispatches,
     enabled: settings.journal.enabled,
   });
 

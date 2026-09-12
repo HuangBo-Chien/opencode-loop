@@ -506,3 +506,40 @@ test('service and run-store failures return one bounded generic safe journal err
     }
   }
 });
+
+test('journal read tools resolve a binding-free managed child through its parent run', async (t) => {
+  const { worktree, globalDirectory } = await roots(t);
+  const runStore = createRunStore({ worktree });
+  const state = await runStore.createRun({ runId: 'root-run', rootSessionId: 'root-run', now: CREATED_AT, request: null, requestCaptureCompleted: true });
+  state.status = 'SUCCEEDED';
+  state.updatedAt = FINISHED_AT;
+  await runStore.saveRun(state);
+  const journalStore = createJournalStore({ worktree, globalDirectory });
+  const journalService = createJournalService({
+    runStore,
+    journalStore,
+    journalSearch: { async search(args) { return { mode: 'metadata', hits: [], delegated: args }; }, status() { return { mode: 'test' }; } },
+    enabled: true,
+    worktree,
+  });
+  const bindings = new Map([['root-run', { runId: 'root-run', root: true, agent: 'graph-orchestrator' }]]);
+  const dispatches = {
+    runForSession(sessionId) {
+      return sessionId === 'late-child' ? 'root-run' : null;
+    },
+  };
+  const tools = await loadJournalTools({ journalService, store: runStore, bindings, dispatches, enabled: true });
+
+  const search = await execute(tools.graph_journal_search, { query: 'weights' }, 'late-child', 'graph-explorer');
+  assert.equal(search.ok, true, JSON.stringify(search));
+  const read = await execute(tools.graph_journal_read, { scope: 'project', id: HEX_A }, 'late-child', 'graph-explorer');
+  assert.equal(read.ok, false);
+  assert.equal(read.code, 'JOURNAL_NOT_FOUND');
+
+  // Unmanaged strangers without a parent-run link still fail closed.
+  const stranger = await execute(tools.graph_journal_search, { query: 'x' }, 'stranger', 'graph-explorer');
+  assert.equal(stranger.code, 'NOT_GRAPH_SESSION');
+  // Write tools still require the root binding.
+  const write = await execute(tools.graph_journal_write_insight, { title: 'T', body: 'B' }, 'late-child', 'graph-orchestrator');
+  assert.equal(write.code, 'ROOT_REQUIRED');
+});

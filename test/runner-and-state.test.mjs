@@ -735,3 +735,61 @@ test('inspect reports blockers, counters, artifacts and a mermaid graph', async 
   const after = runner.inspect(state);
   assert.equal(after.nodes.find((node) => node.id === 'impl-1').ready, true);
 });
+
+test('coordinator-targeted dispatch validates the requested node specifically', () => {
+  const state = newRun({ runId: 'targeted', rootSessionId: 'targeted', now: NOW });
+  const graph = validateTaskGraph([
+    spec('plan-1', 'plan', 'graph-planner'),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'] }),
+    spec('impl-a', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['a/**'] }),
+    spec('impl-b', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['b/**'] }),
+  ]);
+  runner.submitPlan(state, { intent: 'change', nodes: graph.nodes, now: NOW });
+
+  // Before review PASS the targeted node is not admissible.
+  const gated = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-b' });
+  assert.equal(gated.code, 'NODE_NOT_ADMISSIBLE');
+  assert.match(gated.detail, /review-1/);
+
+  runner.beginNode(state, 'review-1', { now: NOW, sessionId: 'sess-critic' });
+  runner.submitReview(state, { planVersion: 1, verdict: 'PASS', findings: [], now: NOW });
+
+  // impl-a sorts first without targeting; explicit targeting selects impl-b.
+  const sorted = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
+  assert.equal(sorted.nodeId, 'impl-a');
+  const targeted = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-b' });
+  assert.equal(targeted.allowed, true);
+  assert.equal(targeted.nodeId, 'impl-b');
+  assert.equal(targeted.reconcile, false);
+
+  const wrongRole = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW, nodeId: 'impl-b' });
+  assert.equal(wrongRole.code, 'NODE_NOT_FOUND');
+  const unknown = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-zzz' });
+  assert.equal(unknown.code, 'NODE_NOT_FOUND');
+
+  // Targeting a node that is RUNNING is rejected, not silently reassigned.
+  runner.beginNode(state, 'impl-b', { now: NOW, sessionId: 'sess-b' });
+  const running = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-a' });
+  assert.equal(running.code, 'ALREADY_RUNNING');
+});
+
+test('targeted dispatch of an exhausted node keeps sorted-path failure semantics', async () => {
+  const state = freshRun();
+  await dispatchCriticAndPass(state);
+  state.nodes['impl-1'].attempt = 3; // node maxAttempts
+  const denied = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-1' });
+  assert.equal(denied.code, 'ATTEMPTS_EXHAUSTED');
+  assert.equal(state.nodes['impl-1'].state, 'FAILED');
+  assert.equal(state.status, 'FAILED');
+});
+
+test('recorded side effects mark redispatches as reconcile work', async () => {
+  const state = freshRun();
+  await dispatchCriticAndPass(state);
+  runner.beginNode(state, 'impl-1', { now: NOW, sessionId: 'i' });
+  runner.recordSideEffect(state, { nodeId: 'impl-1', tool: 'edit', target: 'src/a.ts', now: NOW });
+  runner.markIncomplete(state, { nodeId: 'impl-1', now: NOW });
+  const redispatch = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-1' });
+  assert.equal(redispatch.allowed, true);
+  assert.equal(redispatch.reconcile, true);
+});

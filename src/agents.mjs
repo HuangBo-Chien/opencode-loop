@@ -2,7 +2,7 @@ import { AGENT_NAMES } from './config.mjs';
 import { createAgentPrompt } from './prompts.mjs';
 
 const SUBMIT_TOOL_BY_AGENT = Object.freeze({
-  'graph-orchestrator': ['graph_run_resume'],
+  'graph-orchestrator': ['graph_run_resume', 'graph_run_new'],
   'graph-explorer': ['graph_submit_findings'],
   'graph-planner': ['graph_submit_plan'],
   'graph-plan-critic': ['graph_submit_review'],
@@ -35,8 +35,11 @@ function createPermission(name) {
     permission.graph_journal_write_insight = 'allow';
     permission.graph_journal_promote = 'ask';
   }
-  if (name === 'graph-implementer') permission.edit = 'ask';
-  if (['graph-implementer', 'graph-verifier'].includes(name)) permission.bash = 'ask';
+  if (name === 'graph-implementer') {
+    permission.edit = 'ask';
+    permission.write = 'ask';
+  }
+  if (['graph-implementer', 'graph-verifier', 'graph-explorer'].includes(name)) permission.bash = 'ask';
   if (['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-multimodal'].includes(name)) {
     permission.webfetch = 'ask';
     permission.websearch = 'ask';

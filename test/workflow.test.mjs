@@ -26,13 +26,15 @@ test('native permissions restrict writes, delegation and submit tools by role', 
     assert.equal(p.external_directory, 'ask');
     assert.equal(p.doom_loop, 'ask');
     assert.equal(p.edit ?? p['*'], name === 'graph-implementer' ? 'ask' : 'deny');
-    assert.equal(p.bash ?? p['*'], ['graph-implementer', 'graph-verifier'].includes(name) ? 'ask' : 'deny');
+    assert.equal(p.write ?? p['*'], name === 'graph-implementer' ? 'ask' : 'deny');
+    assert.equal(p.bash ?? p['*'], ['graph-implementer', 'graph-verifier', 'graph-explorer'].includes(name) ? 'ask' : 'deny');
     if (name !== 'graph-orchestrator') assert.equal(p.task ?? p['*'], 'deny');
     assert.equal(p.graph_submit_plan ?? p['*'], name === 'graph-planner' ? 'allow' : 'deny');
     assert.equal(p.graph_submit_review ?? p['*'], name === 'graph-plan-critic' ? 'allow' : 'deny');
     assert.equal(p.graph_submit_change ?? p['*'], name === 'graph-implementer' ? 'allow' : 'deny');
     assert.equal(p.graph_submit_verification ?? p['*'], name === 'graph-verifier' ? 'allow' : 'deny');
     assert.equal(p.graph_run_resume ?? p['*'], name === 'graph-orchestrator' ? 'allow' : 'deny');
+    assert.equal(p.graph_run_new ?? p['*'], name === 'graph-orchestrator' ? 'allow' : 'deny');
     assert.equal(p.graph_journal_search ?? p['*'], journalReaders.has(name) ? 'allow' : 'deny');
     assert.equal(p.graph_journal_read ?? p['*'], journalReaders.has(name) ? 'allow' : 'deny');
     assert.equal(p.graph_journal_write_insight ?? p['*'], name === 'graph-orchestrator' ? 'allow' : 'deny');

@@ -32,9 +32,10 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     return node?.state === 'RUNNING' && node.sessionId === binding.sessionId && node.dispatchId === binding.dispatchId;
   }
 
-  async function admit(rootSessionId, callID, args) {
+  async function admit(rootSessionId, callID, args, desiredNodeId = null) {
     const root = bindings.get(rootSessionId);
     if (!root?.root) return denied('NOT_GRAPH_SESSION', 'task dispatch requires the root orchestrator');
+    const target = typeof desiredNodeId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(desiredNodeId) ? desiredNodeId : null;
     return exclusive(root.runId, async () => {
       const state = store.getRun(root.runId);
       if (!state) return denied('RUN_GONE', 'owning run is unavailable');
@@ -46,26 +47,51 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       const agent = args.subagent_type;
       if (args.task_id !== undefined) {
         const previous = bindings.get(args.task_id);
-        if (previous?.runId !== root.runId || previous.agent !== agent || !current(previous)) {
-          return denied('FRESH_SESSION_REQUIRED', 'task_id may only continue the same active attempt; dispatch retries and other nodes in a fresh session');
+        const sameRole = previous && !previous.root && previous.runId === root.runId && previous.agent === agent;
+        if (sameRole && current(previous)) {
+          records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent,
+            nodeId: previous.nodeId, dispatchId: previous.dispatchId, sessionId: args.task_id,
+            bound: true, continuation: true, acknowledged: false, idleSeen: false, terminal: false,
+            planVersion: state.artifacts.plan?.version ?? 0 });
+          used.push(recordKey);
+          try { await store.saveRun(state); }
+          catch { records.delete(recordKey); return denied('DISPATCH_PERSISTENCE_FAILED', 'could not save dispatch reservation; inspect storage and use a fresh call'); }
+          return { allowed: true, nodeId: previous.nodeId, continuation: true };
         }
-        records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent,
-          nodeId: previous.nodeId, dispatchId: previous.dispatchId, sessionId: args.task_id,
-          bound: true, continuation: true, acknowledged: false, idleSeen: false, terminal: false,
-          planVersion: state.artifacts.plan?.version ?? 0 });
-        used.push(recordKey);
-        try { await store.saveRun(state); }
-        catch { records.delete(recordKey); return denied('DISPATCH_PERSISTENCE_FAILED', 'could not save dispatch reservation; inspect storage and use a fresh call'); }
-        return { allowed: true, nodeId: previous.nodeId, continuation: true };
+        // Resume continuation: the same session may pick its own unfinished
+        // node back up (INCOMPLETE/PENDING/STALE with attempts left). A new
+        // attempt is charged and the recorded side-effect ledger is attached.
+        if (sameRole && previous.nodeId) {
+          const node = state.nodes[previous.nodeId];
+          const lastWorkedByCaller = node?.sessionId === args.task_id;
+          if (node && lastWorkedByCaller && ['PENDING', 'INCOMPLETE', 'STALE'].includes(node.state)) {
+            const decision = runner.admitDispatch(state, { agent, now: NOW(), nodeId: previous.nodeId });
+            if (!decision.allowed) {
+              await store.saveRun(state);
+              return denied('FRESH_SESSION_REQUIRED', `${previous.nodeId} cannot be continued in this session: ${decision.detail}`);
+            }
+            const dispatchId = randomUUID();
+            records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent,
+              nodeId: previous.nodeId, dispatchId, sessionId: args.task_id,
+              bound: false, continuation: true, resumed: true, acknowledged: false, idleSeen: false, terminal: false,
+              planVersion: state.artifacts.plan?.version ?? 0 });
+            bindings.delete(args.task_id); // the inactive entry is superseded by the resumed binding
+            used.push(recordKey);
+            try { await store.saveRun(state); }
+            catch { records.delete(recordKey); return denied('DISPATCH_PERSISTENCE_FAILED', 'could not save dispatch reservation; inspect storage and use a fresh call'); }
+            return { allowed: true, nodeId: previous.nodeId, continuation: true, resumed: true, reconcile: decision.reconcile };
+          }
+        }
+        return denied('FRESH_SESSION_REQUIRED', 'task_id may only continue an active attempt or resume the unfinished node this session last worked on; other nodes, finished work and retries need a fresh session');
       }
       const pending = [...records.values()].some((r) => r.runId === root.runId && !r.bound && r.nodeId &&
         (r.agent === agent || (agent === 'graph-implementer' && r.agent === 'graph-implementer')));
       if (pending) return denied('DISPATCH_PENDING', 'a task for this role is reserved and awaiting host session binding');
-      const decision = runner.admitDispatch(state, { agent, now: NOW() });
+      const decision = runner.admitDispatch(state, { agent, now: NOW(), nodeId: target });
       if (!decision.allowed) { await store.saveRun(state); return decision; }
       records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent, nodeId: decision.nodeId,
         dispatchId: randomUUID(), sessionId: null, bound: false, continuation: false,
-        acknowledged: false, idleSeen: false, terminal: false,
+        acknowledged: false, idleSeen: false, terminal: false, targeted: target !== null,
         planVersion: state.artifacts.plan?.version ?? 0 });
       used.push(recordKey);
       try { await store.saveRun(state); }
@@ -82,8 +108,10 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     if (record.nodeId) {
       const node = state.nodes[record.nodeId];
       if (!record.started) {
-        const decision = runner.admitDispatch(state, { agent: record.agent, now: NOW() });
-        if (!decision.allowed || decision.nodeId !== record.nodeId) return;
+        // Re-validate the reserved node specifically. Reservations are
+        // authoritative; a re-sorted choice must not silently reassign work.
+        const decision = runner.admitDispatch(state, { agent: record.agent, now: NOW(), nodeId: record.nodeId });
+        if (!decision.allowed) return;
         runner.beginNode(state, record.nodeId, { now: NOW(), sessionId: record.sessionId, dispatchId: record.dispatchId });
         record.started = true;
       } else if (node?.state !== 'RUNNING' || node.dispatchId !== record.dispatchId || node.sessionId !== record.sessionId) return;
@@ -201,6 +229,17 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       || !parents.has(sessionId) && [...bindings.values()].some((binding) => binding.root);
   }
 
+  // Read-only lookup: which run does a session belong to? Managed children
+  // without their own binding (rejected or finished dispatches) resolve
+  // through the host-verified parent chain to the root orchestrator's run.
+  function runForSession(sessionId) {
+    const binding = bindings.get(sessionId);
+    if (binding) return binding.runId;
+    const parent = parents.get(sessionId);
+    const rootBinding = parent === undefined ? undefined : bindings.get(parent);
+    return rootBinding?.root === true ? rootBinding.runId : null;
+  }
+
   async function resolveSession(sessionId) {
     if (bindings.has(sessionId)) return true;
     if (!client?.session?.get || !client?.session?.messages) return false;
@@ -239,9 +278,10 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
   function inspect(runId) {
     return [...records.values()].filter((r) => r.runId === runId).map((r) => ({
       callID: r.callID, nodeId: r.nodeId, agent: r.agent, sessionId: r.sessionId, bound: r.bound, continuation: r.continuation,
+      resumed: r.resumed === true, targeted: r.targeted === true,
       errorCode: r.errorCode ?? null,
     }));
   }
 
-  return Object.freeze({ admit, onSession, onPart, onIdle, ensureSession, invalidate, exclusive, managed, current, inspect });
+  return Object.freeze({ admit, onSession, onPart, onIdle, ensureSession, invalidate, exclusive, managed, current, runForSession, inspect });
 }

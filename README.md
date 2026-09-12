@@ -1,6 +1,6 @@
 # opencode-loop
 
-`0.3.0-alpha.1` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
+`0.3.0-alpha.2` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
 
 ## How the gate works
 
@@ -10,7 +10,7 @@ The model proposes; the runner decides. Every hook decision is persisted to a ru
 | --- | --- |
 | Implementer/verifier may only be dispatched when a plan passed review | `tool.execute.before` on `task` consults the runner; illegal dispatches are rewritten into an explicit `RUNNER_REJECTED` child turn (soft block — the child session still spawns, reports the rejection, and burns no work) |
 | Critic `FAIL` terminates the run; nothing may be dispatched afterwards | Runner verdict table: PASS advances, REVISE returns to the planner (capped by `maxPlanRevisions`), FAIL fails the run, UNVERIFIED blocks it honestly |
-| Writes stay inside the assigned `writeScope` | `permission.ask` denies out-of-scope `edit` (and implementer `bash` without `allowShell`) for bound graph sessions before execution; violations are recorded |
+| Writes stay inside the assigned `writeScope` | `permission.ask` denies out-of-scope `edit` **and `write`** (and implementer `bash` without `allowShell`) for bound graph sessions before execution; violations are recorded. For `allowShell` implementers and read-only specialists, a best-effort static screen also rejects shell commands whose write targets (redirections, `tee`/`cp`/`mv`/`rm`/`dd of=`/`sed -i`/`truncate`/heredocs) resolve inside the workspace but outside the allowed scope |
 | `testsPassed`-style claims are not trusted | Verdicts travel only through `graph_submit_*` tools; `PASS` requires at least one cited command with `exitCode 0`, and change submissions are cross-checked against the runner's own edit ledger (undisclosed files fail the node) |
 | Reviews and verifications bind to versions | A review targets `plan@v`; a resubmitted plan supersedes the old PASS. Verifications bind change versions plus file-hash snapshots; on resume, drifted hashes mark stale evidence and its node `STALE` |
 | Crashes never blindly redo side effects | A restart moves in-flight nodes to `RECOVERY_REQUIRED`; `graph_run_resume` revokes old dispatch bindings and reservations, classifies nodes (attempt counters preserved), and re-dispatch injects the recorded side-effect ledger so the implementer reconciles reality first |
@@ -20,7 +20,7 @@ Read-only specialists (explorer, planner, critic, multimodal) dispatch freely on
 
 ## Structured handoff
 
-Work packages are `TaskSpec` nodes (`id`, `kind`, `agent`, `dependsOn`, `inputs`/`outputs` artifact refs, `writeScope`, `acceptance`, optional `maxAttempts`/`allowShell`). `graph_submit_plan` validates the graph — unique ids, resolvable dependencies, no cycles, pairwise-disjoint write scopes, mandatory review-before-implement and implement-before-verify gates, and no write nodes for plan-only intents — before it ever reaches run state. Each role then delivers through its own tool: `graph_submit_review`, `graph_submit_change`, `graph_submit_verification`, `graph_submit_findings`; `graph_inspect` reports node states, attempts, blockers, artifact versions and a Mermaid diagram; `graph_run_resume` performs crash recovery.
+Work packages are `TaskSpec` nodes (`id`, `kind`, `agent`, `dependsOn`, `inputs`/`outputs` artifact refs, `writeScope`, `acceptance`, optional `maxAttempts`/`allowShell`). `graph_submit_plan` validates the graph — unique ids, resolvable dependencies, no cycles, pairwise-disjoint write scopes, mandatory review-before-implement and implement-before-verify gates, and no write nodes for plan-only intents — before it ever reaches run state; an `INVALID_GRAPH` rejection carries a compact TaskSpec schema summary (kind↔agent mapping, bare artifact `outputs`, gate rules) so the planner can fix the submission without guessing. Each role then delivers through its own tool: `graph_submit_review`, `graph_submit_change`, `graph_submit_verification`, `graph_submit_findings`; `graph_inspect` reports node states, attempts, blockers, artifact versions and a Mermaid diagram; `graph_run_resume` performs crash recovery; `graph_run_new` starts a successor run after a terminal one.
 
 ### File claims and correction
 
@@ -41,7 +41,10 @@ Work packages are `TaskSpec` nodes (`id`, `kind`, `agent`, `dependsOn`, `inputs`
 
 ### Dispatch and recovery
 
-- `task_id` may continue the same active RUNNING attempt and role in the same run without charging another attempt. Retries, recovered work, completed sessions and other nodes require a fresh session (`FRESH_SESSION_REQUIRED`).
+- The coordinator can steer dispatch: an explicit `nodeId` task argument, or a single `[nodeId: implement-setup]` marker on the first prompt line, targets a specific node. The runner validates exactly that node (existence, role match, admissibility, attempts, single-writer) and either binds it or rejects the dispatch with the precise reason (`NODE_NOT_FOUND`, `NODE_NOT_ADMISSIBLE`, `ATTEMPTS_EXHAUSTED`, `SINGLE_WRITER`); it never silently reassigns the request to a different node. Unmarked dispatches keep the runner's own ordering, and every bound dispatch confirms the assignment with a `[RUNNER] Assigned nodeId` prompt line.
+- `task_id` may continue the same active RUNNING attempt and role in the same run without charging another attempt. It may also **resume the unfinished node the session last worked on** when that node is `INCOMPLETE`/`PENDING`/`STALE` with attempts left: a new attempt is charged, the recorded side-effect ledger travels with the dispatch, and the old inactive binding is superseded. Completed nodes, foreign sessions and exhausted attempts still require a fresh session (`FRESH_SESSION_REQUIRED`, and rejection messages name the bound node).
+- Read-only tools (`read`, `glob`, `grep`, `list`, `graph_status`, `graph_inspect`, `graph_journal_search`, `graph_journal_read`) are never collaterally blocked by the dispatch-binding gate. Rejected or finished children resolve the owning run through the host-verified parent chain, so inspection and journal history stay available even after a run reaches a terminal state. Write paths keep failing closed.
+- `graph_run_new` starts a successor run in the same orchestrator session once the current run is `SUCCEEDED` or `FAILED` (write journal insights first). The successor run id is `<session>:<n>`; the finished run records `successorRunId`, and a restart follows the chain so the orchestrator rebinds to the newest run instead of the terminal one.
 - A reservation awaiting host metadata blocks another dispatch of that node/role (`DISPATCH_PENDING`) without consuming an attempt. Failed unbound task calls release their reservation.
 - Both foreground running metadata and completed **background** task metadata are supported. Pending continuations survive the preceding prompt's idle event. Host event IDs deduplicate repeated idle notifications; ID-less legacy notifications are consumed once per session and rely on terminal task events for additional completions.
 - Before child work, delayed metadata can be resolved through bounded host reads (64 parent messages, at most 256 parts per message, a 2-second request deadline). An unresolved session cannot silently bypass enforcement; it fails with `BINDING_UNAVAILABLE` until its relationship is established.
@@ -76,12 +79,12 @@ Global promotion never copies a project entry. It accepts only a project `insigh
 
 ## Project-local installation
 
-Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.1.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
+Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.2.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
 
 From the project where you want to use the plugin, install that local tarball:
 
 ```powershell
-npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.1.tgz
+npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.2.tgz
 node --input-type=module -e "import {pathToFileURL} from 'node:url'; import path from 'node:path'; console.log(pathToFileURL(path.resolve('node_modules/opencode-loop/src/index.mjs')).href)"
 ```
 
@@ -114,11 +117,11 @@ Consider adding the state directory to `.gitignore`. Start OpenCode in that proj
 
 | Agent | Mode | Responsibility | Submit tool | Additional native permission |
 | --- | --- | --- | --- | --- |
-| `graph-orchestrator` | primary | Route, dispatch, recover, summarize | `graph_run_resume` | `task` only to the six specialists; `question`, `todowrite` allowed |
-| `graph-explorer` | subagent | Read source, gather versioned findings | `graph_submit_findings` | `webfetch`, `websearch` ask |
+| `graph-orchestrator` | primary | Route, dispatch, recover, summarize | `graph_run_resume`, `graph_run_new` | `task` only to the six specialists; `question`, `todowrite` allowed |
+| `graph-explorer` | subagent | Read source, gather versioned findings | `graph_submit_findings` | `bash` ask for non-mutating checks (workspace writes denied by the screen); `webfetch`, `websearch` ask |
 | `graph-planner` | subagent | Submit a validated task graph | `graph_submit_plan` | `webfetch`, `websearch` ask |
 | `graph-plan-critic` | subagent | Verdict bound to a plan version | `graph_submit_review` | `webfetch`, `websearch` ask |
-| `graph-implementer` | subagent | Write within `writeScope` only | `graph_submit_change` | `edit`, `bash` ask (bash denied unless `allowShell`) |
+| `graph-implementer` | subagent | Write within `writeScope` only | `graph_submit_change` | `edit`, `write`, `bash` ask (bash denied unless `allowShell`; screened write targets must stay in scope) |
 | `graph-verifier` | subagent | Evidence-bound verification | `graph_submit_verification` | `bash` ask; no edit |
 | `graph-multimodal` | subagent | Analyze supported visual inputs honestly | `graph_submit_findings` | `webfetch`, `websearch` ask |
 
@@ -164,7 +167,7 @@ The unit suite covers the sanitizer, TaskSpec/graph validation, the run and jour
 What remains explicitly **not** claimed:
 
 - `RUNNER_REJECTED` is a soft block: the child session is created and consumes a small turn, because `tool.execute.before` cannot abort a call.
-- Established graph bindings do not restrict read paths. Unknown child bindings fail closed until host identity is resolved. Resource locks are not a shell sandbox — an arbitrary command is only scope-gated where native permissions ask.
+- Established graph bindings do not restrict read paths; read-only tools are exempt from the binding gate entirely. Unknown child bindings fail closed (except read-only tools) until host identity is resolved. Resource locks are not a shell sandbox — `allowShell` implementers and read-only specialists get a best-effort static write-target screen (redirections, common write commands, heredocs; tracked `cd`), which fails open on anything it cannot confidently resolve; commands with effects outside the workspace remain governed only by native permissions.
 - Submit-tool caller binding relies on host-provided tool context, task progress metadata (`callID`, `parentSessionId`, `sessionId`) and child parentage. Event races and bounded lookup are covered by simulations; a host that changes these semantics needs re-verification on the pinned build.
 - Verifier `bash` remains a native `ask`; the runner never answers prompts on the user's behalf except to DENY rule violations.
 - Real-model workflow acceptance (does the graph reduce errors versus the advisory loop at fixed budget) is separate evidence; `graph_status` keeps `enforcementAttested: false` until a locked-host scripted integration passes.

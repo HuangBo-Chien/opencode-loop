@@ -33,7 +33,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
   function boundNode(context, { binding, state }) {
     const node = binding.nodeId ? state.nodes[binding.nodeId] : null;
     if (!node || node.sessionId !== context.sessionID || dispatches && !dispatches.current(binding)) {
-      return { error: rejected('NOT_DISPATCHED_NODE', 'no in-flight node is bound to this session; deliver work only for the task you received') };
+      return { error: rejected('NOT_DISPATCHED_NODE', `no in-flight node is bound to this session${binding.nodeId ? ` (last binding: ${binding.nodeId})` : ''}; deliver work only for the task you received`) };
     }
     return { node };
   }
@@ -56,7 +56,10 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       }
       const graph = validateTaskGraph(args.specs, { planOnly: args.intent === 'plan-only', maxAttemptsCeiling: 10 });
       if (!graph.ok) {
-        return rejected('INVALID_GRAPH', graph.errors.join('; '), 'fix the listed TaskSpec problems and submit again');
+        return rejected('INVALID_GRAPH', graph.errors.join('; '), [
+          'TaskSpec schema: {id, kind(explore|analyze|plan|review|implement|verify), agent — must be the kind-mapped graph-* specialist (explore→graph-explorer, analyze→graph-multimodal, plan→graph-planner, review→graph-plan-critic, implement→graph-implementer, verify→graph-verifier), dependsOn:[node ids] (required), inputs:[artifact refs like findings@1], outputs:[bare artifact names only — versions are runner-assigned], writeScope:[relative workspace paths/globs] (implement nodes only, non-empty, pairwise disjoint), acceptance:[criteria] (implement nodes required), maxAttempts?, allowShell?}',
+          'Gates: exactly one plan node; review depends on plan; implement depends on review; verify depends on implement; plan-only intents contain no implement/verify nodes.',
+        ].join(' '));
       }
       try {
         const result = runner.submitPlan(located.state, {
@@ -116,7 +119,9 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (located.error) return located.error;
       const bound = boundNode(context, located);
       if (bound.error) return bound.error;
-      if (args.nodeId !== located.binding.nodeId) return rejected('NOT_DISPATCHED_NODE', 'nodeId must match the node bound to this session');
+      if (args.nodeId !== located.binding.nodeId) {
+        return rejected('NOT_DISPATCHED_NODE', `nodeId must match the node bound to this session; this session is bound to ${located.binding.nodeId}`);
+      }
       const checked = runner.checkChange(located.state, { ...args, now: NOW() });
       if (!checked.ok) {
         await store.saveRun(located.state);
@@ -145,7 +150,9 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (located.error) return located.error;
       const bound = boundNode(context, located);
       if (bound.error) return bound.error;
-      if (args.nodeId !== located.binding.nodeId) return rejected('NOT_DISPATCHED_NODE', 'nodeId must match the node bound to this session');
+      if (args.nodeId !== located.binding.nodeId) {
+        return rejected('NOT_DISPATCHED_NODE', `nodeId must match the node bound to this session; this session is bound to ${located.binding.nodeId}`);
+      }
       const files = (bound.node.spec.dependsOn ?? []).flatMap((dep) => located.state.artifacts[`change:${dep}`]?.payload?.filesTouched ?? []);
       const snapshot = await store.hashFiles(files);
       const result = runner.submitVerification(located.state, { ...args, snapshot, now: NOW() });
@@ -191,10 +198,45 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
     async execute(_args, context) {
       if (!context.agent?.startsWith('graph-')) return rejected('NOT_GRAPH_AGENT', 'graph inspection is reserved for graph agents');
       const binding = bindings.get(context.sessionID);
-      if (!binding) return rejected('NOT_GRAPH_SESSION', 'this session is not part of a graph run');
-      const state = store.getRun(binding.runId);
+      // Read-only and binding-free by design: managed children without their
+      // own binding (rejected dispatch, finished work, terminated run) still
+      // see the run that owns their parent chain.
+      const runId = binding?.runId ?? (dispatches ? dispatches.runForSession(context.sessionID) : null);
+      if (!runId) return rejected('NOT_GRAPH_SESSION', 'this session is not part of a graph run');
+      const state = store.getRun(runId) ?? (store.loadRun ? await store.loadRun(runId) : null);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
       return reply({ ...runner.inspect(state), ...(dispatches ? { dispatches: dispatches.inspect(state.runId) } : {}) });
+    },
+  });
+
+  const graph_run_new = tool({
+    description: 'Orchestrator starts a fresh gated run in this session after the previous run reached a terminal state (SUCCEEDED/FAILED). Write journal insights for the finished run first; the new run starts empty.',
+    args: {},
+    async execute(_args, context) {
+      const wrong = requireRole(context, 'graph-orchestrator');
+      if (wrong) return wrong;
+      const binding = bindings.get(context.sessionID);
+      if (!binding?.root) return rejected('NOT_GRAPH_SESSION', 'only the root orchestrator of this session may start a new run');
+      const state = store.getRun(binding.runId);
+      if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
+      if (state.status !== 'SUCCEEDED' && state.status !== 'FAILED') {
+        return rejected('RUN_NOT_TERMINAL', `the current run is ${state.status}; finish or recover it before starting a new one`);
+      }
+      dispatches?.invalidate(state.runId);
+      let runId = null;
+      for (let counter = 2; counter <= 99; counter += 1) {
+        const candidate = `${state.rootSessionId}:${counter}`;
+        if (store.loadRun && await store.loadRun(candidate)) continue;
+        runId = candidate;
+        break;
+      }
+      if (!runId) return rejected('RUN_LIMIT', 'this session reached its successor-run limit');
+      await store.createRun({ runId, rootSessionId: state.rootSessionId, now: NOW(), request: null, requestCaptureCompleted: true });
+      state.successorRunId = runId;
+      await store.saveRun(state);
+      bindings.set(context.sessionID, { runId, agent: context.agent, nodeId: null, root: true });
+      return reply({ ok: true, runId, previousRun: { runId: state.runId, status: state.status },
+        next: 'dispatch read-only exploration/planning for the new goal; the finished run stays on disk for journal history' });
     },
   });
 
@@ -232,7 +274,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
 
   const definitions = {
       graph_submit_plan, graph_submit_review, graph_submit_change, graph_submit_verification,
-      graph_submit_findings, graph_inspect, graph_run_resume,
+      graph_submit_findings, graph_inspect, graph_run_resume, graph_run_new,
   };
   const tools = Object.fromEntries(Object.entries(definitions).map(([name, definition]) => [name, !dispatches ? definition : {
     ...definition,

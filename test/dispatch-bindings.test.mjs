@@ -38,8 +38,61 @@ test('reserves before binding, counts once, and permits only same-attempt contin
   assert.equal(h.state.nodes.impl.state, 'RUNNING');
   await h.dispatches.onIdle('child', 'idle-b');
   assert.equal(h.state.nodes.impl.state, 'INCOMPLETE');
-  assert.equal((await h.admit('bad-retry', 'graph-implementer', 'child')).code, 'FRESH_SESSION_REQUIRED');
+  // An INCOMPLETE node is resumable by the session that last worked it: the
+  // reservation succeeds, the attempt is charged only when binding begins.
+  const resume = await h.admit('resume', 'graph-implementer', 'child');
+  assert.equal(resume.allowed, true);
+  assert.equal(resume.resumed, true);
   assert.equal(h.state.nodes.impl.attempt, 1);
+});
+
+test('task_id resume of an incomplete attempt rebinds, charges a new attempt and injects the ledger', async () => {
+  const h = await harness();
+  await h.admit('first');
+  await h.dispatches.onSession({ id: 'child', parentID: 'root' });
+  await h.dispatches.onPart(h.part('first', 'child'));
+  h.runner.recordSideEffect(h.state, { nodeId: 'impl', tool: 'edit', target: 'work/a', now: 'now' });
+  await h.dispatches.onIdle('child', 'idle-a');
+  await h.dispatches.onIdle('child', 'idle-b');
+  assert.equal(h.state.nodes.impl.state, 'INCOMPLETE');
+
+  const resume = await h.admit('resume', 'graph-implementer', 'child');
+  assert.equal(resume.allowed, true, JSON.stringify(resume));
+  assert.equal(resume.reconcile, true);
+  await h.dispatches.onPart(h.part('resume', 'child'));
+  assert.equal(h.state.nodes.impl.state, 'RUNNING');
+  assert.equal(h.state.nodes.impl.attempt, 2);
+  assert.equal(h.state.nodes.impl.sessionId, 'child');
+  assert.equal(h.bindings.get('child').active, true);
+  await h.dispatches.onIdle('child', 'idle-c');
+  await h.dispatches.onIdle('child', 'idle-d');
+  assert.equal(h.state.nodes.impl.state, 'INCOMPLETE');
+  assert.equal(h.state.nodes.impl.attempt, 2);
+});
+
+test('task_id resume is denied without attempts, for other nodes and for foreign sessions', async () => {
+  const h = await harness();
+  h.state.nodes.impl.spec.maxAttempts = 1;
+  await h.admit('first');
+  await h.dispatches.onSession({ id: 'child', parentID: 'root' });
+  await h.dispatches.onPart(h.part('first', 'child'));
+  await h.dispatches.onIdle('child', 'idle-a');
+  await h.dispatches.onIdle('child', 'idle-b');
+  assert.equal(h.state.nodes.impl.state, 'FAILED');
+  assert.equal((await h.admit('exhausted', 'graph-implementer', 'child')).code, 'FRESH_SESSION_REQUIRED');
+  assert.equal((await h.admit('wrong-role', 'graph-planner', 'child')).code, 'FRESH_SESSION_REQUIRED');
+
+  const second = await harness();
+  await second.admit('a');
+  await second.dispatches.onSession({ id: 'worker', parentID: 'root' });
+  await second.dispatches.onPart(second.part('a', 'worker'));
+  await second.dispatches.onIdle('worker', 'idle-a');
+  await second.dispatches.onIdle('worker', 'idle-b');
+  assert.equal(second.state.nodes.impl.state, 'INCOMPLETE');
+  // A different session never worked this node; only fresh sessions apply.
+  await second.dispatches.onSession({ id: 'stranger', parentID: 'root' });
+  assert.equal((await second.admit('stranger-call', 'graph-implementer', 'stranger')).code, 'FRESH_SESSION_REQUIRED');
+  assert.equal(second.state.nodes.impl.attempt, 1);
 });
 
 test('metadata correlates concurrent free dispatches even with reversed creation and arrival order', async () => {

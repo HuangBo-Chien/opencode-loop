@@ -6,9 +6,14 @@
 import { isAbsolute, relative, sep } from 'node:path';
 import { captureRequest } from './journal-text.mjs';
 import { matchScopePath, normalizeScopePath } from './task-spec.mjs';
+import { firstOutOfScopeShellWrite } from './shell-scope.mjs';
 import { createDispatchBindings } from './dispatch-bindings.mjs';
 
-const SUBMIT_TOOLS = new Set(['graph_submit_plan', 'graph_submit_review', 'graph_submit_change', 'graph_submit_verification', 'graph_submit_findings', 'graph_inspect', 'graph_run_resume']);
+const READ_ONLY_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-multimodal']);
+// Tools that never mutate run state or the workspace stay available to graph
+// children even when their dispatch binding is gone (rejected dispatch, idle
+// session, terminated run). Write paths keep failing closed.
+const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'list', 'graph_status', 'graph_inspect', 'graph_journal_search', 'graph_journal_read']);
 const NOW = () => new Date().toISOString();
 
 function rejectionPrompt(decision) {
@@ -26,6 +31,19 @@ function reconcilePrompt(state, nodeId) {
     `已紀錄的副作用:${effects.join('; ') || '(無)'}`,
     '請先核對這些檔案的目前實際狀態,決定保留或修正,再以 graph_submit_change 如實回報;filesTouched 必須涵蓋所有實際存在的修改。',
   ].join('\n');
+}
+
+const NODE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+// Coordinator steering: an explicit `nodeId` task argument wins; otherwise a
+// single `[nodeId: implement-setup]` marker on the first prompt line names the
+// intended node. Without a hint the runner picks a ready node itself.
+function parseNodeIdHint(args) {
+  if (typeof args?.nodeId === 'string' && NODE_ID_PATTERN.test(args.nodeId)) return args.nodeId;
+  const prompt = typeof args?.prompt === 'string' ? args.prompt : '';
+  const firstLine = prompt.split('\n', 1)[0] ?? '';
+  const match = firstLine.match(/^\s*\[nodeId:\s*([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\]\s*$/);
+  return match ? match[1] : null;
 }
 
 export function createEnforcement({ settings, store, runner, bindings, client, dispatches = createDispatchBindings({ store, runner, bindings, client }) }) {
@@ -59,6 +77,16 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     } else {
       state = await store.loadRun(sessionID);
       if (state) {
+        // A terminal run may have an explicit successor started through
+        // graph_run_new; follow the recorded chain so a restart rebinds to
+        // the newest run of this session instead of the finished one.
+        for (let hops = 0; hops < 16 && (state.status === 'SUCCEEDED' || state.status === 'FAILED'); hops += 1) {
+          const successorId = state.successorRunId;
+          if (typeof successorId !== 'string' || !successorId.length) break;
+          const successor = await store.loadRun(successorId);
+          if (!successor) break;
+          state = successor;
+        }
         // Restart recovery: in-flight nodes cannot be trusted; resume classifies.
         if (Object.values(state.nodes).some((node) => node.state === 'RUNNING') && state.status === 'RUNNING') {
           state.status = 'RECOVERY_REQUIRED';
@@ -96,16 +124,38 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     const state = store.getRun(binding.runId);
     if (!state) return null;
     const node = binding.nodeId ? state.nodes[binding.nodeId] : null;
-    if (!node || node.spec.kind !== 'implement') return null;
-    if (tool === 'edit') {
+    if (tool === 'edit' || tool === 'write') {
+      if (!node || node.spec.kind !== 'implement') return null;
       const target = toWorkspaceRelative(args?.filePath ?? args?.path);
       const patterns = node.spec.writeScope ?? [];
       const allowed = typeof target === 'string' && patterns.length > 0 && patterns.some((pattern) => matchScopePath(pattern, target));
-      return { state, node, target, allowed, reason: `edit target ${target} is outside the writeScope [${patterns.join(', ')}] of ${node.spec.id}` };
+      return { state, node, nodeId: node.spec.id, target, allowed, kind: tool === 'edit' ? 'out-of-scope-edit' : 'out-of-scope-write',
+        reason: `${tool} target ${target} is outside the writeScope [${patterns.join(', ')}] of ${node.spec.id}` };
     }
     if (tool === 'bash') {
-      const allowed = node.spec.allowShell === true;
-      return { state, node, target: typeof args?.command === 'string' ? args.command.slice(0, 200) : '(unknown)', allowed, reason: `implementer bash is deferred to verification (${node.spec.id} declares allowShell=false)` };
+      const command = typeof args?.command === 'string' ? args.command : '';
+      const target = command.slice(0, 200);
+      if (node && node.spec.kind === 'implement') {
+        if (node.spec.allowShell !== true) {
+          return { state, node, nodeId: node.spec.id, target, allowed: false, kind: 'blocked-bash',
+            reason: `implementer bash is deferred to verification (${node.spec.id} declares allowShell=false)` };
+        }
+        const escape = firstOutOfScopeShellWrite(command, node.spec.writeScope ?? [], toWorkspaceRelative);
+        if (escape !== null) {
+          return { state, node, nodeId: node.spec.id, target, allowed: false, kind: 'out-of-scope-bash',
+            reason: `bash write target ${escape} is outside the writeScope [${(node.spec.writeScope ?? []).join(', ')}] of ${node.spec.id}` };
+        }
+        return { state, node, nodeId: node.spec.id, target, allowed: true };
+      }
+      if (READ_ONLY_ROLES.has(binding.agent)) {
+        // Read-only specialists may run non-mutating checks (e.g. tool
+        // availability) but never write workspace files through the shell.
+        const escape = firstOutOfScopeShellWrite(command, [], toWorkspaceRelative);
+        if (escape !== null) {
+          return { state, node, nodeId: binding.nodeId, target, allowed: false, kind: 'out-of-scope-bash',
+            reason: `read-only specialist ${binding.agent} may not write workspace files (bash target ${escape})` };
+        }
+      }
     }
     return null;
   }
@@ -119,13 +169,13 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       if (!state) return;
       const args = output.args ?? {};
       const subagentType = typeof args.subagent_type === 'string' ? args.subagent_type : null;
-       const decision = await dispatches.admit(sessionID, callID, args);
+       const decision = await dispatches.admit(sessionID, callID, args, parseNodeIdHint(args));
       if (!decision.allowed) {
         await dispatches.exclusive(binding.runId, async () => {
           runner.recordViolation(state, { nodeId: null, kind: 'gate-blocked-dispatch', detail: `${subagentType}: ${decision.code} — ${decision.detail}`, now: NOW() });
           await store.saveRun(state);
         });
-        const { task_id: _oldSession, ...freshArgs } = args;
+        const { task_id: _oldSession, nodeId: _nodeId, ...freshArgs } = args;
         output.args = { ...freshArgs, description: args.description ?? 'runner-rejected dispatch', prompt: rejectionPrompt(decision), subagent_type: subagentType ?? 'graph-explorer' };
         return;
       }
@@ -137,11 +187,11 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       output.args = { ...args, prompt };
       return;
     }
-    if (tool === 'edit' || tool === 'bash') {
+    if (tool === 'edit' || tool === 'write' || tool === 'bash') {
       const decision = decideWriteBinding(sessionID, tool, output.args);
       if (!decision || decision.allowed) return;
       deniedCalls.set(`${sessionID}:${callID}`, { tool, target: decision.target, callID });
-      runner.recordViolation(decision.state, { nodeId: decision.node.spec.id, kind: tool === 'edit' ? 'out-of-scope-edit' : 'blocked-bash', detail: decision.reason, now: NOW() });
+      runner.recordViolation(decision.state, { nodeId: decision.nodeId, kind: decision.kind, detail: decision.reason, now: NOW() });
       await store.saveRun(decision.state);
     }
   }
@@ -149,7 +199,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
   async function onPermissionAsk(input, output) {
     const { type, sessionID, callID } = input ?? {};
     const tool = type;
-    if (tool !== 'edit' && tool !== 'bash') return;
+    if (tool !== 'edit' && tool !== 'write' && tool !== 'bash') return;
     const key = `${sessionID}:${callID}`;
     const preDecided = deniedCalls.get(key);
     if (preDecided) {
@@ -158,10 +208,10 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     }
     // Independent re-check: the ask may fire without a matching before-hook.
     const args = input.pattern ? { filePath: Array.isArray(input.pattern) ? input.pattern[input.pattern.length - 1] : input.pattern } : {};
-    const decision = decideWriteBinding(sessionID, tool, tool === 'edit' ? args : {});
+    const decision = decideWriteBinding(sessionID, tool, tool === 'bash' ? {} : args);
     if (decision && !decision.allowed) {
       output.status = 'deny';
-      runner.recordViolation(decision.state, { nodeId: decision.node.spec.id, kind: tool === 'edit' ? 'out-of-scope-edit' : 'blocked-bash', detail: `${decision.reason} (denied at permission prompt)`, now: NOW() });
+      runner.recordViolation(decision.state, { nodeId: decision.nodeId, kind: decision.kind, detail: `${decision.reason} (denied at permission prompt)`, now: NOW() });
       await store.saveRun(decision.state);
     }
   }
@@ -175,7 +225,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
         state: { status: 'completed', input: input.args, metadata: output?.metadata } });
       return;
     }
-    if (tool !== 'edit' && tool !== 'bash') return;
+    if (tool !== 'edit' && tool !== 'write' && tool !== 'bash') return;
     const binding = bindings.get(sessionID);
     if (!binding || binding.root || !binding.nodeId) return;
     const key = `${sessionID}:${callID}`;
@@ -185,8 +235,10 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       return;
     }
     const args = input.args ?? {};
-    const target = tool === 'edit' ? toWorkspaceRelative(args.filePath ?? args.path) : (typeof args.command === 'string' ? args.command.slice(0, 200) : null);
-    if (target === null && tool === 'edit') return;
+    const target = tool === 'bash'
+      ? (typeof args.command === 'string' ? args.command.slice(0, 200) : null)
+      : toWorkspaceRelative(args.filePath ?? args.path);
+    if (target === null && tool !== 'bash') return;
     await mutate(binding.runId, (state) => runner.recordSideEffect(state, { nodeId: binding.nodeId, tool, target, now: NOW() }));
   }
 
@@ -217,13 +269,13 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
 
   return Object.freeze({
     onChatMessage: (input, output) => dispatches.exclusive(bindings.get(input?.sessionID)?.runId ?? input?.sessionID, () => onChatMessage(input, output)),
-    onToolBefore: (input, output) => input?.tool === 'task' ? onToolBefore(input, output) : childOperation(input, output, onToolBefore, true),
+    onToolBefore: (input, output) => input?.tool === 'task' ? onToolBefore(input, output) : childOperation(input, output, onToolBefore, !READ_ONLY_TOOLS.has(input?.tool)),
     onToolAfter: (input, output) => input?.tool === 'task' ? onToolAfter(input, output) : childOperation(input, output, onToolAfter),
     onPermissionAsk: (input, output) => childOperation(input, output, async (i, o) => {
-      if (dispatches.managed(i?.sessionID) && !bindings.get(i.sessionID)?.root && !dispatches.current(bindings.get(i.sessionID))) { o.status = 'deny'; return; }
+      if (!READ_ONLY_TOOLS.has(i?.type) && dispatches.managed(i?.sessionID) && !bindings.get(i.sessionID)?.root && !dispatches.current(bindings.get(i.sessionID))) { o.status = 'deny'; return; }
       return onPermissionAsk(i, o);
     }),
     onEvent, dispatches,
-    internals: Object.freeze({ bindings, deniedCalls, decideWriteBinding, toWorkspaceRelative }),
+    internals: Object.freeze({ bindings, deniedCalls, decideWriteBinding, toWorkspaceRelative, READ_ONLY_TOOLS }),
   });
 }

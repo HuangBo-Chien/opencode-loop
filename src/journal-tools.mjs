@@ -44,17 +44,21 @@ function publicFailure(error) {
 const tags = () => z.array(z.string().min(1).max(128)).max(16).default([]);
 const searchValues = (maxLength) => z.array(z.string().min(1).max(maxLength)).max(16).default([]);
 
-export function createJournalTools({ journalService, store, bindings, enabled }) {
+export function createJournalTools({ journalService, store, bindings, dispatches = null, enabled }) {
   async function authorized(context, roles, { root = false } = {}, operation) {
     if (!enabled) return rejected('JOURNAL_DISABLED');
     try {
       if (!roles.has(context?.agent)) return rejected('WRONG_ROLE');
       const binding = bindings.get(context?.sessionID);
-      if (!binding) return rejected('NOT_GRAPH_SESSION');
-      if (binding.agent !== context.agent) return rejected('WRONG_ROLE');
-      const state = store.getRun(binding.runId);
-      if (!state || state.runId !== binding.runId) return rejected('RUN_GONE');
-      if (root && (!binding.root || state.rootSessionId !== context.sessionID)) return rejected('ROOT_REQUIRED');
+      // Read access stays available to managed children whose own binding is
+      // gone (finished dispatch, terminated run): resolve the owning run
+      // through the host-verified parent chain.
+      const runId = binding?.runId ?? (dispatches ? dispatches.runForSession(context.sessionID) : null);
+      if (!runId) return rejected('NOT_GRAPH_SESSION');
+      if (binding && binding.agent !== context.agent) return rejected('WRONG_ROLE');
+      const state = store.getRun(runId);
+      if (!state || state.runId !== runId) return rejected('RUN_GONE');
+      if (root && (!binding?.root || state.rootSessionId !== context.sessionID)) return rejected('ROOT_REQUIRED');
       return await operation({ binding, state });
     } catch (error) {
       return publicFailure(error);

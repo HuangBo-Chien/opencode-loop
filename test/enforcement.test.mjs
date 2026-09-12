@@ -29,8 +29,9 @@ function harness(worktree) {
 async function startRun(h) {
   await h.enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });
 }
-async function dispatch(h, agent, { prompt = `work for ${agent}` } = {}) {
-  const output = { args: { description: `dispatch ${agent}`, prompt, subagent_type: agent } };
+async function dispatch(h, agent, options = {}) {
+  const { prompt = `work for ${agent}`, ...rest } = options;
+  const output = { args: { description: `dispatch ${agent}`, prompt, subagent_type: agent, ...rest } };
   const callID = `call-${agent}-${Math.random().toString(36).slice(2)}`;
   await h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID }, output);
   if (!output.args.prompt.includes('RUNNER_REJECTED')) h.calls.push({ agent, callID });
@@ -489,4 +490,188 @@ test('invalid graphs are rejected with actionable errors; unbound sessions canno
   const outsider = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs: SPECS }, ctx(h, 'stranger', 'graph-planner')));
   assert.equal(outsider.ok, false);
   assert.equal(outsider.code, 'NOT_GRAPH_SESSION');
+});
+
+const STEER_SPECS = [
+  { id: 'plan-1', kind: 'plan', agent: 'graph-planner', dependsOn: [], inputs: [], outputs: [], acceptance: ['plan'] },
+  { id: 'review-1', kind: 'review', agent: 'graph-plan-critic', dependsOn: ['plan-1'], inputs: [], outputs: [], acceptance: ['review'] },
+  { id: 'impl-a', kind: 'implement', agent: 'graph-implementer', dependsOn: ['review-1'], inputs: [], outputs: [], writeScope: ['pkg-a/**'], acceptance: ['a'] },
+  { id: 'impl-b', kind: 'implement', agent: 'graph-implementer', dependsOn: ['review-1'], inputs: [], outputs: [], writeScope: ['pkg-b/**'], acceptance: ['b'], allowShell: true },
+  { id: 'verify-1', kind: 'verify', agent: 'graph-verifier', dependsOn: ['impl-a', 'impl-b'], inputs: [], outputs: [], acceptance: ['verify'] },
+];
+
+async function setupSteerableRun(h) {
+  await startRun(h);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  const submitted = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs: STEER_SPECS }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(submitted.ok, true, JSON.stringify(submitted));
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
+}
+
+test('coordinator nodeId steering binds the requested node, not the sorted one', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-steer-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await setupSteerableRun(h);
+
+  // Without steering the runner sorts to impl-a; the marker selects impl-b.
+  const plain = await dispatch(h, 'graph-implementer');
+  assert.match(plain.args.prompt, /Assigned nodeId: impl-a/);
+  await bindChild(h, 'child-a', 'graph-implementer');
+  await childIdle(h, 'child-a');
+
+  const steered = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-b]\nwrite the b package' });
+  assert.ok(!steered.args.prompt.includes('RUNNER_REJECTED'));
+  assert.match(steered.args.prompt, /Assigned nodeId: impl-b/);
+  await bindChild(h, 'child-b', 'graph-implementer');
+  assert.equal(h.bindings.get('child-b').nodeId, 'impl-b');
+  await childIdle(h, 'child-b');
+
+  // An explicit args.nodeId works too, and an ineligible target is rejected
+  // with the precise reason instead of a silent reassignment.
+  const invalid = await dispatch(h, 'graph-implementer', { prompt: 'x', nodeId: 'impl-zzz' });
+  assert.match(invalid.args.prompt, /RUNNER_REJECTED/);
+  assert.match(invalid.args.prompt, /NODE_NOT_FOUND/);
+  assert.ok(h.store.getRun('root').violations.some((entry) => entry.detail.includes('NODE_NOT_FOUND')));
+});
+
+test('write tool is scope-gated exactly like edit and enters the side-effect ledger', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-write-tool-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await setupSteerableRun(h);
+  await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-b]\nwork' });
+  await bindChild(h, 'child-b', 'graph-implementer');
+
+  const outside = { args: { filePath: join(dir, 'pkg-a', 'escape.ts'), content: 'x' } };
+  await h.enforcement.onToolBefore({ tool: 'write', sessionID: 'child-b', callID: 'w1' }, outside);
+  const permission = { status: 'ask' };
+  await h.enforcement.onPermissionAsk({ type: 'write', sessionID: 'child-b', callID: 'w1', pattern: join(dir, 'pkg-a', 'escape.ts') }, permission);
+  assert.equal(permission.status, 'deny');
+  assert.ok(h.store.getRun('root').violations.some((entry) => entry.kind === 'out-of-scope-write'));
+
+  await mkdir(join(dir, 'pkg-b'), { recursive: true });
+  await h.enforcement.onToolAfter({ tool: 'write', sessionID: 'child-b', callID: 'w2', args: { filePath: join(dir, 'pkg-b', 'new.ts'), content: 'y' } }, { title: 'write', output: 'ok' });
+  const state = h.store.getRun('root');
+  assert.ok(state.sideEffects.some((effect) => effect.nodeId === 'impl-b' && effect.tool === 'write' && effect.target === 'pkg-b/new.ts'));
+});
+
+test('allowShell bash cannot write outside writeScope; in-scope writes pass', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-bash-scope-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await setupSteerableRun(h);
+  await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-b]\nwork' });
+  await bindChild(h, 'child-b', 'graph-implementer');
+
+  const escape = { args: { command: `cat > ${join(dir, 'pkg-a', 'steal.sh')} <<'EOF'\necho boom\nEOF` } };
+  await h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-b', callID: 'b1' }, escape);
+  const permission = { status: 'ask' };
+  await h.enforcement.onPermissionAsk({ type: 'bash', sessionID: 'child-b', callID: 'b1' }, permission);
+  assert.equal(permission.status, 'deny');
+  assert.ok(h.store.getRun('root').violations.some((entry) => entry.kind === 'out-of-scope-bash' && entry.detail.includes('pkg-a/steal.sh')));
+
+  const fine = await h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-b', callID: 'b2' }, { args: { command: 'UV_CACHE_DIR=$PWD/pkg-b/cache uv venv pkg-b/.venv > pkg-b/logs/setup.log' } });
+  assert.equal(fine, undefined);
+});
+
+test('read-only explorer bash passes checks but not workspace writes', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-explorer-bash-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+
+  const check = await h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-explore', callID: 'x1' }, { args: { command: 'uv --version; python3 --version' } });
+  assert.equal(check, undefined);
+
+  const write = { args: { command: 'uv --version > notes.txt' } };
+  await h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-explore', callID: 'x2' }, write);
+  const permission = { status: 'ask' };
+  await h.enforcement.onPermissionAsk({ type: 'bash', sessionID: 'child-explore', callID: 'x2' }, permission);
+  assert.equal(permission.status, 'deny');
+  assert.ok(h.store.getRun('root').violations.some((entry) => entry.kind === 'out-of-scope-bash' && entry.detail.includes('graph-explorer')));
+});
+
+test('NOT_DISPATCHED_NODE names the bound node and INVALID_GRAPH carries schema guidance', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-errors-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await setupSteerableRun(h);
+
+  // Schema guidance rides along with the first rejection, before any node runs.
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner2', 'graph-planner');
+  const badGraph = JSON.parse(await h.tools.graph_submit_plan.execute(
+    { intent: 'change', specs: [{ id: 'n1', kind: 'plan', agent: 'planner', dependsOn: [], outputs: ['plan@1'] }] },
+    ctx(h, 'child-planner2', 'graph-planner'),
+  ));
+  assert.equal(badGraph.code, 'INVALID_GRAPH');
+  assert.match(badGraph.hint, /explore→graph-explorer/);
+  assert.match(badGraph.hint, /bare artifact names only/);
+  assert.match(badGraph.hint, /exactly one plan node/);
+
+  await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-b]\nwork' });
+  await bindChild(h, 'child-b', 'graph-implementer');
+  const wrongNode = JSON.parse(await h.tools.graph_submit_change.execute(
+    { nodeId: 'impl-a', filesTouched: ['pkg-b/x.ts'], summary: 'did b work' },
+    ctx(h, 'child-b', 'graph-implementer'),
+  ));
+  assert.equal(wrongNode.code, 'NOT_DISPATCHED_NODE');
+  assert.match(wrongNode.detail, /bound to impl-b/);
+});
+
+test('terminal runs keep read-only tools alive for children and graph_run_new starts a successor', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-newrun-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await setupSteerableRun(h);
+  await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-a]\nwork' });
+  await bindChild(h, 'child-a', 'graph-implementer');
+  await mkdir(join(dir, 'pkg-a'), { recursive: true });
+  await writeFile(join(dir, 'pkg-a', 'a.ts'), 'a');
+  const changeA = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-a', filesTouched: ['pkg-a/a.ts'], summary: 'a' }, ctx(h, 'child-a', 'graph-implementer')));
+  assert.equal(changeA.ok, true, JSON.stringify(changeA));
+  await childIdle(h, 'child-a');
+  await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-b]\nwork' });
+  await bindChild(h, 'child-b', 'graph-implementer');
+  await mkdir(join(dir, 'pkg-b'), { recursive: true });
+  await writeFile(join(dir, 'pkg-b', 'b.ts'), 'b');
+  const changeB = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-b', filesTouched: ['pkg-b/b.ts'], summary: 'b' }, ctx(h, 'child-b', 'graph-implementer')));
+  assert.equal(changeB.ok, true, JSON.stringify(changeB));
+  await childIdle(h, 'child-b');
+  await dispatch(h, 'graph-verifier');
+  await bindChild(h, 'child-verify', 'graph-verifier');
+  const verdict = JSON.parse(await h.tools.graph_submit_verification.execute(
+    { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }] },
+    ctx(h, 'child-verify', 'graph-verifier'),
+  ));
+  assert.equal(verdict.ok, true, JSON.stringify(verdict));
+  assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
+
+  // A post-terminal dispatch is rejected, but read-only tools keep working
+  // for the rejected child through the parent-chain fallback.
+  const blocked = await dispatch(h, 'graph-explorer');
+  assert.match(blocked.args.prompt, /RUNNER_REJECTED/);
+  await h.enforcement.onEvent({ event: { type: 'session.created', properties: { info: { id: 'late-child', parentID: 'root' } } } });
+  const fromChild = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'late-child', 'graph-explorer')));
+  assert.equal(fromChild.status, 'SUCCEEDED');
+  assert.doesNotThrow(() => h.enforcement.internals.READ_ONLY_TOOLS.has('read'), undefined);
+
+  // A new run can be started in the same session once the old one is terminal.
+  const tooEarlyHarness = h;
+  const early = JSON.parse(await tooEarlyHarness.tools.graph_run_new.execute({}, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(early.ok, true);
+  assert.match(early.runId, /^root:2$/);
+  const terminalDispatch = await dispatch(tooEarlyHarness, 'graph-explorer');
+  assert.ok(!terminalDispatch.args.prompt.includes('RUNNER_REJECTED'));
+
+  // Restart: the successor chain is followed back to the newest run.
+  const h2 = harness(dir);
+  await startRun(h2);
+  assert.equal(h2.bindings.get('root').runId, 'root:2');
 });

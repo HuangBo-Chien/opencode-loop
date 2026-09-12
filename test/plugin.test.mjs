@@ -81,6 +81,7 @@ test('registers exactly seven runner-gated agents, preserving native definitions
     'graph_journal_read',
     'graph_journal_search',
     'graph_journal_write_insight',
+    'graph_run_new',
     'graph_run_resume',
     'graph_status',
     'graph_submit_change',
@@ -306,7 +307,7 @@ test('status is read-only, truthful, stable and does not expose host secrets or 
   const hooks = await plugin({ directory: 'C:/private/project', secret: 'host-secret' });
   const output = await hooks.tool.graph_status.execute({}, new Proxy({}, { get() { throw new Error('host effects forbidden'); } }));
   const status = JSON.parse(output);
-  assert.equal(status.version, '0.3.0-alpha.1');
+  assert.equal(status.version, '0.3.0-alpha.2');
   assert.equal(status.enforcementScope, 'GRAPH_MANAGED_SESSIONS');
   assert.equal(status.enforcementAttested, false);
   assert.equal(status.runtimeAvailable, true);

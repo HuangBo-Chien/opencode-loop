@@ -71,7 +71,27 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1) throw new TypeError('maxAttempts must be a positive integer');
   if (!Number.isInteger(maxPlanRevisions) || maxPlanRevisions < 1) throw new TypeError('maxPlanRevisions must be a positive integer');
 
-  function admitDispatch(state, { agent, now }) {
+  // Per-node admissibility shared by the sorted and coordinator-targeted paths.
+  // Attempt exhaustion keeps sorted-path semantics: the node fails, and write
+  // agents additionally fail the run.
+  function admissibleNode(state, chosen, agent, now) {
+    if (!ELIGIBLE_STATES.has(chosen.state)) {
+      return { allowed: false, code: 'NODE_NOT_ADMISSIBLE', detail: `${chosen.spec.id} is ${chosen.state} and cannot begin` };
+    }
+    const deps = depsSatisfied(state, chosen);
+    if (!deps.ok) {
+      return { allowed: false, code: 'NODE_NOT_ADMISSIBLE', detail: `${chosen.spec.id} is not yet admissible: ${deps.missing.join(', ')}` };
+    }
+    if (chosen.attempt >= nodeMaxAttempts(chosen, maxAttempts)) {
+      chosen.state = 'FAILED';
+      chosen.finishedAt = now;
+      if (WRITE_AGENTS.has(agent)) failRun(state, `${chosen.spec.id} exhausted its attempt budget`, now);
+      return { allowed: false, code: 'ATTEMPTS_EXHAUSTED', detail: `${chosen.spec.id} has no attempts left` };
+    }
+    return { allowed: true, nodeId: chosen.spec.id, reconcile: chosen.reconcile === true || state.sideEffects.some((effect) => effect.nodeId === chosen.spec.id) };
+  }
+
+  function admitDispatch(state, { agent, now, nodeId = null }) {
     if (TERMINAL_RUN.has(state.status)) {
       return { allowed: false, code: 'RUN_TERMINATED', detail: state.failReason ? `run failed: ${state.failReason}` : 'run already finished' };
     }
@@ -96,6 +116,16 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
       }
     }
 
+    // Coordinator-targeted dispatch: validate exactly the requested node so
+    // the binding always matches the node the coordinator described.
+    if (typeof nodeId === 'string' && nodeId.length) {
+      const chosen = mine.find((node) => node.spec.id === nodeId);
+      if (!chosen) {
+        return { allowed: false, code: 'NODE_NOT_FOUND', detail: `${nodeId} is not a ${agent} node in the current task graph` };
+      }
+      return admissibleNode(state, chosen, agent, now);
+    }
+
     const ready = mine
       .filter((node) => ELIGIBLE_STATES.has(node.state))
       .map((node) => ({ node, deps: depsSatisfied(state, node) }))
@@ -110,14 +140,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
         detail: waiting.length ? `not yet admissible: ${waiting.join('; ')}` : `no ${agent} node exists in the current task graph`,
       };
     }
-    const chosen = ready[0].node;
-    if (chosen.attempt >= nodeMaxAttempts(chosen, maxAttempts)) {
-      chosen.state = 'FAILED';
-      chosen.finishedAt = now;
-      if (WRITE_AGENTS.has(agent)) failRun(state, `${chosen.spec.id} exhausted its attempt budget`, now);
-      return { allowed: false, code: 'ATTEMPTS_EXHAUSTED', detail: `${chosen.spec.id} has no attempts left` };
-    }
-    return { allowed: true, nodeId: chosen.spec.id, reconcile: chosen.reconcile === true };
+    return admissibleNode(state, ready[0].node, agent, now);
   }
 
   function beginNode(state, nodeId, { now, sessionId = null, dispatchId = null }) {
