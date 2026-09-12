@@ -391,7 +391,10 @@ test('out-of-scope edit and implementer bash are denied at the permission prompt
   await dispatch(h, 'graph-implementer');
   await bindChild(h, 'child-impl', 'graph-implementer');
 
-  await h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-impl', callID: 'bad-edit', args: { filePath: join(dir, 'docs', 'other.md') } }, { args: { filePath: join(dir, 'docs', 'other.md') } });
+  await assert.rejects(
+    () => h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-impl', callID: 'bad-edit', args: { filePath: join(dir, 'docs', 'other.md') } }, { args: { filePath: join(dir, 'docs', 'other.md') } }),
+    /RUNNER_DENIED\(out-of-scope-edit\)/,
+  );
   const permission = { status: 'ask' };
   await h.enforcement.onPermissionAsk({ type: 'edit', sessionID: 'child-impl', callID: 'bad-edit', pattern: join(dir, 'docs', 'other.md') }, permission);
   assert.equal(permission.status, 'deny');
@@ -570,7 +573,10 @@ test('write tool is scope-gated exactly like edit and enters the side-effect led
   await bindChild(h, 'child-b', 'graph-implementer');
 
   const outside = { args: { filePath: join(dir, 'pkg-a', 'escape.ts'), content: 'x' } };
-  await h.enforcement.onToolBefore({ tool: 'write', sessionID: 'child-b', callID: 'w1' }, outside);
+  await assert.rejects(
+    () => h.enforcement.onToolBefore({ tool: 'write', sessionID: 'child-b', callID: 'w1' }, outside),
+    /RUNNER_DENIED\(out-of-scope-write\)/,
+  );
   const permission = { status: 'ask' };
   await h.enforcement.onPermissionAsk({ type: 'write', sessionID: 'child-b', callID: 'w1', pattern: join(dir, 'pkg-a', 'escape.ts') }, permission);
   assert.equal(permission.status, 'deny');
@@ -591,7 +597,10 @@ test('allowShell bash cannot write outside writeScope; in-scope writes pass', as
   await bindChild(h, 'child-b', 'graph-implementer');
 
   const escape = { args: { command: `cat > ${join(dir, 'pkg-a', 'steal.sh')} <<'EOF'\necho boom\nEOF` } };
-  await h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-b', callID: 'b1' }, escape);
+  await assert.rejects(
+    () => h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-b', callID: 'b1' }, escape),
+    /RUNNER_DENIED\(out-of-scope-bash\)/,
+  );
   const permission = { status: 'ask' };
   await h.enforcement.onPermissionAsk({ type: 'bash', sessionID: 'child-b', callID: 'b1' }, permission);
   assert.equal(permission.status, 'deny');
@@ -613,7 +622,10 @@ test('read-only explorer bash passes checks but not workspace writes', async (t)
   assert.equal(check, undefined);
 
   const write = { args: { command: 'uv --version > notes.txt' } };
-  await h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-explore', callID: 'x2' }, write);
+  await assert.rejects(
+    () => h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-explore', callID: 'x2' }, write),
+    /RUNNER_DENIED\(out-of-scope-bash\)/,
+  );
   const permission = { status: 'ask' };
   await h.enforcement.onPermissionAsk({ type: 'bash', sessionID: 'child-explore', callID: 'x2' }, permission);
   assert.equal(permission.status, 'deny');
@@ -937,7 +949,10 @@ test('parallel writers: two [nodeId:] implementers run concurrently and complete
 
   // Scope enforcement stays per-node while running in parallel.
   const escape = { args: { filePath: join(dir, 'pkg-b', 'from-a.ts'), content: 'x' } };
-  await h.enforcement.onToolBefore({ tool: 'write', sessionID: 'child-a', callID: 'w1' }, escape);
+  await assert.rejects(
+    () => h.enforcement.onToolBefore({ tool: 'write', sessionID: 'child-a', callID: 'w1' }, escape),
+    /RUNNER_DENIED\(out-of-scope-write\)/,
+  );
   const permission = { status: 'ask' };
   await h.enforcement.onPermissionAsk({ type: 'write', sessionID: 'child-a', callID: 'w1', pattern: join(dir, 'pkg-b', 'from-a.ts') }, permission);
   assert.equal(permission.status, 'deny');
@@ -1298,7 +1313,10 @@ test('{{run}} tokens expand before validation and reach the bound implementer', 
   // Shell screening matches the expanded scope: inside passes, outside is denied.
   const fine = await h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-impl', callID: 'tk1' }, { args: { command: 'mkdir -p lanes/root && echo hi > lanes/root/out.txt' } });
   assert.equal(fine ?? null, null);
-  await h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-impl', callID: 'tk2' }, { args: { command: 'echo hi > lanes/other/out.txt' } });
+  await assert.rejects(
+    () => h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-impl', callID: 'tk2' }, { args: { command: 'echo hi > lanes/other/out.txt' } }),
+    /RUNNER_DENIED\(out-of-scope-bash\)/,
+  );
   assert.ok(h.store.getRun('root').violations.some((entry) => entry.kind === 'out-of-scope-bash' && entry.detail.includes('lanes/other/out.txt')));
 });
 
@@ -1316,4 +1334,104 @@ test('plans with unsubstituted placeholders are rejected at submission', async (
   assert.equal(plan.ok, false);
   assert.equal(plan.code, 'INVALID_GRAPH');
   assert.match(plan.detail, /unsubstituted template placeholder/);
+});
+
+test('a denied bash that executes anyway taints the attempt (strict failure)', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-taint-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  await h.tools.graph_submit_plan.execute({ intent: 'change', specs: SPECS }, ctx(h, 'child-planner', 'graph-planner'));
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
+  await dispatch(h, 'graph-implementer');
+  await bindChild(h, 'child-impl', 'graph-implementer');
+
+  // SPECS' impl node has no allowShell: the before-hook hard-blocks...
+  await assert.rejects(
+    () => h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-impl', callID: 'by1' }, { args: { command: 'uv venv .venv' } }),
+    /RUNNER_DENIED\(blocked-bash\).*Do not retry bash/,
+  );
+  // ...but if the host executes it anyway, the attempt is strictly failed.
+  await h.enforcement.onToolAfter({ tool: 'bash', sessionID: 'child-impl', callID: 'by1', args: { command: 'uv venv .venv' } }, { title: 'bash', output: 'ran' });
+  const node = h.store.getRun('root').nodes['impl-1'];
+  assert.equal(node.state, 'FAILED');
+  assert.deepEqual(node.lastFailure, { code: 'EXECUTED_DESPITE_DENY', detail: 'bash executed despite runner denial', retryable: false });
+  assert.ok(h.store.getRun('root').violations.some((entry) => entry.kind === 'executed-despite-deny'));
+  // A tainted attempt can never reach SUCCEEDED: submission is rejected.
+  const change = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: [], summary: 'x' }, ctx(h, 'child-impl', 'graph-implementer')));
+  assert.equal(change.ok, false);
+});
+
+test('blocked-bash loop closes through unresolved report and plan revision', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-blocked-loop-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  await h.tools.graph_submit_plan.execute({ intent: 'change', specs: SPECS }, ctx(h, 'child-planner', 'graph-planner'));
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
+  await dispatch(h, 'graph-implementer');
+  await bindChild(h, 'child-impl', 'graph-implementer');
+
+  await assert.rejects(
+    () => h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-impl', callID: 'bx1' }, { args: { command: 'python3 -c "print(1)"' } }),
+    /RUNNER_DENIED\(blocked-bash\)/,
+  );
+  // The implementer wraps up: submits its (empty) change with an unresolved
+  // report asking for allowShell — the structured channel back to the
+  // coordinator.
+  const change = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: [], summary: 'blocked: shell required', unresolved: ['plan must set allowShell=true or split an install node'] }, ctx(h, 'child-impl', 'graph-implementer')));
+  assert.equal(change.ok, true, JSON.stringify(change));
+  assert.equal(h.store.getRun('root').nodes['impl-1'].state, 'SUCCEEDED');
+
+  // The planner revises: v2 sets allowShell on the same node id (attempt
+  // and session are preserved), critic passes, the implementer is
+  // re-dispatched and bash now goes through.
+  const REVISED = SPECS.map((spec) => spec.id === 'impl-1' ? { ...spec, allowShell: true, writeScope: ['src/**'] } : spec);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner2', 'graph-planner');
+  const revised = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs: REVISED }, ctx(h, 'child-planner2', 'graph-planner')));
+  assert.equal(revised.ok, true, JSON.stringify(revised));
+  assert.equal(revised.planVersion, 2);
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic2', 'graph-plan-critic');
+  await h.tools.graph_submit_review.execute({ planVersion: 2, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic2', 'graph-plan-critic'));
+  await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-1]\nretry with shell' });
+  await bindChild(h, 'child-impl2', 'graph-implementer');
+  const rerun = await h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'child-impl2', callID: 'bx2' }, { args: { command: 'python3 -c "print(1)"' } });
+  assert.equal(rerun ?? null, null);
+  assert.equal(h.store.getRun('root').nodes['impl-1'].attempt, 2);
+});
+
+test('graph_inspect counts on-disk deliverables the ledger never saw', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-fs-progress-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+  const FS_SPECS = SPECS.map((spec) => spec.id === 'impl-1'
+    ? { ...spec, writeScope: ['src/**', '.tmp-environment/**'], deliverables: ['src/a.ts', '.tmp-environment/venv/bin/python'] }
+    : spec);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  await h.tools.graph_submit_plan.execute({ intent: 'change', specs: FS_SPECS }, ctx(h, 'child-planner', 'graph-planner'));
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
+  await dispatch(h, 'graph-implementer');
+  await bindChild(h, 'child-impl', 'graph-implementer');
+
+  // The venv python was created by bash: it is on disk but absent from the
+  // edit/write ledger. inspect's fs fallback must still count it as done.
+  await mkdir(join(dir, '.tmp-environment', 'venv', 'bin'), { recursive: true });
+  await writeFile(join(dir, '.tmp-environment', 'venv', 'bin', 'python'), '#!python');
+  const report = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'child-impl', 'graph-implementer')));
+  const impl = report.nodes.find((node) => node.id === 'impl-1');
+  assert.deepEqual(impl.deliverables, { total: 2, done: 1, pending: ['src/a.ts'] });
 });

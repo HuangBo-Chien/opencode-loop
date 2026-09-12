@@ -1,6 +1,6 @@
 # opencode-loop
 
-`0.3.0-alpha.9` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
+`0.3.0-alpha.10` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
 
 ## How the gate works
 
@@ -83,12 +83,12 @@ Global promotion never copies a project entry. It accepts only a project `insigh
 
 ## Project-local installation
 
-Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.9.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
+Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.10.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
 
 From the project where you want to use the plugin, install that local tarball:
 
 ```powershell
-npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.9.tgz
+npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.10.tgz
 node --input-type=module -e "import {pathToFileURL} from 'node:url'; import path from 'node:path'; console.log(pathToFileURL(path.resolve('node_modules/opencode-loop/src/index.mjs')).href)"
 ```
 
@@ -178,4 +178,4 @@ What remains explicitly **not** claimed:
 - Journal redaction is best-effort, storage is plaintext, and historical entries can be stale; journal output is never current gate evidence.
 - The internal effect boundary (`effect-boundary.mjs`) remains a tested but unwired design sketch; its replay protection is still single-instance.
 
-Parallel implementers are gated at **admission time** (dispatch capacity over reserved + RUNNING nodes), unlike creation-time worker pools in team-style plugins; the gate sees the run's live DAG state, and per-node side-effect ledgers, file claims and scope enforcement are already per-writer. A per-member git-worktree isolation option (stronger than scope globs, at the cost of merge-back) is a possible future TaskSpec field. Attempt ceilings are per-node structured-submission budgets — much coarser than conversation-turn budgets — and exhaustion now pauses for a user reset decision rather than terminating, which is the intended pressure valve instead of larger budgets. Mid-flight progress is likewise mechanical, not signalled: every child mutation already serializes through the per-run dispatch queue, `graph_inspect` surfaces per-node ledger activity and deliverable completion, and bash-written files are not tracked mid-flight (progress may under-report honestly until submission) — finer-grained reporting is expressed by decomposing work into smaller nodes with declared `deliverables`, not by a self-reported status channel.
+Parallel implementers are gated at **admission time** (dispatch capacity over reserved + RUNNING nodes), unlike creation-time worker pools in team-style plugins; the gate sees the run's live DAG state, and per-node side-effect ledgers, file claims and scope enforcement are already per-writer. Scope denials are hard blocks: the `tool.execute.before` hook throws `RUNNER_DENIED(...)` with actionable guidance (the host's permission flow may auto-allow, so the throw is the only unbypassable deny), and a denied call that executes anyway strictly fails the attempt (`EXECUTED_DESPITE_DENY`, same class as out-of-scope claims) — tainted work can never reach SUCCEEDED. A per-member git-worktree isolation option (stronger than scope globs, at the cost of merge-back) is a possible future TaskSpec field. Attempt ceilings are per-node structured-submission budgets — much coarser than conversation-turn budgets — and exhaustion now pauses for a user reset decision rather than terminating, which is the intended pressure valve instead of larger budgets. Mid-flight progress is likewise mechanical, not signalled: every child mutation already serializes through the per-run dispatch queue, `graph_inspect` surfaces per-node ledger activity and deliverable completion (with a read-only existence check so bash-created artifacts like venv binaries count honestly), and finer-grained reporting is expressed by decomposing work into smaller nodes with declared `deliverables`, not by a self-reported status channel.

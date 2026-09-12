@@ -4,6 +4,8 @@
 // run state, so a specialist cannot forge another role's submission.
 
 import { tool } from '@opencode-ai/plugin/tool';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { cleanJson } from './json-safe.mjs';
 import { validateTaskGraph, expandRunTokens, runToken } from './task-spec.mjs';
 
@@ -213,7 +215,28 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (!runId) return rejected('NOT_GRAPH_SESSION', 'this session is not part of a graph run');
       const state = store.getRun(runId) ?? (store.loadRun ? await store.loadRun(runId) : null);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
-      return reply({ ...runner.inspect(state), ...(dispatches ? { dispatches: dispatches.inspect(state.runId) } : {}) });
+      const report = runner.inspect(state);
+      // Honest deliverable progress: bash-created artifacts (venv binaries,
+      // symlinks, generated checkpoints) never enter the edit/write ledger
+      // or the filesTouched claim, so the runner's ledger-only numbers can
+      // under-report real progress. A read-only existence check keeps the
+      // denominator truthful; the runner itself stays a pure state machine
+      // (this mirrors nodeProgress's coverage derivation on purpose).
+      for (const node of report.nodes) {
+        const spec = state.nodes[node.id]?.spec;
+        const declared = Array.isArray(spec?.deliverables) ? spec.deliverables : null;
+        if (node.deliverables === undefined || !declared?.length) continue;
+        let covered;
+        if (node.state === 'SUCCEEDED') {
+          const claimed = state.artifacts[`change:${node.id}`]?.payload?.filesTouched;
+          covered = new Set(Array.isArray(claimed) ? claimed : []);
+        } else {
+          covered = new Set(state.sideEffects.filter((effect) => effect.nodeId === node.id && (effect.tool === 'edit' || effect.tool === 'write')).map((effect) => effect.target));
+        }
+        const stillPending = declared.filter((file) => !covered.has(file) && !existsSync(join(worktree, file)));
+        node.deliverables = { total: declared.length, done: declared.length - stillPending.length, pending: stillPending.slice(0, 8) };
+      }
+      return reply({ ...report, ...(dispatches ? { dispatches: dispatches.inspect(state.runId) } : {}) });
     },
   });
 

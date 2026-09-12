@@ -83,8 +83,12 @@ test('roles provide distinct evidence contracts, submit duties and capability li
   assert.match(definitions['graph-planner'].prompt, /deliverables/);
   assert.match(definitions['graph-planner'].prompt, /\{\{run\}\}/);
   assert.match(definitions['graph-planner'].prompt, /嚴禁自創/);
+  assert.match(definitions['graph-planner'].prompt, /暫存根/);
   assert.match(definitions['graph-planner'].prompt, /拆成多個小 implement 節點/);
   assert.match(definitions['graph-planner'].prompt, /maxImplementerParallel=2/);
+  assert.match(definitions['graph-implementer'].prompt, /RUNNER_DENIED/);
+  assert.match(definitions['graph-implementer'].prompt, /EXECUTED_DESPITE_DENY/);
+  assert.match(definitions['graph-verifier'].prompt, /申報位置與用途/);
   assert.match(definitions['graph-plan-critic'].prompt, /graph_submit_review/);
   assert.match(definitions['graph-plan-critic'].prompt, /FAIL/);
   assert.match(definitions['graph-plan-critic'].prompt, /REVISE/);

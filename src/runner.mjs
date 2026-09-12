@@ -384,6 +384,19 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       hint: retryable ? 'Correct filesTouched/filesDeleted and resubmit within this attempt; use literal file paths, not directories or globs' : 'Inspect the node failure and recorded scope/ledger evidence' };
   }
 
+  // Strict failure for an attempt whose denied tool call executed anyway:
+  // mirrors the out-of-scope claim semantics (FAILED, not retryable in this
+  // attempt); a plan revision or fresh attempt is the only recovery.
+  function taintAttempt(state, { nodeId, detail, now }) {
+    const node = state.nodes[nodeId];
+    if (!node || node.state !== 'RUNNING') return false;
+    node.lastFailure = { code: 'EXECUTED_DESPITE_DENY', detail, retryable: false };
+    node.state = 'FAILED';
+    node.finishedAt = now;
+    state.updatedAt = now;
+    return true;
+  }
+
   function checkChange(state, { nodeId, filesTouched, filesDeleted = [], now }) {
     if (TERMINAL_RUN.has(state.status)) return { ok: false, code: 'RUN_TERMINATED', detail: state.failReason ?? 'run already finished' };
     const node = state.nodes[nodeId];
@@ -660,6 +673,6 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   return Object.freeze({
     admitDispatch, beginNode, attachSession, submitPlan, submitReview, checkChange, submitChange, submitVerification,
     recordSideEffect, recordViolation, captureRequest, completeRequestCapture, markIncomplete, resumeRun, reconcileNode, revalidateArtifacts, inspect,
-    abortRun, archiveForReset, implementerCapacity,
+    abortRun, archiveForReset, implementerCapacity, taintAttempt,
   });
 }

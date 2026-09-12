@@ -246,7 +246,26 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       deniedCalls.set(`${sessionID}:${callID}`, { tool, target: decision.target, callID });
       runner.recordViolation(decision.state, { nodeId: decision.nodeId, kind: decision.kind, detail: decision.reason, now: NOW() });
       await store.saveRun(decision.state);
+      // Hard block: the host's permission flow may auto-allow this call
+      // (config defaults or manual approval at the native prompt), so the
+      // only deny that cannot be bypassed is throwing from the before-hook.
+      // The serialized queue swallows the rejection (tails settle to
+      // undefined), so this cannot poison subsequent operations.
+      throw new Error(`RUNNER_DENIED(${decision.kind}): ${decision.reason} ${denyGuidance(decision.kind)}`);
     }
+  }
+
+  function denyGuidance(kind) {
+    if (kind === 'blocked-bash') {
+      return 'Do not retry bash. Complete the work with edit/write; if it genuinely requires shell (installs, builds), wrap up and report via graph_submit_change unresolved (or your final task report) that the coordinator must revise the plan: set allowShell=true for this node or split out an install node with its own lane.';
+    }
+    if (kind === 'out-of-scope-bash') {
+      return 'Retarget or remove the out-of-scope write (redirections, tee/cp/mv/rm/sed -i, ...) so every write lands inside your writeScope; the [RUNNER] writeScope line in your dispatch prompt is authoritative.';
+    }
+    if (kind === 'out-of-scope-edit' || kind === 'out-of-scope-write') {
+      return 'Write only inside your declared writeScope; the [RUNNER] writeScope line in your dispatch prompt is authoritative.';
+    }
+    return 'Read-only specialists may not write workspace files; report findings through the structured submit tool instead.';
   }
 
   async function onPermissionAsk(input, output) {
@@ -284,7 +303,14 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     const key = `${sessionID}:${callID}`;
     if (deniedCalls.has(key)) {
       deniedCalls.delete(key);
-      await mutate(binding.runId, (state) => runner.recordViolation(state, { nodeId: binding.nodeId, kind: 'executed-despite-deny', detail: `${tool} ran even though the runner denied it`, now: NOW() }));
+      await mutate(binding.runId, (state) => {
+        runner.recordViolation(state, { nodeId: binding.nodeId, kind: 'executed-despite-deny', detail: `${tool} ran even though the runner denied it`, now: NOW() });
+        // A denied call that ran anyway taints the attempt: strict failure,
+        // the same class as out-of-scope claims. Recovery is a fresh
+        // attempt (or a plan revision), never a resubmission of this one,
+        // so tainted work can never reach SUCCEEDED.
+        runner.taintAttempt(state, { nodeId: binding.nodeId, detail: `${tool} executed despite runner denial`, now: NOW() });
+      });
       return;
     }
     const args = input.args ?? {};
