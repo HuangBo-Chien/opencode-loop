@@ -175,7 +175,7 @@ test('new-run hook persists only a completed initial request representation', as
         getRun: (runId) => baseStore.getRun(runId),
         async createRun(options) {
           const state = await baseStore.createRun(options);
-          initialDocuments.push(JSON.parse(await readFile(join(dir, '.opencode-loop', 'runs', `${options.runId}.json`), 'utf8')));
+          initialDocuments.push(JSON.parse(await readFile(join(dir, '.opencode-loop', 'runs', `${encodeURIComponent(options.runId)}.json`), 'utf8')));
           return state;
         },
         async saveRun() {

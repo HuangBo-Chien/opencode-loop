@@ -1008,3 +1008,56 @@ test('inspect reports mechanical per-node progress from the ledger and deliverab
   const wideImpl = wideReport.nodes.find((node) => node.id === 'impl-w');
   assert.equal(wideImpl.deliverables.pending.length, 8);
 });
+
+test('run ids with colons persist to platform-safe encoded filenames', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-encoded-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const store = createRunStore({ worktree: dir });
+
+  await store.createRun({ runId: 'root:2', rootSessionId: 'root', now: NOW });
+  const state = store.getRun('root:2');
+  state.failReason = 'x';
+  await store.saveRun(state);
+  await store.releaseRun('root:2');
+
+  const runsDir = join(dir, '.opencode-loop', 'runs');
+  const names = await fsPromises.readdir(runsDir);
+  assert.ok(names.includes('root%3A2.json'), `expected encoded file, got ${names.join(', ')}`);
+  assert.equal(names.some((name) => name.includes(':')), false);
+
+  const fresh = createRunStore({ worktree: dir });
+  const loaded = await fresh.loadRun('root:2');
+  assert.equal(loaded.runId, 'root:2');
+  assert.equal(loaded.failReason, 'x');
+  assert.ok((await fresh.listRunIds()).includes('root:2'));
+});
+
+test('legacy colon filenames are lazily migrated and never duplicated', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-legacy-migrate-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsDir = join(dir, '.opencode-loop', 'runs');
+  await mkdir(runsDir, { recursive: true });
+  const legacy = newRun({ runId: 'old:1', rootSessionId: 'root', now: NOW });
+  await writeFile(join(runsDir, 'old:1.json'), JSON.stringify(legacy));
+
+  // Direct load still sees the legacy file during the transition.
+  const store = createRunStore({ worktree: dir });
+  const direct = await store.loadRun('old:1');
+  assert.equal(direct.runId, 'old:1');
+
+  // Listing migrates the file to its encoded name and reports the logical id.
+  assert.ok((await store.listRunIds()).includes('old:1'));
+  const names = await fsPromises.readdir(runsDir);
+  assert.ok(names.includes('old%3A1.json'));
+  assert.equal(names.includes('old:1.json'), false);
+});
+
+test('runFileKey output is Windows-filename safe for every representable id', async () => {
+  const { runFileKey } = await import('../src/run-state.mjs');
+  for (const id of ['root', 'root:2', 'ses_abc123', 'ses_x:12', 'a.b-c_d']) {
+    const key = runFileKey(id);
+    assert.match(key, /^[A-Za-z0-9._~-]+(?:%[0-9A-F]{2}[A-Za-z0-9._~-]*)*$/);
+    assert.equal(key.includes(':'), false);
+    assert.equal(decodeURIComponent(key), id);
+  }
+});

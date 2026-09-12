@@ -1,10 +1,10 @@
 # opencode-loop
 
-`0.3.0-alpha.10` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
+`0.3.0-alpha.11` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
 
 ## How the gate works
 
-The model proposes; the runner decides. Every hook decision is persisted to a run document under `<worktree>/<stateDirectory>/runs/<runId>.json` (atomic writes, cross-instance lock file), where `runId` is the orchestrator session id — a restart reloads it and continues with counters intact.
+The model proposes; the runner decides. Every hook decision is persisted to a run document under `<worktree>/<stateDirectory>/runs/<encoded-runId>.json` (atomic writes, cross-instance lock file; the filename is the percent-encoded run id, so successor runs like `root:2` stay valid on Windows while colon-free names are unchanged), where `runId` is the orchestrator session id — a restart reloads it and continues with counters intact.
 
 | Gate | Mechanism |
 | --- | --- |
@@ -83,12 +83,12 @@ Global promotion never copies a project entry. It accepts only a project `insigh
 
 ## Project-local installation
 
-Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.10.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
+Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.11.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
 
 From the project where you want to use the plugin, install that local tarball:
 
 ```powershell
-npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.10.tgz
+npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.11.tgz
 node --input-type=module -e "import {pathToFileURL} from 'node:url'; import path from 'node:path'; console.log(pathToFileURL(path.resolve('node_modules/opencode-loop/src/index.mjs')).href)"
 ```
 
