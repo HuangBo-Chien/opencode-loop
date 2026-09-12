@@ -122,6 +122,24 @@ export function validateTaskSpec(spec, { maxAttemptsCeiling = 20 } = {}) {
   } else if (Array.isArray(spec.writeScope) && spec.writeScope.length > 0) {
     fail('only implement nodes may declare a writeScope');
   }
+  // Optional concrete deliverable list (implement nodes only): literal
+  // workspace-relative files inside the node's writeScope. graph_inspect
+  // uses it as the denominator for mechanical progress reporting.
+  if (spec.deliverables !== undefined) {
+    if (kind !== 'implement') {
+      fail('only implement nodes may declare deliverables');
+    } else if (!Array.isArray(spec.deliverables) || spec.deliverables.length > 32 || spec.deliverables.some((entry) => typeof entry !== 'string')) {
+      fail('deliverables must be an array of strings (max 32)');
+    } else if (Array.isArray(spec.writeScope) && spec.writeScope.length > 0) {
+      for (const entry of spec.deliverables) {
+        const checked = validateFileClaim(entry);
+        if (!checked.ok) fail(`deliverables: ${checked.detail}`);
+        else if (!spec.writeScope.some((pattern) => matchScopePath(pattern, checked.path))) {
+          fail(`deliverables: ${checked.path} is outside this node's writeScope`);
+        }
+      }
+    }
+  }
   const maxAttempts = spec.maxAttempts === undefined ? undefined : spec.maxAttempts;
   if (maxAttempts !== undefined && (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > maxAttemptsCeiling)) {
     fail(`maxAttempts must be an integer from 1 to ${maxAttemptsCeiling}`);

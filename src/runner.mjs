@@ -595,6 +595,34 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     return { invalidated };
   }
 
+  // Mechanical per-node progress for graph_inspect: side-effect counts and
+  // last activity come straight from the serialized ledger; deliverable
+  // completion compares the declared list against the ledger's edit/write
+  // targets mid-flight (bash writes are not tracked, so in-flight progress
+  // may under-report honestly) and against the change artifact's claimed
+  // files once the node has succeeded.
+  function nodeProgress(state, node) {
+    const effects = state.sideEffects.filter((effect) => effect.nodeId === node.spec.id);
+    const lastActivityAt = effects.reduce((latest, effect) => latest === null || effect.at > latest ? effect.at : latest, node.startedAt ?? null);
+    const progress = { sideEffectCount: effects.length, lastActivityAt };
+    const declared = Array.isArray(node.spec.deliverables) ? node.spec.deliverables : null;
+    if (node.spec.kind === 'implement' && declared && declared.length) {
+      let covered;
+      if (node.state === 'SUCCEEDED') {
+        const claimed = state.artifacts[`change:${node.spec.id}`]?.payload?.filesTouched;
+        covered = new Set(Array.isArray(claimed) ? claimed : []);
+      } else {
+        covered = new Set(effects.filter((effect) => effect.tool === 'edit' || effect.tool === 'write').map((effect) => effect.target));
+      }
+      progress.deliverables = {
+        total: declared.length,
+        done: declared.filter((file) => covered.has(file)).length,
+        pending: declared.filter((file) => !covered.has(file)).slice(0, 8),
+      };
+    }
+    return progress;
+  }
+
   function inspect(state) {
     const nodes = Object.values(state.nodes).map((node) => {
       const deps = depsSatisfied(state, node);
@@ -609,6 +637,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         ready: ELIGIBLE_STATES.has(node.state) && node.attempt < nodeMaxAttempts(node, maxAttempts) && deps.ok,
         waitingOn: deps.ok ? [] : deps.missing,
         writeScope: node.spec.writeScope ?? [], reconcile: node.reconcile === true,
+        ...nodeProgress(state, node),
       };
     });
     const edges = [];

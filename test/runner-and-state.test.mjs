@@ -957,3 +957,54 @@ test('admission carries bounded revision and repair context from artifacts', asy
   assert.equal(repairAdmit.repairEvidence.summary, 'tests fail on the new path');
   assert.deepEqual(repairAdmit.repairEvidence.commands, ['npm test (exit 1)']);
 });
+
+test('inspect reports mechanical per-node progress from the ledger and deliverables', async () => {
+  const graph = validateTaskGraph([
+    spec('explore-1', 'explore', 'graph-explorer'),
+    spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'] }),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'] }),
+    spec('impl-1', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['src/**'], deliverables: ['src/a.ts', 'src/b.ts', 'src/c.ts'] }),
+    spec('verify-1', 'verify', 'graph-verifier', { dependsOn: ['impl-1'] }),
+  ]);
+  const state = newRun({ runId: 'progress', rootSessionId: 'progress', now: NOW });
+  runner.submitPlan(state, { intent: 'change', nodes: graph.nodes, now: NOW });
+  await dispatchCriticAndPass(state);
+
+  const admit = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
+  runner.beginNode(state, admit.nodeId, { now: NOW, sessionId: 'i' });
+  runner.recordSideEffect(state, { nodeId: 'impl-1', tool: 'edit', target: 'src/a.ts', now: '2026-09-12T01:00:01.000Z' });
+  runner.recordSideEffect(state, { nodeId: 'impl-1', tool: 'bash', target: 'ls src/', now: '2026-09-12T01:00:02.000Z' });
+
+  let report = runner.inspect(state);
+  let impl = report.nodes.find((node) => node.id === 'impl-1');
+  assert.equal(impl.sideEffectCount, 2);
+  assert.equal(impl.lastActivityAt, '2026-09-12T01:00:02.000Z');
+  assert.deepEqual(impl.deliverables, { total: 3, done: 1, pending: ['src/b.ts', 'src/c.ts'] });
+  const review = report.nodes.find((node) => node.id === 'review-1');
+  assert.equal(review.sideEffectCount, 0);
+  assert.equal(review.deliverables, undefined);
+
+  // After submission the claimed file list is the authoritative denominator.
+  runner.submitChange(state, { nodeId: 'impl-1', filesTouched: ['src/a.ts', 'src/b.ts', 'src/c.ts'], summary: 'done', now: NOW });
+  report = runner.inspect(state);
+  impl = report.nodes.find((node) => node.id === 'impl-1');
+  assert.equal(impl.state, 'SUCCEEDED');
+  assert.deepEqual(impl.deliverables, { total: 3, done: 3, pending: [] });
+
+  // Pending lists are bounded at eight entries.
+  const wide = newRun({ runId: 'wide', rootSessionId: 'wide', now: NOW });
+  const wideGraph = validateTaskGraph([
+    spec('plan-w', 'plan', 'graph-planner'),
+    spec('review-w', 'review', 'graph-plan-critic', { dependsOn: ['plan-w'] }),
+    spec('impl-w', 'implement', 'graph-implementer', { dependsOn: ['review-w'], writeScope: ['w/**'], deliverables: Array.from({ length: 10 }, (_, index) => `w/f${index}.ts`) }),
+  ]);
+  runner.submitPlan(wide, { intent: 'change', nodes: wideGraph.nodes, now: NOW });
+  const criticW = runner.admitDispatch(wide, { agent: 'graph-plan-critic', now: NOW });
+  runner.beginNode(wide, criticW.nodeId, { now: NOW, sessionId: 'cw' });
+  runner.submitReview(wide, { planVersion: 1, verdict: 'PASS', findings: [], now: NOW });
+  const admitW = runner.admitDispatch(wide, { agent: 'graph-implementer', now: NOW });
+  runner.beginNode(wide, admitW.nodeId, { now: NOW, sessionId: 'iw' });
+  const wideReport = runner.inspect(wide);
+  const wideImpl = wideReport.nodes.find((node) => node.id === 'impl-w');
+  assert.equal(wideImpl.deliverables.pending.length, 8);
+});

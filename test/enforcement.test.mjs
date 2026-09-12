@@ -1232,3 +1232,39 @@ test('round-1 planner continues through task_id after REVISE and submits v2 (fie
   assert.equal(pass.ok, true, JSON.stringify(pass));
   assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
 });
+
+test('declared deliverables surface as mechanical progress through graph_inspect', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-progress-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+  const DELIVERY_SPECS = SPECS.map((spec) => spec.id === 'impl-1'
+    ? { ...spec, writeScope: ['src/**'], deliverables: ['src/a.ts', 'src/notes.md'] }
+    : spec);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs: DELIVERY_SPECS }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(plan.ok, true, JSON.stringify(plan));
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
+  await dispatch(h, 'graph-implementer');
+  await bindChild(h, 'child-impl', 'graph-implementer');
+
+  // One of two deliverables exists so far: inspect reports 1/2 mechanically.
+  await mkdir(join(dir, 'src'), { recursive: true });
+  await writeFile(join(dir, 'src', 'a.ts'), 'a');
+  await h.enforcement.onToolAfter({ tool: 'write', sessionID: 'child-impl', callID: 'w1', args: { filePath: join(dir, 'src', 'a.ts'), content: 'a' } }, { title: 'write', output: 'ok' });
+  let inspected = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'root', 'graph-orchestrator')));
+  let impl = inspected.nodes.find((node) => node.id === 'impl-1');
+  assert.equal(impl.sideEffectCount >= 1, true);
+  assert.equal(impl.lastActivityAt !== null, true);
+  assert.deepEqual(impl.deliverables, { total: 2, done: 1, pending: ['src/notes.md'] });
+
+  await writeFile(join(dir, 'src', 'notes.md'), 'notes');
+  const change = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/a.ts', 'src/notes.md'], summary: 'both deliverables' }, ctx(h, 'child-impl', 'graph-implementer')));
+  assert.equal(change.ok, true, JSON.stringify(change));
+  inspected = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'root', 'graph-orchestrator')));
+  impl = inspected.nodes.find((node) => node.id === 'impl-1');
+  assert.deepEqual(impl.deliverables, { total: 2, done: 2, pending: [] });
+});
