@@ -40,6 +40,36 @@ function artifactRef(state, ref) {
   return { artifact };
 }
 
+// Version pins on plan/review inputs are unknowable at authoring time: the
+// plan's version is assigned by the very submission that carries the graph,
+// and the gating review's version by the critic's future verdict. A pin
+// copied from a previous revision (plan@1 once the runner assigns v2) stays
+// forever stale and strands the review node behind a dependency that can
+// never be satisfied again. The runner therefore rewrites these references
+// mechanically instead of trusting planner-authored version numbers:
+// plan (pinned or not) re-pins to the version being created, review pins
+// resolve unpinned to whichever PASS verdict eventually gates this graph.
+// Evidence pins to pre-existing artifacts (findings@N, change:<id>@N,
+// verification:<id>@N) are kept exactly as authored.
+function normalizePlanInputs(specs, version) {
+  const rewritten = new Map();
+  for (const [id, spec] of specs) {
+    if (!Array.isArray(spec.inputs) || !spec.inputs.some((ref) => ref === 'plan' || ref === 'review' || /^plan@\d+$/.test(ref) || /^review@\d+$/.test(ref))) {
+      rewritten.set(id, spec);
+      continue;
+    }
+    rewritten.set(id, {
+      ...spec,
+      inputs: spec.inputs.map((ref) => {
+        if (ref === 'plan' || /^plan@\d+$/.test(ref)) return `plan@${version}`;
+        if (ref === 'review' || /^review@\d+$/.test(ref)) return 'review';
+        return ref;
+      }),
+    });
+  }
+  return rewritten;
+}
+
 export function depsSatisfied(state, node) {
   const missing = [];
   for (const dep of node.spec.dependsOn ?? []) {
@@ -267,8 +297,9 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     state.blockedReason = null;
 
     const preservedNodes = new Map(Object.values(state.nodes).map((node) => [node.spec.id, { attempt: node.attempt, sessionId: node.sessionId ?? null }]));
+    const normalized = normalizePlanInputs(nodes, version);
     state.nodes = {};
-    for (const [id, spec] of nodes) {
+    for (const [id, spec] of normalized) {
       const preserved = preservedNodes.get(id);
       state.nodes[id] = {
         spec,
@@ -291,7 +322,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         node.finishedAt = now;
       }
     }
-    state.artifacts.plan = { kind: 'plan', nodeId: 'plan', version, basedOn, payload: { intent, specs: [...nodes.values()], parallel }, status: 'valid', createdAt: now };
+    state.artifacts.plan = { kind: 'plan', nodeId: 'plan', version, basedOn, payload: { intent, specs: [...normalized.values()], parallel }, status: 'valid', createdAt: now };
     state.updatedAt = now;
     return { ok: true, version, mode: intent };
   }
