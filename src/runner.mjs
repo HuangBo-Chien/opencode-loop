@@ -10,7 +10,7 @@
 //   artifacts invalidate downstream results conservatively.
 
 import { cleanJson } from './json-safe.mjs';
-import { matchScopePath, normalizeScopePath } from './task-spec.mjs';
+import { matchScopePath, normalizeScopePath, validateFileClaim } from './task-spec.mjs';
 
 const READ_ONLY_AGENTS = new Set(['graph-explorer', 'graph-multimodal', 'graph-planner', 'graph-plan-critic']);
 const WRITE_AGENTS = new Set(['graph-implementer', 'graph-verifier']);
@@ -120,7 +120,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
     return { allowed: true, nodeId: chosen.spec.id, reconcile: chosen.reconcile === true };
   }
 
-  function beginNode(state, nodeId, { now, sessionId = null }) {
+  function beginNode(state, nodeId, { now, sessionId = null, dispatchId = null }) {
     const node = state.nodes[nodeId];
     if (!node) throw new Error(`Unknown node ${nodeId}`);
     if (node.state !== 'PENDING' && node.state !== 'INCOMPLETE' && node.state !== 'STALE') throw new Error(`Node ${nodeId} is ${node.state} and cannot begin`);
@@ -128,6 +128,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
     node.attempt += 1;
     node.startedAt = now;
     node.sessionId = sessionId;
+    node.dispatchId = dispatchId;
     node.reconcile = false;
     state.updatedAt = now;
     return node;
@@ -248,7 +249,21 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
     return { changed: true };
   }
 
-  function submitChange(state, { nodeId, filesTouched, summary, checksRun = [], unresolved = [], snapshot = {}, now }) {
+  function rejectClaim(state, nodeId, code, detail, now) {
+    const node = state.nodes[nodeId];
+    const retryable = code === 'INVALID_FILE_CLAIM';
+    node.lastFailure = { code, detail, retryable };
+    if (!retryable) {
+      recordViolation(state, { nodeId, kind: code === 'LEDGER_MISMATCH' ? 'undisclosed-edit' : 'out-of-scope-claim', detail, now });
+      node.state = 'FAILED';
+      node.finishedAt = now;
+    }
+    state.updatedAt = now;
+    return { ok: false, code, detail, retryable,
+      hint: retryable ? 'Correct filesTouched/filesDeleted and resubmit within this attempt; use literal file paths, not directories or globs' : 'Inspect the node failure and recorded scope/ledger evidence' };
+  }
+
+  function checkChange(state, { nodeId, filesTouched, filesDeleted = [], now }) {
     if (TERMINAL_RUN.has(state.status)) return { ok: false, code: 'RUN_TERMINATED', detail: state.failReason ?? 'run already finished' };
     const node = state.nodes[nodeId];
     if (!node || node.spec.kind !== 'implement') return { ok: false, code: 'NOT_IMPLEMENT_NODE', detail: `${nodeId} is not an implement node` };
@@ -256,36 +271,46 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
 
     const claimed = new Set();
     for (const file of filesTouched) {
-      const normalized = normalizeScopePath(file);
-      if (!normalized) {
-        recordViolation(state, { nodeId, kind: 'invalid-path-claim', detail: `${file} is not a valid workspace path`, now });
-        node.state = 'FAILED';
-        node.finishedAt = now;
-        return { ok: false, code: 'OUT_OF_SCOPE', detail: `${file} is not a valid workspace path` };
-      }
+      const checked = validateFileClaim(file);
+      if (!checked.ok) return rejectClaim(state, nodeId, checked.code, checked.detail, now);
+      const normalized = checked.path;
       claimed.add(normalized);
       if (!node.spec.writeScope.some((pattern) => matchScopePath(pattern, normalized))) {
-        recordViolation(state, { nodeId, kind: 'out-of-scope-claim', detail: `${normalized} is outside the assigned writeScope`, now });
-        node.state = 'FAILED';
-        node.finishedAt = now;
-        return { ok: false, code: 'OUT_OF_SCOPE', detail: `${normalized} is outside the assigned writeScope` };
+        return rejectClaim(state, nodeId, 'OUT_OF_SCOPE', `${normalized} is outside the assigned writeScope`, now);
       }
+    }
+    for (const file of filesDeleted) {
+      const checked = validateFileClaim(file);
+      if (!checked.ok) return rejectClaim(state, nodeId, checked.code, checked.detail, now);
+      if (!claimed.has(file)) return rejectClaim(state, nodeId, 'INVALID_FILE_CLAIM', `${file}: filesDeleted must be a subset of filesTouched`, now);
     }
     const edited = state.sideEffects.filter((effect) => effect.nodeId === nodeId && effect.tool === 'edit').map((effect) => effect.target);
     const undisclosed = edited.filter((target) => !claimed.has(target));
     if (undisclosed.length) {
-      recordViolation(state, { nodeId, kind: 'undisclosed-edit', detail: `edited but not reported: ${undisclosed.join(', ')}`, now });
-      node.state = 'FAILED';
-      node.finishedAt = now;
-      return { ok: false, code: 'LEDGER_MISMATCH', detail: `files edited but not disclosed: ${undisclosed.join(', ')}` };
+      return rejectClaim(state, nodeId, 'LEDGER_MISMATCH', `files edited but not disclosed: ${undisclosed.join(', ')}`, now);
+    }
+    return { ok: true, claimed: [...claimed] };
+  }
+
+  function submitChange(state, { nodeId, filesTouched, filesDeleted = [], summary, checksRun = [], unresolved = [], snapshot = {}, now }) {
+    const checked = checkChange(state, { nodeId, filesTouched, filesDeleted, now });
+    if (!checked.ok) return checked;
+    const node = state.nodes[nodeId];
+    for (const file of checked.claimed) {
+      if (!Object.hasOwn(snapshot, file)) continue; // Pure runner callers may supply no filesystem evidence.
+      const value = snapshot[file];
+      if (filesDeleted.includes(file) ? value !== 'MISSING' : !/^[a-f0-9]{64}$/.test(value)) {
+        return rejectClaim(state, nodeId, 'INVALID_FILE_CLAIM', `${file}: ${filesDeleted.includes(file) ? 'deleted files must be absent' : 'expected a readable regular file; explicitly list deletions in filesDeleted'}`, now);
+      }
     }
 
     const name = `change:${nodeId}`;
     const previous = state.artifacts[name];
     const version = previous ? previous.version + 1 : 1;
     if (previous && previous.status === 'valid') previous.status = 'superseded';
-    state.artifacts[name] = { kind: 'change', nodeId, version, basedOn: [`review@${state.artifacts.review?.version ?? 1}`], payload: { filesTouched: [...claimed], summary, checksRun, unresolved }, snapshot, status: 'valid', createdAt: now };
+    state.artifacts[name] = { kind: 'change', nodeId, version, basedOn: [`review@${state.artifacts.review?.version ?? 1}`], payload: { filesTouched: checked.claimed, filesDeleted: [...new Set(filesDeleted)], summary, checksRun, unresolved }, snapshot, status: 'valid', createdAt: now };
     node.state = 'SUCCEEDED';
+    node.lastFailure = null;
     node.finishedAt = now;
     state.updatedAt = now;
     return { ok: true, version };
@@ -445,7 +470,12 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
       return {
         id: node.spec.id, kind: node.spec.kind, agent: node.spec.agent, state: node.state,
         attempt: node.attempt, maxAttempts: nodeMaxAttempts(node, maxAttempts),
-        ready: node.state === 'PENDING' && deps.ok,
+        remainingAttempts: Math.max(0, nodeMaxAttempts(node, maxAttempts) - node.attempt),
+        bindingStatus: node.state === 'RUNNING' ? (node.sessionId ? 'bound' : 'unbound') : 'none',
+        lastFailure: node.lastFailure ?? null,
+        recoveryAction: node.state === 'FAILED' ? 'inspect-failure' : node.lastFailure?.retryable && node.state === 'RUNNING' ? 'correct-and-resubmit'
+          : ['INCOMPLETE', 'RECOVERY_REQUIRED'].includes(node.state) || node.state === 'RUNNING' && !node.sessionId ? 'resume-then-fresh-session' : null,
+        ready: ELIGIBLE_STATES.has(node.state) && node.attempt < nodeMaxAttempts(node, maxAttempts) && deps.ok,
         waitingOn: deps.ok ? [] : deps.missing,
         writeScope: node.spec.writeScope ?? [], reconcile: node.reconcile === true,
       };
@@ -464,7 +494,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
   }
 
   return Object.freeze({
-    admitDispatch, beginNode, attachSession, submitPlan, submitReview, submitChange, submitVerification,
+    admitDispatch, beginNode, attachSession, submitPlan, submitReview, checkChange, submitChange, submitVerification,
     recordSideEffect, recordViolation, captureRequest, completeRequestCapture, markIncomplete, resumeRun, reconcileNode, revalidateArtifacts, inspect,
   });
 }

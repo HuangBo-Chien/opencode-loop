@@ -1,6 +1,7 @@
 import { resolve } from 'node:path';
 import { JOURNAL_SCHEMA_VERSION, stableJournalId } from './journal-store.mjs';
 import { sanitizeJournalText } from './journal-text.mjs';
+import { safeJournalStage } from './journal-errors.mjs';
 
 const TERMINAL_STATUSES = new Set(['SUCCEEDED', 'FAILED']);
 const MAX_REQUEST_CHARS = 8000;
@@ -317,10 +318,12 @@ export function createJournalService({ runStore, journalStore, journalSearch, en
   let backfillOffset = 0;
   let backfillFlight = null;
   let lastError = enabled && projectKey === null ? 'Project journal unavailable' : null;
+  let errorCode = null;
 
-  function recordFailure(message, error) {
+  function recordFailure(message, error, stage = null) {
     failures += 1;
     lastError = message;
+    errorCode = safeJournalStage(stage);
     if (error?.code === 'PROJECT_WORKTREE_UNAVAILABLE') projectAvailable = false;
   }
 
@@ -376,12 +379,13 @@ export function createJournalService({ runStore, journalStore, journalSearch, en
       if (!Array.isArray(runIds)) throw new TypeError('Run store must return run ids');
     } catch (error) {
       backfillOffset = 0;
-      recordFailure('Journal backfill failed', error);
+      recordFailure('Journal backfill failed', error, 'JOURNAL_BACKFILL_FAILED');
       report.failures += 1;
       return Object.freeze(report);
     }
 
     const pageLength = Math.min(runIds.length, limit);
+    if (errorCode === 'JOURNAL_BACKFILL_FAILED') { errorCode = null; lastError = null; }
     for (let index = 0; index < pageLength; index += 1) {
       report.inspected += 1;
       try {
@@ -531,6 +535,7 @@ export function createJournalService({ runStore, journalStore, journalSearch, en
     let storeStatus = null;
     let searchStatus = null;
     let statusError = null;
+    let statusErrorCode = null;
     try {
       storeStatus = await journalStore.status();
       if (typeof storeStatus?.project?.available === 'boolean') projectAvailable = storeStatus.project.available;
@@ -554,6 +559,7 @@ export function createJournalService({ runStore, journalStore, journalSearch, en
       } catch {
         runIds = undefined;
         statusError ??= 'Journal pending backfill status unavailable';
+        statusErrorCode = 'JOURNAL_BACKFILL_FAILED';
       }
 
       if (runIds !== undefined) {
@@ -586,6 +592,7 @@ export function createJournalService({ runStore, journalStore, journalSearch, en
       backfilled,
       failures,
       lastError: statusError ?? lastError,
+      errorCode: statusErrorCode ?? errorCode,
       pendingBackfill: Object.freeze(pending),
       store: storeStatus,
       search: searchStatus,

@@ -4,9 +4,10 @@
 // When no worktree is available the store degrades to in-memory only.
 
 import { createHash } from 'node:crypto';
-import { mkdir, open, opendir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, opendir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { cleanJson } from './json-safe.mjs';
+import { validateFileClaim } from './task-spec.mjs';
 export const SCHEMA_VERSION = 2;
 export const RUN_STATUSES = Object.freeze(['RUNNING', 'BLOCKED', 'FAILED', 'SUCCEEDED', 'RECOVERY_REQUIRED']);
 export const NODE_STATES = Object.freeze(['PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'SKIPPED', 'STALE', 'INCOMPLETE', 'RECOVERY_REQUIRED']);
@@ -153,6 +154,7 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } =
     }
     const runIds = [];
     let skipped = 0;
+    let missing = false;
     try {
       for await (const entry of handle) {
         if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
@@ -165,10 +167,16 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } =
         runIds.push(runId);
         if (runIds.length >= limit) break;
       }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      missing = true; // Bun may defer opening the directory until iteration.
+      runIds.length = 0;
     } finally {
-      await handle.close().catch((error) => {
-        if (error?.code !== 'ERR_DIR_CLOSED') throw error;
-      });
+      try {
+        await handle.close();
+      } catch (error) {
+        if (error?.code !== 'ERR_DIR_CLOSED' && !(missing && error?.code === 'ENOENT')) throw error;
+      }
     }
     return runIds;
   }
@@ -179,13 +187,25 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } =
     const snapshot = {};
     for (const entry of files) {
       if (typeof entry !== 'string' || !entry.length) continue;
-      if (/[*?[\]{}!]/.test(entry) || !runsDirWorktree()) {
+      if (!validateFileClaim(entry).ok || !runsDirWorktree()) {
         snapshot[entry] = 'UNVERIFIABLE';
         continue;
       }
       try {
-        const content = await readFile(join(worktree, entry), 'utf8');
-        snapshot[entry] = createHash('sha256').update(content, 'utf8').digest('hex');
+        let path = worktree;
+        let unsafe = false;
+        const segments = entry.split('/');
+        for (let index = 0; index < segments.length; index += 1) {
+          path = join(path, segments[index]);
+          const info = await lstat(path);
+          if (info.isSymbolicLink() || (index === segments.length - 1 ? !info.isFile() : !info.isDirectory())) {
+            unsafe = true;
+            break;
+          }
+        }
+        if (unsafe) { snapshot[entry] = 'UNVERIFIABLE'; continue; }
+        const content = await readFile(path);
+        snapshot[entry] = createHash('sha256').update(content).digest('hex');
       } catch (error) {
         snapshot[entry] = error?.code === 'ENOENT' ? 'MISSING' : 'UNVERIFIABLE';
       }

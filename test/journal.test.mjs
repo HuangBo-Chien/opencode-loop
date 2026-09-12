@@ -850,6 +850,10 @@ test('plugin composition projects terminal saves and exposes Task 5 journal tool
     const output = { args: { description: `dispatch ${agent}`, prompt: 'work', subagent_type: agent } };
     await hooks['tool.execute.before']({ tool: 'task', sessionID, callID: `call-${agent}` }, output);
     await hooks.event({ event: { type: 'session.created', properties: { info: { id: child, parentID: sessionID } } } });
+    await hooks.event({ event: { type: 'message.part.updated', properties: { part: {
+      type: 'tool', tool: 'task', sessionID, callID: `call-${agent}`,
+      state: { status: 'running', input: { subagent_type: agent }, metadata: { parentSessionId: sessionID, sessionId: child } },
+    } } } });
   }
 
   await hooks['chat.message'](

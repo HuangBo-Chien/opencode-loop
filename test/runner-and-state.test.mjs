@@ -422,7 +422,7 @@ test('review verdict must target the current plan version (no stale PASS)', () =
 test('happy path: PASS chain completes the run and requires command evidence', async () => {
   const state = freshRun();
   await dispatchCriticAndPass(state);
-  await dispatchImplementerAndSucceed(state, { snapshot: { 'src/a.ts': 'hash-1' } });
+  await dispatchImplementerAndSucceed(state, { snapshot: { 'src/a.ts': '1'.repeat(64) } });
 
   const weak = await dispatchVerifier(state, 'PASS', []);
   assert.equal(weak.ok, false);
@@ -574,8 +574,8 @@ test('resume: crash windows classify conservatively and keep counters', async ()
 test('revalidation: hash mismatch invalidates stale verification evidence', async () => {
   const state = freshRun();
   await dispatchCriticAndPass(state);
-  await dispatchImplementerAndSucceed(state, { snapshot: { 'src/a.ts': 'hash-1' } });
-  const verified = await dispatchVerifier(state, 'PASS', [{ command: 'npm test', exitCode: 0 }], { 'src/a.ts': 'hash-1' });
+  await dispatchImplementerAndSucceed(state, { snapshot: { 'src/a.ts': '1'.repeat(64) } });
+  const verified = await dispatchVerifier(state, 'PASS', [{ command: 'npm test', exitCode: 0 }], { 'src/a.ts': '1'.repeat(64) });
   assert.equal(verified.ok, true, JSON.stringify(verified));
   assert.equal(state.status, 'SUCCEEDED');
 
@@ -725,6 +725,8 @@ test('inspect reports blockers, counters, artifacts and a mermaid graph', async 
   assert.equal(report.mode, 'change');
   const impl = report.nodes.find((node) => node.id === 'impl-1');
   assert.equal(impl.ready, false);
+  assert.equal(impl.remainingAttempts, impl.maxAttempts);
+  assert.equal(impl.bindingStatus, 'none');
   assert.match(impl.waitingOn.join('; '), /review-1/);
   assert.match(report.mermaid, /graph TD/);
   assert.match(report.mermaid, /review-1 --> impl-1/);

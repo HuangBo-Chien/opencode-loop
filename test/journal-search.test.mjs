@@ -154,6 +154,9 @@ test('embedding provider is lazy, caches one q8 pipeline, and returns a plain fi
     embeddingSpaceDigest: EMBEDDING_SPACE_DIGEST,
     state: 'idle',
     lastError: null,
+    errorCode: null,
+    initializationAttempts: 0,
+    nextRetryAt: null,
   });
 
   const first = await provider.embed('first embedding');
@@ -186,10 +189,67 @@ test('embedding provider validates bounded text and finite model output without 
     await assert.rejects(() => invalidOutput.embed(value), TypeError);
   }
   assert.equal(factoryCalls, 0);
-  await assert.rejects(() => invalidOutput.embed('valid text'), /finite numeric vector/i);
+  await assert.rejects(() => invalidOutput.embed('valid text'), { code: 'EMBEDDING_INFERENCE_FAILED' });
   assert.equal(factoryCalls, 1);
   assert.equal(invalidOutput.status().state, 'degraded');
   assert.match(invalidOutput.status().lastError, /embedding inference failed/i);
+});
+
+test('initialization retry is query-driven, single-flight, cooled down and capped at three attempts', async () => {
+  const { createEmbeddingProvider } = await task3Modules();
+  let now = 0;
+  let calls = 0;
+  const provider = createEmbeddingProvider({ now: () => now, pipelineFactory: async () => {
+    calls++;
+    throw new Error('private download details');
+  } });
+  await Promise.all([1, 2].map(() => assert.rejects(provider.embed('query'), { code: 'EMBEDDING_INITIALIZATION_FAILED' })));
+  assert.equal(calls, 1);
+  await assert.rejects(provider.embed('query'));
+  assert.equal(calls, 1);
+  now = 30_000;
+  await assert.rejects(provider.embed('query'));
+  assert.equal(calls, 2);
+  now = 89_999;
+  await assert.rejects(provider.embed('query'));
+  assert.equal(calls, 2);
+  now = 90_000;
+  await assert.rejects(provider.embed('query'));
+  assert.equal(calls, 3);
+  now = 1_000_000;
+  await assert.rejects(provider.embed('query'));
+  assert.equal(calls, 3);
+  assert.equal(provider.status().initializationAttempts, 3);
+  assert.equal(provider.status().nextRetryAt, null);
+  assert.doesNotMatch(JSON.stringify(provider.status()), /private download/);
+});
+
+test('provider recovers after cooldown and reuses the successful extractor', async () => {
+  const { createEmbeddingProvider } = await task3Modules();
+  let now = 0;
+  let calls = 0;
+  const provider = createEmbeddingProvider({ now: () => now, pipelineFactory: async () => {
+    if (++calls === 1) throw new Error('offline');
+    return async () => [[1, 0]];
+  } });
+  await assert.rejects(provider.embed('query'));
+  now = 30_000;
+  assert.deepEqual(await provider.embed('query'), [1, 0]);
+  assert.deepEqual(await provider.embed('query'), [1, 0]);
+  assert.equal(calls, 2);
+  assert.equal(provider.status().state, 'ready');
+  assert.equal(provider.status().errorCode, null);
+});
+
+test('entry scan failure reports its stage without initializing embeddings or pretending an empty result', async () => {
+  const { createJournalSearch } = await task3Modules();
+  const search = createJournalSearch({
+    store: { async listBounded() { throw new Error('/private/scan'); } },
+    embeddingProvider: { embed() { assert.fail('must not initialize'); } },
+  });
+  await assert.rejects(search.search({ scope: 'project' }), { code: 'JOURNAL_SCAN_FAILED' });
+  assert.equal(search.status().errorCode, 'JOURNAL_SCAN_FAILED');
+  assert.doesNotMatch(JSON.stringify(search.status()), /private/);
 });
 
 test('cosineSimilarity validates vectors and handles orthogonal and zero-norm inputs', async () => {

@@ -13,13 +13,41 @@ The model proposes; the runner decides. Every hook decision is persisted to a ru
 | Writes stay inside the assigned `writeScope` | `permission.ask` denies out-of-scope `edit` (and implementer `bash` without `allowShell`) for bound graph sessions before execution; violations are recorded |
 | `testsPassed`-style claims are not trusted | Verdicts travel only through `graph_submit_*` tools; `PASS` requires at least one cited command with `exitCode 0`, and change submissions are cross-checked against the runner's own edit ledger (undisclosed files fail the node) |
 | Reviews and verifications bind to versions | A review targets `plan@v`; a resubmitted plan supersedes the old PASS. Verifications bind change versions plus file-hash snapshots; on resume, drifted hashes mark stale evidence and its node `STALE` |
-| Crashes never blindly redo side effects | A restart moves in-flight nodes to `RECOVERY_REQUIRED`; `graph_run_resume` classifies them (attempt counters preserved) and re-dispatch injects the recorded side-effect ledger so the implementer reconciles reality first |
+| Crashes never blindly redo side effects | A restart moves in-flight nodes to `RECOVERY_REQUIRED`; `graph_run_resume` revokes old dispatch bindings and reservations, classifies nodes (attempt counters preserved), and re-dispatch injects the recorded side-effect ledger so the implementer reconciles reality first |
+| Child sessions cannot consume another task's queue entry | Reservations are keyed by root session and native task `callID`; host task metadata supplies `sessionId`, checked against child parentage. Attempts start only after binding. Session creation order is not used |
 
 Read-only specialists (explorer, planner, critic, multimodal) dispatch freely on healthy runs; enforcement concentrates on the write path and the verdict gates.
 
 ## Structured handoff
 
 Work packages are `TaskSpec` nodes (`id`, `kind`, `agent`, `dependsOn`, `inputs`/`outputs` artifact refs, `writeScope`, `acceptance`, optional `maxAttempts`/`allowShell`). `graph_submit_plan` validates the graph — unique ids, resolvable dependencies, no cycles, pairwise-disjoint write scopes, mandatory review-before-implement and implement-before-verify gates, and no write nodes for plan-only intents — before it ever reaches run state. Each role then delivers through its own tool: `graph_submit_review`, `graph_submit_change`, `graph_submit_verification`, `graph_submit_findings`; `graph_inspect` reports node states, attempts, blockers, artifact versions and a Mermaid diagram; `graph_run_resume` performs crash recovery.
+
+### File claims and correction
+
+`filesTouched` contains **literal workspace-relative file paths**, not directories, trailing `/`, globs, or absolute paths. New/modified files must be readable regular files; linked paths are not accepted as verifiable file claims. Explicit deletions are included in both `filesTouched` and optional `filesDeleted` and must be absent at submission:
+
+```json
+{
+  "nodeId": "implement-main",
+  "filesTouched": ["src/main.mjs", "src/obsolete.mjs"],
+  "filesDeleted": ["src/obsolete.mjs"],
+  "summary": "Updated main and removed obsolete module"
+}
+```
+
+`INVALID_FILE_CLAIM` returns `retryable: true` and leaves the node RUNNING. Correct the claim and submit again within the same attempt; do not repeat successful disk work or rebuild the plan. Scope escapes and undisclosed edits remain strict failures, and rejection mutations are saved before returning. Submission `nodeId` must match the caller's bound node. Snapshots hash raw file bytes and represent explicitly deleted files with `MISSING`.
+
+`filesTouched` remains bounded to 32 entries. Installation tasks should identify concrete deliverables and a manifest in their plan. Shell commands are recorded as commands, **not** as an exhaustive file-change ledger; report extra side effects in `summary`/`unresolved` and have the verifier check the manifest. Set `UV_CACHE_DIR` and `PIP_CACHE_DIR` within `writeScope` before the first uv/pip invocation, including interpreter discovery. Native glob tools may omit dot-directories; inspect explicit paths with read/list.
+
+### Dispatch and recovery
+
+- `task_id` may continue the same active RUNNING attempt and role in the same run without charging another attempt. Retries, recovered work, completed sessions and other nodes require a fresh session (`FRESH_SESSION_REQUIRED`).
+- A reservation awaiting host metadata blocks another dispatch of that node/role (`DISPATCH_PENDING`) without consuming an attempt. Failed unbound task calls release their reservation.
+- Both foreground running metadata and completed **background** task metadata are supported. Pending continuations survive the preceding prompt's idle event. Host event IDs deduplicate repeated idle notifications; ID-less legacy notifications are consumed once per session and rely on terminal task events for additional completions.
+- Before child work, delayed metadata can be resolved through bounded host reads (64 parent messages, at most 256 parts per message, a 2-second request deadline). An unresolved session cannot silently bypass enforcement; it fails with `BINDING_UNAVAILABLE` until its relationship is established.
+- `graph_run_resume` clears reservations and revokes old bindings; late events cannot claim a fresh dispatch. Recorded attempts and side effects remain intact. This is recovery of interrupted work, not a general FAILED-node reset.
+- Consumed call IDs are retained in bounded run history (4,096 calls/run; 128 outstanding reservations) so recovery cannot reuse a revoked call ID. A failed binding save can be retried with the same dispatch identity without incrementing the attempt twice; inspect reports `BINDING_PERSISTENCE_FAILED` while the save is unresolved.
+- `graph_inspect` includes pending/bound dispatches, remaining attempts, binding status, last submission failure and a recovery hint. Review attempts and `maxPlanRevisions` are independent budgets. Plan replacement is refused while a review, implementation or verification node is still RUNNING.
 
 ## Run journal
 
@@ -38,13 +66,17 @@ Project entries are Markdown with JSON-compatible frontmatter; embedding vectors
 
 With semantic search enabled, the first semantic use lazily downloads the pinned `Xenova/all-MiniLM-L6-v2` model from Hugging Face at revision `751bff37182d3f1213fa05d7196b954e230abad9` and runs q8 inference locally through `@huggingface/transformers` `3.8.1`. Journal queries and content are not sent to a remote inference service. Model/download/inference failures do not block startup or the runner: searches without a query remain metadata-only, and text queries use `text-fallback`; `graph_status` reports `hybrid`, `text-fallback` or `disabled` as the current search mode.
 
+Initialization is single-flight and limited to three attempts per plugin instance. After failure, a later query may retry after 30 seconds, then 60 seconds; there are no background retry timers. Exhausted initialization continues using text fallback. Status exposes safe stage codes, initialization attempt count and the next retry timestamp. Transformers.js controls its own cache (by default its package `.cache`), which is distinct from Python's Hugging Face Hub cache.
+
+Diagnostics distinguish `JOURNAL_SCAN_FAILED`, `JOURNAL_BACKFILL_FAILED`, `EMBEDDING_INITIALIZATION_FAILED`, `EMBEDDING_INFERENCE_FAILED`, `JOURNAL_INDEX_READ_FAILED` and `JOURNAL_INDEX_WRITE_FAILED`. Raw provider errors and filesystem paths are not copied into these public errors. Storage scan failures remain errors, not successful empty search results. Directory cleanup supports both Node Promise-returning and Bun synchronous `close()` behavior.
+
 By default, the first user request is retained in run state and terminal summaries, capped at 8,000 characters. Set `journal.includeUserRequest` to `false` before the first request to opt out, or adjust `journal.maxUserRequestChars` within its documented range. Requests, commands and insights receive best-effort redaction for common key, token, bearer, JWT, password and secret patterns, but this is not a guarantee: avoid placing secrets in requests and protect or remove the plaintext state directories according to local retention policy.
 
 Global promotion never copies a project entry. It accepts only a project `insight` and requires separately supplied, project-neutral title/body/tags plus native permission `ask`. Run summaries, raw requests, project paths, run IDs and file lists are never written to the global journal.
 
 ## Project-local installation
 
-Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.1.tgz`; these commands do not publish or install globally.
+Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.1.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
 
 From the project where you want to use the plugin, install that local tarball:
 
@@ -132,8 +164,8 @@ The unit suite covers the sanitizer, TaskSpec/graph validation, the run and jour
 What remains explicitly **not** claimed:
 
 - `RUNNER_REJECTED` is a soft block: the child session is created and consumes a small turn, because `tool.execute.before` cannot abort a call.
-- Reads are unrestricted by the runner (read-only agents have no native write permissions anyway); resource locks are not a shell sandbox — an arbitrary command is only gated where native permissions ask.
-- Submit-tool caller binding relies on the host-provided tool context (`sessionID`/`agent`) and child-session parentage events; a host that changes those semantics needs re-verification on the pinned build.
+- Established graph bindings do not restrict read paths. Unknown child bindings fail closed until host identity is resolved. Resource locks are not a shell sandbox — an arbitrary command is only scope-gated where native permissions ask.
+- Submit-tool caller binding relies on host-provided tool context, task progress metadata (`callID`, `parentSessionId`, `sessionId`) and child parentage. Event races and bounded lookup are covered by simulations; a host that changes these semantics needs re-verification on the pinned build.
 - Verifier `bash` remains a native `ask`; the runner never answers prompts on the user's behalf except to DENY rule violations.
 - Real-model workflow acceptance (does the graph reduce errors versus the advisory loop at fixed budget) is separate evidence; `graph_status` keeps `enforcementAttested: false` until a locked-host scripted integration passes.
 - Journal redaction is best-effort, storage is plaintext, and historical entries can be stale; journal output is never current gate evidence.

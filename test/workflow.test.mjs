@@ -53,6 +53,8 @@ test('orchestrator prompt states gated handoffs, runner rejections, recovery and
   assert.match(chain, /graph-explorer\s*→\s*graph-planner\s*→\s*graph-plan-critic\s*→\s*graph-implementer\s*→\s*graph-verifier/);
   assert.match(p, /RUNNER_REJECTED/);
   assert.match(p, /graph_run_resume/);
+  assert.match(p, /DISPATCH_PENDING/);
+  assert.match(p, /同一 RUNNING attempt/);
   assert.match(p, /graph_inspect/);
   assert.match(p, /maxAttempts=2/);
   assert.match(p, /maxPlanRevisions=2/);
@@ -79,6 +81,7 @@ test('roles provide distinct evidence contracts, submit duties and capability li
   assert.match(definitions['graph-plan-critic'].prompt, /FAIL/);
   assert.match(definitions['graph-plan-critic'].prompt, /REVISE/);
   assert.match(definitions['graph-implementer'].prompt, /graph_submit_change/);
+  for (const field of ['filesDeleted', 'INVALID_FILE_CLAIM', 'UV_CACHE_DIR', 'PIP_CACHE_DIR']) assert.ok(definitions['graph-implementer'].prompt.includes(field), field);
   assert.match(definitions['graph-implementer'].prompt, /writeScope/);
   assert.match(definitions['graph-verifier'].prompt, /graph_submit_verification/);
   assert.match(definitions['graph-verifier'].prompt, /exitCode/);

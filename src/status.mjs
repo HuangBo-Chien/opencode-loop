@@ -1,10 +1,12 @@
 import { readFileSync } from 'node:fs';
 import { tool } from '@opencode-ai/plugin/tool';
 import { MODEL_DTYPE, MODEL_NAME, MODEL_REVISION } from './embeddings.mjs';
+import { JOURNAL_STAGE_ERRORS, safeJournalStage } from './journal-errors.mjs';
 
 const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const GLOBAL_JOURNAL_LABEL = '~/.config/opencode/opencode-loop/journal';
 const SAFE_JOURNAL_ERRORS = new Set([
+  ...Object.values(JOURNAL_STAGE_ERRORS),
   'Project journal unavailable',
   'Journal projection failed',
   'Journal backfill failed',
@@ -62,6 +64,12 @@ function journalStatus(options, runtime, unavailable) {
     backfilled: count(runtime?.backfilled),
     failures: count(runtime?.failures),
     lastError: unavailable ? 'Journal status unavailable' : safeError(reportedError),
+    errorCode: safeJournalStage(runtime?.search?.errorCode) ?? safeJournalStage(runtime?.errorCode),
+    embedding: Object.freeze({
+      state: ['idle', 'loading', 'ready', 'degraded'].includes(runtime?.search?.provider?.state) ? runtime.search.provider.state : 'unknown',
+      initializationAttempts: Math.min(3, count(runtime?.search?.provider?.initializationAttempts)),
+      nextRetryAt: Number.isSafeInteger(runtime?.search?.provider?.nextRetryAt) && runtime.search.provider.nextRetryAt >= 0 ? runtime.search.provider.nextRetryAt : null,
+    }),
     storage: Object.freeze({
       project: `${options.stateDirectory}/journal`,
       global: GLOBAL_JOURNAL_LABEL,
@@ -87,7 +95,7 @@ export function createStatusTool(options, journalService) {
         workflowMode: 'gated',
         enforcement: 'tool-execute-hooks',
         enforcementScope: 'GRAPH_MANAGED_SESSIONS',
-        enforcementDetail: 'Dispatch admission, write-scope confinement, bash deferral, attempt counters, verdict gates (PASS/REVISE/FAIL/BLOCKED) and version-bound evidence are enforced mechanically via tool.execute.before/after, permission.ask and session events. Reads remain unrestricted; a rejected task dispatch is rewritten into an explicit RUNNER_REJECTED child turn instead of aborting the tool call.',
+        enforcementDetail: 'Dispatch admission reserves work by callID; host task metadata and parentage bind sessions before attempts begin. Scope, bash, verdict and evidence gates use tool.execute.before/after hooks and native permissions. Unresolved child bindings fail closed. Rejected task dispatches receive a fresh RUNNER_REJECTED child turn.',
         enforcementAttested: false,
         runtimeAvailable: true,
         managedRuntimeStatus: 'available',

@@ -17,10 +17,11 @@ function rejected(code, detail, hint = null) {
   return reply({ ok: false, code, detail, ...(hint ? { hint } : {}) });
 }
 
-export function createSubmitTools({ store, runner, bindings, worktree }) {
+export function createSubmitTools({ store, runner, bindings, worktree, dispatches }) {
   function runFor(context) {
     const binding = bindings.get(context.sessionID);
     if (!binding) return { error: rejected('NOT_GRAPH_SESSION', 'this session is not part of a graph run; work is dispatched by graph-orchestrator through native task') };
+    if (binding.agent !== context.agent || binding.active === false) return { error: rejected('NOT_DISPATCHED_NODE', 'caller must match an active dispatch binding') };
     const state = store.getRun(binding.runId);
     if (!state) return { error: rejected('RUN_GONE', 'the owning run no longer exists') };
     return { binding, state };
@@ -31,7 +32,7 @@ export function createSubmitTools({ store, runner, bindings, worktree }) {
   }
   function boundNode(context, { binding, state }) {
     const node = binding.nodeId ? state.nodes[binding.nodeId] : null;
-    if (!node || node.sessionId !== context.sessionID) {
+    if (!node || node.sessionId !== context.sessionID || dispatches && !dispatches.current(binding)) {
       return { error: rejected('NOT_DISPATCHED_NODE', 'no in-flight node is bound to this session; deliver work only for the task you received') };
     }
     return { node };
@@ -50,6 +51,9 @@ export function createSubmitTools({ store, runner, bindings, worktree }) {
       if (wrong) return wrong;
       const located = runFor(context);
       if (located.error) return located.error;
+      if (Object.values(located.state.nodes).some((node) => node.state === 'RUNNING' && ['review', 'implement', 'verify'].includes(node.spec.kind))) {
+        return rejected('RUN_BUSY', 'finish or recover in-flight review/implementation/verification before replacing the plan');
+      }
       const graph = validateTaskGraph(args.specs, { planOnly: args.intent === 'plan-only', maxAttemptsCeiling: 10 });
       if (!graph.ok) {
         return rejected('INVALID_GRAPH', graph.errors.join('; '), 'fix the listed TaskSpec problems and submit again');
@@ -64,6 +68,7 @@ export function createSubmitTools({ store, runner, bindings, worktree }) {
         });
         if (!result.ok) return rejected(result.code, result.detail);
         await store.saveRun(located.state);
+        dispatches?.invalidate(located.state.runId);
         return reply({ ok: true, planVersion: result.version, mode: result.mode, order: graph.order, next: args.intent === 'plan-only' ? 'await plan critique; no implementation will be admitted' : 'await plan critique before implementation' });
       } catch (error) {
         return rejected('PAYLOAD_INVALID', error.message);
@@ -84,6 +89,9 @@ export function createSubmitTools({ store, runner, bindings, worktree }) {
       if (wrong) return wrong;
       const located = runFor(context);
       if (located.error) return located.error;
+      const bound = boundNode(context, located);
+      if (bound.error) return bound.error;
+      if (bound.node.spec.kind !== 'review') return rejected('NOT_DISPATCHED_NODE', 'caller must be bound to the review node');
       const result = runner.submitReview(located.state, { ...args, now: NOW() });
       if (!result.ok) return rejected(result.code, result.detail, result.code === 'STALE_PLAN_VERSION' ? 'the planner resubmitted; review the current plan version instead' : null);
       await store.saveRun(located.state);
@@ -92,10 +100,11 @@ export function createSubmitTools({ store, runner, bindings, worktree }) {
   });
 
   const graph_submit_change = tool({
-    description: 'Implementer reports a completed node. filesTouched is cross-checked against the runner side-effect ledger and the assigned writeScope; undisclosed or out-of-scope files fail the node.',
+    description: 'Implementer reports its bound node using literal workspace-relative file paths (no directories/globs). filesDeleted is an absent subset of filesTouched. INVALID_FILE_CLAIM is correctable within this attempt; out-of-scope or undisclosed edits fail the node and are persisted.',
     args: {
       nodeId: z.string().min(1).max(128),
       filesTouched: z.array(z.string().min(1).max(512)).max(32),
+      filesDeleted: z.array(z.string().min(1).max(512)).max(32).default([]),
       summary: z.string().min(1).max(2000),
       checksRun: z.array(z.string().max(2000)).max(16).default([]),
       unresolved: z.array(z.string().max(2000)).max(16).default([]),
@@ -107,10 +116,16 @@ export function createSubmitTools({ store, runner, bindings, worktree }) {
       if (located.error) return located.error;
       const bound = boundNode(context, located);
       if (bound.error) return bound.error;
-      const snapshot = await store.hashFiles(bound.node.spec.writeScope ?? []);
+      if (args.nodeId !== located.binding.nodeId) return rejected('NOT_DISPATCHED_NODE', 'nodeId must match the node bound to this session');
+      const checked = runner.checkChange(located.state, { ...args, now: NOW() });
+      if (!checked.ok) {
+        await store.saveRun(located.state);
+        return reply(checked);
+      }
+      const snapshot = await store.hashFiles(checked.claimed);
       const result = runner.submitChange(located.state, { ...args, snapshot, now: NOW() });
-      if (!result.ok) return rejected(result.code, result.detail, result.code === 'LEDGER_MISMATCH' ? 'report every file you actually edited, exactly as recorded' : null);
       await store.saveRun(located.state);
+      if (!result.ok) return reply(result);
       return reply({ ok: true, changeVersion: result.version, next: 'verification follows' });
     },
   });
@@ -130,6 +145,7 @@ export function createSubmitTools({ store, runner, bindings, worktree }) {
       if (located.error) return located.error;
       const bound = boundNode(context, located);
       if (bound.error) return bound.error;
+      if (args.nodeId !== located.binding.nodeId) return rejected('NOT_DISPATCHED_NODE', 'nodeId must match the node bound to this session');
       const files = (bound.node.spec.dependsOn ?? []).flatMap((dep) => located.state.artifacts[`change:${dep}`]?.payload?.filesTouched ?? []);
       const snapshot = await store.hashFiles(files);
       const result = runner.submitVerification(located.state, { ...args, snapshot, now: NOW() });
@@ -178,7 +194,7 @@ export function createSubmitTools({ store, runner, bindings, worktree }) {
       if (!binding) return rejected('NOT_GRAPH_SESSION', 'this session is not part of a graph run');
       const state = store.getRun(binding.runId);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
-      return reply(runner.inspect(state));
+      return reply({ ...runner.inspect(state), ...(dispatches ? { dispatches: dispatches.inspect(state.runId) } : {}) });
     },
   });
 
@@ -192,6 +208,7 @@ export function createSubmitTools({ store, runner, bindings, worktree }) {
       if (!binding?.root) return rejected('NOT_GRAPH_SESSION', 'only the orchestrator of this run may resume it');
       const state = store.getRun(binding.runId);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
+      if (state.status !== 'SUCCEEDED' && state.status !== 'FAILED') dispatches?.invalidate(state.runId);
       const resume = runner.resumeRun(state, { now: NOW() });
       if (!resume.ok) return rejected(resume.code, resume.detail);
       // Auto-reconcile: recovery-required nodes return to PENDING with a
@@ -213,10 +230,17 @@ export function createSubmitTools({ store, runner, bindings, worktree }) {
     },
   });
 
-  return Object.freeze({
-    tools: Object.freeze({
+  const definitions = {
       graph_submit_plan, graph_submit_review, graph_submit_change, graph_submit_verification,
       graph_submit_findings, graph_inspect, graph_run_resume,
-    }),
-  });
+  };
+  const tools = Object.fromEntries(Object.entries(definitions).map(([name, definition]) => [name, !dispatches ? definition : {
+    ...definition,
+    async execute(args, context) {
+      await dispatches.ensureSession(context.sessionID);
+      const binding = bindings.get(context.sessionID);
+      return binding ? dispatches.exclusive(binding.runId, () => definition.execute(args, context)) : definition.execute(args, context);
+    },
+  }]));
+  return Object.freeze({ tools: Object.freeze(tools) });
 }

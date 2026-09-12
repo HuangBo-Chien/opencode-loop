@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { journalStageError, safeJournalStage } from './journal-errors.mjs';
 import {
   cosineSimilarity,
   createEmbeddingProvider,
@@ -253,6 +254,7 @@ export function createJournalSearch({ store, embeddingProvider, semanticSearch =
   const provider = embeddingProvider ?? createEmbeddingProvider();
   const flights = sidecarFlights(store);
   let lastError = null;
+  let errorCode = null;
   let lastCandidates = null;
 
   async function selectedEntries(filters) {
@@ -336,21 +338,23 @@ export function createJournalSearch({ store, embeddingProvider, semanticSearch =
       let flight = flights.get(key);
       if (flight === undefined) {
         flight = (async () => {
-          const sidecar = await store.readEmbedding(entry.scope, entry.id);
+          let sidecar;
+          try { sidecar = await store.readEmbedding(entry.scope, entry.id); }
+          catch { throw journalStageError('JOURNAL_INDEX_READ_FAILED'); }
           const reusable = reusableVector(sidecar, spaceDigest, digest, queryVector.length);
           if (reusable !== null) return reusable;
           const chunkVectors = [];
           for (const chunk of indexChunks(text, space)) chunkVectors.push(validatedVector(await embed(chunk)));
           const vector = meanNormalizedVector(chunkVectors);
           if (vector.length !== queryVector.length) throw new TypeError('Query and journal embedding dimensions must match');
-          await store.writeEmbedding(entry.scope, entry.id, {
+          try { await store.writeEmbedding(entry.scope, entry.id, {
             schemaVersion: JOURNAL_EMBEDDING_SCHEMA_VERSION,
             digest,
             space,
             spaceDigest,
             dimensions: vector.length,
             vector,
-          });
+          }); } catch { throw journalStageError('JOURNAL_INDEX_WRITE_FAILED'); }
           return vector;
         })();
         flights.set(key, flight);
@@ -379,7 +383,14 @@ export function createJournalSearch({ store, embeddingProvider, semanticSearch =
 
   async function search(args) {
     const filters = searchArguments(args);
-    const selected = await selectedEntries(filters);
+    let selected;
+    try { selected = await selectedEntries(filters); }
+    catch {
+      errorCode = 'JOURNAL_SCAN_FAILED';
+      lastError = 'Journal entry scan failed';
+      throw journalStageError(errorCode);
+    }
+    if (errorCode === 'JOURNAL_SCAN_FAILED') { errorCode = null; lastError = null; }
     const { entries, candidates } = selected;
     lastCandidates = candidates;
     if (filters.query === undefined) {
@@ -391,9 +402,11 @@ export function createJournalSearch({ store, embeddingProvider, semanticSearch =
     try {
       const semantic = await semanticResult(entries, filters.query, filters.limit, candidates);
       lastError = null;
+      errorCode = null;
       return semantic;
-    } catch {
+    } catch (error) {
       lastError = 'Semantic search unavailable; using text fallback';
+      errorCode = safeJournalStage(error?.code) ?? 'JOURNAL_SEMANTIC_FAILED';
       return textFallback(entries, filters.query, filters.limit, candidates);
     }
   }
@@ -402,10 +415,12 @@ export function createJournalSearch({ store, embeddingProvider, semanticSearch =
     let embeddingSpace = null;
     let currentSpaceDigest = null;
     let model = null;
+    let providerStatus = null;
     try {
       embeddingSpace = providerEmbeddingSpace(provider);
       currentSpaceDigest = embeddingSpaceDigest(embeddingSpace);
       model = embeddingSpace.model;
+      if (typeof provider.status === 'function') providerStatus = provider.status();
     } catch {
       // Status must remain safe even when a third-party provider is malformed.
     }
@@ -418,6 +433,13 @@ export function createJournalSearch({ store, embeddingProvider, semanticSearch =
       candidateLimits: Object.freeze({ count: JOURNAL_SEARCH_MAX_CANDIDATES, dirents: JOURNAL_SEARCH_MAX_DIRENTS, bytes: JOURNAL_SEARCH_MAX_BYTES }),
       lastCandidates,
       lastError,
+      errorCode,
+      provider: Object.freeze({
+        state: ['idle', 'loading', 'ready', 'degraded'].includes(providerStatus?.state) ? providerStatus.state : 'unknown',
+        errorCode: safeJournalStage(providerStatus?.errorCode),
+        initializationAttempts: Number.isInteger(providerStatus?.initializationAttempts) ? Math.min(3, Math.max(0, providerStatus.initializationAttempts)) : 0,
+        nextRetryAt: Number.isSafeInteger(providerStatus?.nextRetryAt) && providerStatus.nextRetryAt >= 0 ? providerStatus.nextRetryAt : null,
+      }),
     });
   }
 

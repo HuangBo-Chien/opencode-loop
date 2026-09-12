@@ -1,4 +1,5 @@
 import { tool } from '@opencode-ai/plugin/tool';
+import { JOURNAL_STAGE_ERRORS, safeJournalStage } from './journal-errors.mjs';
 
 const z = tool.schema;
 const READ_ROLES = new Set(['graph-orchestrator', 'graph-explorer', 'graph-planner', 'graph-plan-critic']);
@@ -14,6 +15,7 @@ const SAFE_SERVICE_CODES = new Set([
   'JOURNAL_METADATA_LEAK',
 ]);
 const DETAILS = Object.freeze({
+  ...JOURNAL_STAGE_ERRORS,
   JOURNAL_DISABLED: 'Journal is disabled',
   WRONG_ROLE: 'Journal tool is not available to this role',
   NOT_GRAPH_SESSION: 'Journal tools require a bound graph session',
@@ -36,7 +38,7 @@ function rejected(code) {
 }
 
 function publicFailure(error) {
-  return rejected(SAFE_SERVICE_CODES.has(error?.code) ? error.code : 'JOURNAL_ERROR');
+  return rejected(SAFE_SERVICE_CODES.has(error?.code) ? error.code : safeJournalStage(error?.code) ?? 'JOURNAL_ERROR');
 }
 
 const tags = () => z.array(z.string().min(1).max(128)).max(16).default([]);

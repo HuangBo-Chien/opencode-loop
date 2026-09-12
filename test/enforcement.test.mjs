@@ -22,8 +22,8 @@ function harness(worktree) {
   const bindings = new Map();
   const journal = { enabled: true, includeUserRequest: true, semanticSearch: true, maxUserRequestChars: 8000 };
   const enforcement = createEnforcement({ settings: { worktree, journal }, store, runner, bindings });
-  const { tools } = createSubmitTools({ store, runner, bindings, worktree });
-  return { store, runner, bindings, enforcement, tools };
+  const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches });
+  return { store, runner, bindings, enforcement, tools, calls: [] };
 }
 
 async function startRun(h) {
@@ -31,11 +31,19 @@ async function startRun(h) {
 }
 async function dispatch(h, agent, { prompt = `work for ${agent}` } = {}) {
   const output = { args: { description: `dispatch ${agent}`, prompt, subagent_type: agent } };
-  await h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID: `call-${agent}-${Math.random().toString(36).slice(2)}` }, output);
+  const callID = `call-${agent}-${Math.random().toString(36).slice(2)}`;
+  await h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID }, output);
+  if (!output.args.prompt.includes('RUNNER_REJECTED')) h.calls.push({ agent, callID });
   return output;
 }
 async function bindChild(h, sessionId, agent) {
   await h.enforcement.onEvent({ event: { type: 'session.created', properties: { info: { id: sessionId, parentID: 'root' } } } });
+  const index = h.calls.findIndex((call) => call.agent === agent);
+  const [call] = h.calls.splice(index, 1);
+  await h.enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part: {
+    type: 'tool', tool: 'task', sessionID: 'root', callID: call.callID,
+    state: { status: 'running', input: { subagent_type: agent }, metadata: { parentSessionId: 'root', sessionId } },
+  } } } });
   assert.equal(h.bindings.get(sessionId)?.agent, agent, `child ${sessionId} should bind to ${agent}`);
 }
 async function childIdle(h, sessionId) {
@@ -318,7 +326,15 @@ test('implementer cannot be dispatched before review PASS; verifier evidence gat
   await bindChild(h, 'child-impl', 'graph-implementer');
   assert.equal(h.bindings.get('child-impl').nodeId, 'impl-1');
 
+  await mkdir(join(dir, 'src'), { recursive: true });
+  await writeFile(join(dir, 'src', 'a.ts'), 'fixed auth errors');
   await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-impl', callID: 'e1', args: { filePath: join(dir, 'src', 'a.ts') } }, { title: 'edit', output: 'ok' });
+  const invalid = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/'], summary: 'bad claim' }, ctx(h, 'child-impl', 'graph-implementer')));
+  assert.equal(invalid.code, 'INVALID_FILE_CLAIM');
+  assert.equal(invalid.retryable, true);
+  assert.equal(h.store.getRun('root').nodes['impl-1'].attempt, 1);
+  assert.equal(h.store.getRun('root').artifacts.plan.version, 1);
+  assert.equal(h.store.getRun('root').nodes['review-1'].attempt, 1);
   const change = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/a.ts'], summary: 'fixed auth errors' }, ctx(h, 'child-impl', 'graph-implementer')));
   assert.equal(change.ok, true, JSON.stringify(change));
 
@@ -401,9 +417,21 @@ test('crash window: side effects lead to RECOVERY_REQUIRED; resume preserves att
   const before = await dispatch(h, 'graph-implementer');
   assert.match(before.args.prompt, /副作用/);
   assert.match(before.args.prompt, /src\/a.ts/);
+  assert.equal(h.store.getRun('root').nodes['impl-1'].attempt, 1);
+  await bindChild(h, 'recovered-impl', 'graph-implementer');
   const after = h.store.getRun('root');
   assert.equal(after.nodes['impl-1'].state, 'RUNNING');
   assert.equal(after.nodes['impl-1'].attempt, 2);
+  await assert.rejects(h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-impl', callID: 'late' }, { args: { filePath: join(dir, 'src', 'a.ts') } }), /BINDING_UNAVAILABLE/);
+  await mkdir(join(dir, 'src'), { recursive: true });
+  await writeFile(join(dir, 'src', 'a.ts'), 'reconciled');
+  const delivered = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/a.ts'], summary: 'reconciled' }, ctx(h, 'recovered-impl', 'graph-implementer')));
+  assert.equal(delivered.ok, true, JSON.stringify(delivered));
+  await dispatch(h, 'graph-verifier');
+  await bindChild(h, 'recovered-verify', 'graph-verifier');
+  const verified = JSON.parse(await h.tools.graph_submit_verification.execute({ nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'fixture verification', exitCode: 0 }] }, ctx(h, 'recovered-verify', 'graph-verifier')));
+  assert.equal(verified.ok, true);
+  assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
 });
 
 test('session idle without submission marks INCOMPLETE and burns attempts; roles cannot forge other tools', async (t) => {

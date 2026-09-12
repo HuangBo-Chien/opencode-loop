@@ -1,0 +1,247 @@
+// Native task correlation. Session creation order is not dispatch order.
+// Only host task metadata, keyed by parent session + callID, can bind work.
+import { randomUUID } from 'node:crypto';
+
+const NOW = () => new Date().toISOString();
+const key = (root, call) => JSON.stringify([root, call]);
+const denied = (code, detail) => ({ allowed: false, code, detail });
+
+export function createDispatchBindings({ store, runner, bindings, client }) {
+  const records = new Map();
+  const parents = new Map();
+  const tails = new Map();
+  const resolutions = new Map();
+  const idleEvidence = new Map();
+  const seenIdleEvents = new Map();
+
+  function exclusive(runId, operation) {
+    const result = (tails.get(runId) ?? Promise.resolve()).then(operation);
+    const settled = result.then(() => undefined, () => undefined);
+    tails.set(runId, settled);
+    void settled.then(() => { if (tails.get(runId) === settled) tails.delete(runId); });
+    return result;
+  }
+
+  function current(binding) {
+    if (!binding || binding.root || binding.active === false) return false;
+    if (bindings.get(binding.sessionId) !== binding) return false;
+    const state = store.getRun(binding.runId);
+    if (!state || state.status !== 'RUNNING') return false;
+    if (!binding.nodeId) return true;
+    const node = state.nodes[binding.nodeId];
+    return node?.state === 'RUNNING' && node.sessionId === binding.sessionId && node.dispatchId === binding.dispatchId;
+  }
+
+  async function admit(rootSessionId, callID, args) {
+    const root = bindings.get(rootSessionId);
+    if (!root?.root) return denied('NOT_GRAPH_SESSION', 'task dispatch requires the root orchestrator');
+    return exclusive(root.runId, async () => {
+      const state = store.getRun(root.runId);
+      if (!state) return denied('RUN_GONE', 'owning run is unavailable');
+      const recordKey = key(rootSessionId, callID);
+      const used = state.dispatchCallIds ??= [];
+      if (typeof callID !== 'string' || !callID.length || callID.length > 256 || used.includes(recordKey)) return denied('DUPLICATE_DISPATCH', 'a unique host callID is required, including after recovery');
+      if (used.length >= 4096) return denied('DISPATCH_LIMIT', 'run dispatch history reached its bounded limit');
+      if ([...records.values()].filter((r) => r.runId === root.runId).length >= 128) return denied('DISPATCH_LIMIT', 'too many outstanding task calls');
+      const agent = args.subagent_type;
+      if (args.task_id !== undefined) {
+        const previous = bindings.get(args.task_id);
+        if (previous?.runId !== root.runId || previous.agent !== agent || !current(previous)) {
+          return denied('FRESH_SESSION_REQUIRED', 'task_id may only continue the same active attempt; dispatch retries and other nodes in a fresh session');
+        }
+        records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent,
+          nodeId: previous.nodeId, dispatchId: previous.dispatchId, sessionId: args.task_id,
+          bound: true, continuation: true, acknowledged: false, idleSeen: false, terminal: false,
+          planVersion: state.artifacts.plan?.version ?? 0 });
+        used.push(recordKey);
+        try { await store.saveRun(state); }
+        catch { records.delete(recordKey); return denied('DISPATCH_PERSISTENCE_FAILED', 'could not save dispatch reservation; inspect storage and use a fresh call'); }
+        return { allowed: true, nodeId: previous.nodeId, continuation: true };
+      }
+      const pending = [...records.values()].some((r) => r.runId === root.runId && !r.bound && r.nodeId &&
+        (r.agent === agent || (agent === 'graph-implementer' && r.agent === 'graph-implementer')));
+      if (pending) return denied('DISPATCH_PENDING', 'a task for this role is reserved and awaiting host session binding');
+      const decision = runner.admitDispatch(state, { agent, now: NOW() });
+      if (!decision.allowed) { await store.saveRun(state); return decision; }
+      records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent, nodeId: decision.nodeId,
+        dispatchId: randomUUID(), sessionId: null, bound: false, continuation: false,
+        acknowledged: false, idleSeen: false, terminal: false,
+        planVersion: state.artifacts.plan?.version ?? 0 });
+      used.push(recordKey);
+      try { await store.saveRun(state); }
+      catch { records.delete(recordKey); return denied('DISPATCH_PERSISTENCE_FAILED', 'could not save dispatch reservation; inspect storage and use a fresh call'); }
+      return decision;
+    });
+  }
+
+  async function bind(record) {
+    if (record.bound || !record.sessionId || !parents.has(record.sessionId)) return;
+    const state = store.getRun(record.runId);
+    if (!state || state.status !== 'RUNNING' || (state.artifacts.plan?.version ?? 0) !== record.planVersion
+      || parents.get(record.sessionId) !== record.rootSessionId || bindings.has(record.sessionId)) return;
+    if (record.nodeId) {
+      const node = state.nodes[record.nodeId];
+      if (!record.started) {
+        const decision = runner.admitDispatch(state, { agent: record.agent, now: NOW() });
+        if (!decision.allowed || decision.nodeId !== record.nodeId) return;
+        runner.beginNode(state, record.nodeId, { now: NOW(), sessionId: record.sessionId, dispatchId: record.dispatchId });
+        record.started = true;
+      } else if (node?.state !== 'RUNNING' || node.dispatchId !== record.dispatchId || node.sessionId !== record.sessionId) return;
+      // Do not publish the binding until authoritative attempt state is saved.
+      try {
+        await store.saveRun(state);
+        record.errorCode = null;
+      } catch {
+        record.errorCode = 'BINDING_PERSISTENCE_FAILED';
+        return; // A repeated metadata event/host lookup retries this same save.
+      }
+    }
+    record.bound = true;
+    bindings.set(record.sessionId, { runId: record.runId, root: false, agent: record.agent,
+      nodeId: record.nodeId, sessionId: record.sessionId, dispatchId: record.dispatchId, active: true });
+    await consumeIdle(record.sessionId);
+    if (record.terminal && ![...records.values()].some((r) => r.sessionId === record.sessionId && !r.terminal && !r.idleSeen)) await finish(record.sessionId);
+  }
+
+  async function onSession(info) {
+    if (typeof info?.id !== 'string' || typeof info.parentID !== 'string') return;
+    if (parents.has(info.id) && parents.get(info.id) !== info.parentID) return;
+    parents.set(info.id, info.parentID);
+    const root = bindings.get(info.parentID);
+    if (!root?.root) return;
+    await exclusive(root.runId, async () => {
+      for (const record of records.values()) {
+        if (record.rootSessionId === info.parentID && record.sessionId === info.id) await bind(record);
+      }
+    });
+  }
+
+  async function finish(sessionId) {
+    const binding = bindings.get(sessionId);
+    if (!binding || binding.root) return;
+    const state = store.getRun(binding.runId);
+    if (current(binding) && binding.nodeId) {
+      runner.markIncomplete(state, { nodeId: binding.nodeId, now: NOW() });
+      await store.saveRun(state);
+    }
+    binding.active = false;
+    idleEvidence.delete(sessionId);
+    for (const [id, record] of records) if (record.sessionId === sessionId) records.delete(id);
+  }
+
+  async function consumeIdle(sessionId) {
+    const pending = idleEvidence.get(sessionId);
+    if (!pending?.length || !bindings.has(sessionId)) return;
+    const calls = [...records.values()].filter((r) => r.sessionId === sessionId);
+    while (pending.length) {
+      const ended = calls.find((r) => r.acknowledged && !r.idleSeen);
+      if (!ended) break;
+      ended.idleSeen = true;
+      pending.shift();
+    }
+    if (calls.some((r) => !r.idleSeen && !r.terminal)) return;
+    await finish(sessionId);
+  }
+
+  async function onPart(part) {
+    if (part?.type !== 'tool' || part.tool !== 'task') return;
+    const recordKey = key(part.sessionID, part.callID);
+    const record = records.get(recordKey);
+    if (!record) return;
+    await exclusive(record.runId, async () => {
+      if (records.get(recordKey) !== record) return; // revoked while waiting
+      const meta = part.state?.metadata;
+      if ((part.state?.status === 'running' || part.state?.status === 'completed' && meta?.background === true) && typeof meta?.sessionId === 'string'
+        && meta.parentSessionId === record.rootSessionId && part.state.input?.subagent_type === record.agent) {
+        if (record.sessionId && record.sessionId !== meta.sessionId) return;
+        record.sessionId = meta.sessionId;
+        record.background = meta.background === true;
+        record.acknowledged = true;
+        await bind(record);
+        await consumeIdle(record.sessionId);
+      }
+      if (part.state?.status === 'error' || part.state?.status === 'completed' && !meta?.background && !record.background) {
+        record.terminal = true;
+        if (!record.acknowledged) record.idleSeen = true;
+        if (!record.bound && record.started) await bind(record);
+        else if (!record.bound) records.delete(recordKey);
+        else if (![...records.values()].some((r) => r.sessionId === record.sessionId && !r.terminal && !r.idleSeen)) await finish(record.sessionId);
+      }
+    });
+  }
+
+  async function onIdle(sessionId, eventId) {
+    const binding = bindings.get(sessionId);
+    const runId = binding?.runId ?? bindings.get(parents.get(sessionId))?.runId;
+    if (!runId || binding?.root) return;
+    await exclusive(runId, async () => {
+      const seen = seenIdleEvents.get(runId) ?? new Set();
+      // Pinned host supplies event.id. Legacy ID-less notifications are only
+      // consumed once per session; terminal task events can still finish work.
+      const identity = key(sessionId, typeof eventId === 'string' ? eventId : 'legacy-idle');
+      if (seen.has(identity) || seen.size >= 8192) return;
+      seen.add(identity);
+      seenIdleEvents.set(runId, seen);
+      const pending = idleEvidence.get(sessionId) ?? [];
+      if (pending.length < 128) pending.push(identity);
+      idleEvidence.set(sessionId, pending);
+      await consumeIdle(sessionId);
+    });
+  }
+
+  function invalidate(runId) {
+    for (const [id, record] of records) if (record.runId === runId) records.delete(id);
+    for (const [id, binding] of bindings) if (!binding.root && binding.runId === runId) bindings.delete(id);
+    for (const sessionId of idleEvidence.keys()) if (bindings.get(parents.get(sessionId))?.runId === runId) idleEvidence.delete(sessionId);
+  }
+
+  function managed(sessionId) {
+    return bindings.has(sessionId) || bindings.get(parents.get(sessionId))?.root === true
+      // Lookup failure is not evidence that an unknown session is unmanaged.
+      || !parents.has(sessionId) && [...bindings.values()].some((binding) => binding.root);
+  }
+
+  async function resolveSession(sessionId) {
+    if (bindings.has(sessionId)) return true;
+    if (!client?.session?.get || !client?.session?.messages) return false;
+    try {
+      const signal = AbortSignal.timeout(2000);
+      const response = await client.session.get({ path: { id: sessionId }, signal });
+      const info = response.data;
+      if (info?.id !== sessionId) return false;
+      parents.set(sessionId, typeof info.parentID === 'string' ? info.parentID : null);
+      if (!bindings.get(info.parentID)?.root) return false;
+      await onSession(info);
+      const messages = await client.session.messages({ path: { id: info.parentID }, query: { limit: 64 }, signal });
+      if (!Array.isArray(messages.data)) return false;
+      for (const message of messages.data.slice(-64)) {
+        if (!Array.isArray(message.parts)) continue;
+        for (const part of message.parts.slice(0, 256)) {
+          if (part.state?.metadata?.sessionId === sessionId) await onPart(part);
+        }
+      }
+      return bindings.has(sessionId);
+    } catch {
+      return false;
+    }
+  }
+
+  async function ensureSession(sessionId) {
+    let flight = resolutions.get(sessionId);
+    if (!flight) {
+      flight = resolveSession(sessionId);
+      resolutions.set(sessionId, flight);
+    }
+    try { return await flight; }
+    finally { if (resolutions.get(sessionId) === flight) resolutions.delete(sessionId); }
+  }
+
+  function inspect(runId) {
+    return [...records.values()].filter((r) => r.runId === runId).map((r) => ({
+      callID: r.callID, nodeId: r.nodeId, agent: r.agent, sessionId: r.sessionId, bound: r.bound, continuation: r.continuation,
+      errorCode: r.errorCode ?? null,
+    }));
+  }
+
+  return Object.freeze({ admit, onSession, onPart, onIdle, ensureSession, invalidate, exclusive, managed, current, inspect });
+}

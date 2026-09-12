@@ -1,4 +1,5 @@
 import { cleanJson, stableHash } from './json-safe.mjs';
+import { journalStageError } from './journal-errors.mjs';
 
 export const MODEL_NAME = 'Xenova/all-MiniLM-L6-v2';
 export const MODEL_REVISION = '751bff37182d3f1213fa05d7196b954e230abad9';
@@ -152,15 +153,23 @@ async function outputVector(output) {
   return finiteVector(value, 'Embedding output', MAX_VECTOR_DIMENSIONS);
 }
 
-export function createEmbeddingProvider({ pipelineFactory } = {}) {
+export function createEmbeddingProvider({ pipelineFactory, now = Date.now } = {}) {
   if (pipelineFactory !== undefined && typeof pipelineFactory !== 'function') throw new TypeError('pipelineFactory must be a function when provided');
+  if (typeof now !== 'function') throw new TypeError('now must be a function');
   const factory = pipelineFactory ?? defaultPipelineFactory;
   let pipelinePromise;
   let state = 'idle';
   let lastError = null;
+  let errorCode = null;
+  let initializationAttempts = 0;
+  let nextRetryAt = null;
 
   async function getPipeline() {
     if (pipelinePromise === undefined) {
+      if (initializationAttempts >= 3 || nextRetryAt !== null && now() < nextRetryAt) {
+        throw journalStageError('EMBEDDING_INITIALIZATION_FAILED');
+      }
+      initializationAttempts += 1;
       state = 'loading';
       pipelinePromise = Promise.resolve()
         .then(() => factory('feature-extraction', MODEL_NAME, { dtype: MODEL_DTYPE, revision: MODEL_REVISION }))
@@ -168,12 +177,17 @@ export function createEmbeddingProvider({ pipelineFactory } = {}) {
           if (typeof extractor !== 'function') throw new TypeError('Embedding pipeline factory must return a function');
           state = 'ready';
           lastError = null;
+          errorCode = null;
+          nextRetryAt = null;
           return extractor;
         })
-        .catch((error) => {
+        .catch(() => {
           state = 'degraded';
           lastError = 'Embedding initialization failed';
-          throw error;
+          errorCode = 'EMBEDDING_INITIALIZATION_FAILED';
+          nextRetryAt = initializationAttempts < 3 ? now() + 30_000 * initializationAttempts : null;
+          pipelinePromise = undefined;
+          throw journalStageError(errorCode);
         });
     }
     return pipelinePromise;
@@ -189,11 +203,13 @@ export function createEmbeddingProvider({ pipelineFactory } = {}) {
       const vector = await outputVector(output);
       state = 'ready';
       lastError = null;
+      errorCode = null;
       return vector;
-    } catch (error) {
+    } catch {
       state = 'degraded';
       lastError = 'Embedding inference failed';
-      throw error;
+      errorCode = 'EMBEDDING_INFERENCE_FAILED';
+      throw journalStageError(errorCode);
     }
   }
 
@@ -206,6 +222,9 @@ export function createEmbeddingProvider({ pipelineFactory } = {}) {
       embeddingSpaceDigest: EMBEDDING_SPACE_DIGEST,
       state,
       lastError,
+      errorCode,
+      initializationAttempts,
+      nextRetryAt,
     });
   }
 

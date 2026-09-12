@@ -35,6 +35,20 @@ export function normalizeScopePath(input) {
   return segments.join('/');
 }
 
+// File claims are literals, unlike writeScope patterns. Escape attempts remain
+// strict scope failures; ordinary formatting errors may be corrected in-place.
+export function validateFileClaim(input) {
+  if (typeof input === 'string' && (/^(?:[a-zA-Z]:|[/\\])/.test(input)
+    || input.split(/[/\\]/).includes('..'))) {
+    return { ok: false, code: 'OUT_OF_SCOPE', detail: `${input} escapes workspace-relative paths` };
+  }
+  const path = normalizeScopePath(input);
+  if (!path || /[*?[\]{}!]/.test(path)) {
+    return { ok: false, code: 'INVALID_FILE_CLAIM', detail: `${input} must be a literal workspace-relative file path (no directory slash or glob)` };
+  }
+  return { ok: true, path };
+}
+
 const GLOB_CHARS = /[*?[\]{}!]/;
 
 // Minimal glob matcher: '**' spans separators, '*' within one segment.

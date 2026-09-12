@@ -6,6 +6,7 @@
 import { isAbsolute, relative, sep } from 'node:path';
 import { captureRequest } from './journal-text.mjs';
 import { matchScopePath, normalizeScopePath } from './task-spec.mjs';
+import { createDispatchBindings } from './dispatch-bindings.mjs';
 
 const SUBMIT_TOOLS = new Set(['graph_submit_plan', 'graph_submit_review', 'graph_submit_change', 'graph_submit_verification', 'graph_submit_findings', 'graph_inspect', 'graph_run_resume']);
 const NOW = () => new Date().toISOString();
@@ -27,8 +28,7 @@ function reconcilePrompt(state, nodeId) {
   ].join('\n');
 }
 
-export function createEnforcement({ settings, store, runner, bindings, pendingDispatches = null }) {
-  const queues = pendingDispatches ?? new Map();
+export function createEnforcement({ settings, store, runner, bindings, client, dispatches = createDispatchBindings({ store, runner, bindings, client }) }) {
   const deniedCalls = new Map();
 
   function toWorkspaceRelative(target) {
@@ -119,23 +119,22 @@ export function createEnforcement({ settings, store, runner, bindings, pendingDi
       if (!state) return;
       const args = output.args ?? {};
       const subagentType = typeof args.subagent_type === 'string' ? args.subagent_type : null;
-      const decision = runner.admitDispatch(state, { agent: subagentType, now: NOW() });
+       const decision = await dispatches.admit(sessionID, callID, args);
       if (!decision.allowed) {
-        runner.recordViolation(state, { nodeId: null, kind: 'gate-blocked-dispatch', detail: `${subagentType}: ${decision.code} — ${decision.detail}`, now: NOW() });
-        await store.saveRun(state);
-        output.args = { ...args, description: args.description ?? 'runner-rejected dispatch', prompt: rejectionPrompt(decision), subagent_type: subagentType ?? 'graph-explorer' };
+        await dispatches.exclusive(binding.runId, async () => {
+          runner.recordViolation(state, { nodeId: null, kind: 'gate-blocked-dispatch', detail: `${subagentType}: ${decision.code} — ${decision.detail}`, now: NOW() });
+          await store.saveRun(state);
+        });
+        const { task_id: _oldSession, ...freshArgs } = args;
+        output.args = { ...freshArgs, description: args.description ?? 'runner-rejected dispatch', prompt: rejectionPrompt(decision), subagent_type: subagentType ?? 'graph-explorer' };
         return;
       }
       let prompt = typeof args.prompt === 'string' ? args.prompt : '';
       if (decision.nodeId) {
-        runner.beginNode(state, decision.nodeId, { now: NOW() });
+        prompt = `[RUNNER] Assigned nodeId: ${decision.nodeId}. Submit only this node.\n${prompt}`;
         if (decision.reconcile) prompt = `${reconcilePrompt(state, decision.nodeId)}\n\n${prompt}`;
-        await store.saveRun(state);
       }
-      const queue = queues.get(binding.runId) ?? [];
-      queue.push({ agent: subagentType, nodeId: decision.nodeId });
-      queues.set(binding.runId, queue);
-      if (decision.reconcile) output.args = { ...args, prompt };
+      output.args = { ...args, prompt };
       return;
     }
     if (tool === 'edit' || tool === 'bash') {
@@ -169,6 +168,13 @@ export function createEnforcement({ settings, store, runner, bindings, pendingDi
 
   async function onToolAfter(input, output) {
     const { tool, sessionID, callID } = input ?? {};
+    if (tool === 'task') {
+      // The running metadata event normally arrives before child work. This is
+      // also a cleanup path for hosts that deliver terminal metadata via after.
+      await dispatches.onPart({ type: 'tool', tool, sessionID, callID,
+        state: { status: 'completed', input: input.args, metadata: output?.metadata } });
+      return;
+    }
     if (tool !== 'edit' && tool !== 'bash') return;
     const binding = bindings.get(sessionID);
     if (!binding || binding.root || !binding.nodeId) return;
@@ -189,38 +195,35 @@ export function createEnforcement({ settings, store, runner, bindings, pendingDi
     if (!event || typeof event.type !== 'string') return;
     const { type, properties } = event;
 
-    if (type === 'session.created' || type === 'session.updated') {
-      const info = properties?.info;
-      const sessionId = info?.id;
-      const parentId = info?.parentID;
-      if (typeof sessionId !== 'string' || !parentId || bindings.has(sessionId)) return;
-      const parentBinding = bindings.get(parentId);
-      if (!parentBinding?.root) return;
-      const queue = queues.get(parentBinding.runId);
-      if (!queue || !queue.length) return;
-      const dispatch = queue.shift();
-      bindings.set(sessionId, { runId: parentBinding.runId, agent: dispatch.agent, nodeId: dispatch.nodeId, root: false });
-      if (dispatch.nodeId) {
-        await mutate(parentBinding.runId, (state) => runner.attachSession(state, dispatch.nodeId, sessionId));
-      }
-      return;
-    }
+    if (type === 'session.created' || type === 'session.updated') return dispatches.onSession(properties?.info);
+    if (type === 'message.part.updated') return dispatches.onPart(properties?.part);
+    // Pinned host emits both status(idle) and idle for one transition. Consume
+    // only the latter or a continuation would be completed twice.
+    if (type === 'session.idle') return dispatches.onIdle(properties?.sessionID, event.id);
+  }
 
-    if (type === 'session.idle') {
-      const sessionId = properties?.sessionID;
-      const binding = bindings.get(sessionId);
-      if (!binding || binding.root || !binding.nodeId) return;
-      const state = store.getRun(binding.runId);
-      if (!state) return;
-      const node = state.nodes[binding.nodeId];
-      if (!node || node.state !== 'RUNNING' || node.sessionId !== sessionId) return;
-      const result = runner.markIncomplete(state, { nodeId: binding.nodeId, now: NOW() });
-      if (result.changed) await store.saveRun(state);
-    }
+  async function childOperation(input, output, operation, requireActive = false) {
+    const sessionID = input?.sessionID;
+    await dispatches.ensureSession(sessionID);
+    const binding = bindings.get(sessionID);
+    const work = () => {
+      if (requireActive && !binding?.root && dispatches.managed(sessionID) && !dispatches.current(binding)) {
+        throw new Error('BINDING_UNAVAILABLE: managed child must have an active, verified dispatch before work');
+      }
+      return operation(input, output);
+    };
+    return binding ? dispatches.exclusive(binding.runId, work) : work();
   }
 
   return Object.freeze({
-    onChatMessage, onToolBefore, onToolAfter, onPermissionAsk, onEvent,
-    internals: Object.freeze({ bindings, queues, deniedCalls, decideWriteBinding, toWorkspaceRelative }),
+    onChatMessage: (input, output) => dispatches.exclusive(bindings.get(input?.sessionID)?.runId ?? input?.sessionID, () => onChatMessage(input, output)),
+    onToolBefore: (input, output) => input?.tool === 'task' ? onToolBefore(input, output) : childOperation(input, output, onToolBefore, true),
+    onToolAfter: (input, output) => input?.tool === 'task' ? onToolAfter(input, output) : childOperation(input, output, onToolAfter),
+    onPermissionAsk: (input, output) => childOperation(input, output, async (i, o) => {
+      if (dispatches.managed(i?.sessionID) && !bindings.get(i.sessionID)?.root && !dispatches.current(bindings.get(i.sessionID))) { o.status = 'deny'; return; }
+      return onPermissionAsk(i, o);
+    }),
+    onEvent, dispatches,
+    internals: Object.freeze({ bindings, deniedCalls, decideWriteBinding, toWorkspaceRelative }),
   });
 }

@@ -741,7 +741,6 @@ export function createJournalStore({ worktree, stateDirectory = '.opencode-loop'
     try {
       await revalidateAccess(scope, canonicalRoot);
       handle = await opendir(base);
-      await revalidateAccess(scope, canonicalRoot);
     } catch (error) {
       if (error?.code === 'ENOENT') {
         await revalidateAccess(scope, canonicalRoot);
@@ -758,7 +757,9 @@ export function createJournalStore({ worktree, stateDirectory = '.opencode-loop'
     let loaded = 0;
     let bytes = 0;
     let truncated = false;
+    let missing = false;
     try {
+      await revalidateAccess(scope, canonicalRoot);
       for await (const item of handle) {
         inspected += 1;
         const name = item.name;
@@ -798,10 +799,16 @@ export function createJournalStore({ worktree, stateDirectory = '.opencode-loop'
           break;
         }
       }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      missing = true;
+      await revalidateAccess(scope, canonicalRoot);
     } finally {
-      await handle.close().catch((error) => {
-        if (error?.code !== 'ERR_DIR_CLOSED') throw error;
-      });
+      try {
+        await handle.close();
+      } catch (error) {
+        if (error?.code !== 'ERR_DIR_CLOSED' && !(missing && error?.code === 'ENOENT')) throw error;
+      }
     }
     await revalidateAccess(scope, canonicalRoot);
     entries.sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.id.localeCompare(right.id));
