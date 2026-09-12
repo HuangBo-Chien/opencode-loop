@@ -33,6 +33,39 @@ function reconcilePrompt(state, nodeId) {
   ].join('\n');
 }
 
+// Mechanical relay of the latest critic verdict or verifier failure so every
+// dispatch (fresh session or continuation) sees the same revision evidence.
+function revisionPrompt(decision) {
+  if (Array.isArray(decision.reviseFindings) && decision.reviseFindings.length) {
+    return `[RUNNER 修訂要求] 前次審查退件意見,新版本必須逐項處理:\n${decision.reviseFindings.map((finding) => `- ${finding}`).join('\n')}`;
+  }
+  if (decision.repairEvidence) {
+    const evidence = decision.repairEvidence;
+    const commands = (evidence.commands ?? []).join('; ');
+    return [
+      `[RUNNER 修復要求] 前次驗證失敗(verifier ${evidence.verifier}):${evidence.summary || '(未附摘要)'}`,
+      commands ? `失敗命令:${commands}` : '',
+    ].filter(Boolean).join('\n');
+  }
+  return null;
+}
+
+// A successor run created by a user reset starts with a bounded digest of the
+// archived run so the new explorer/planner build on its lessons, not from zero.
+function carryOverPrompt(state) {
+  const carry = state.carryOver;
+  if (!carry || typeof carry !== 'object') return null;
+  const findings = Array.isArray(carry.reviewFindings) && carry.reviewFindings.length
+    ? `前次審查退件意見(新計畫必須逐項處理,不得重蹈):\n${carry.reviewFindings.map((finding) => `- ${String(finding)}`).join('\n')}`
+    : '';
+  return [
+    `[RUNNER 前次 run 資訊] 此 run 由 ${carry.predecessorRunId} 因使用者 reset 而來(原因:${String(carry.reason ?? '').slice(0, 300)})。`,
+    findings,
+    typeof carry.findingsDigest === 'string' && carry.findingsDigest.length ? `前次探索摘要:${carry.findingsDigest}` : '',
+    '可用 graph_journal_read/graph_journal_search 查前次完整紀錄;所有引用都必須對目前工作樹重新驗證後才能採用。',
+  ].filter(Boolean).join('\n');
+}
+
 const NODE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 // Coordinator steering: an explicit `nodeId` task argument wins; otherwise a
@@ -86,8 +119,17 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
           if (!successor) break;
           state = successor;
         }
-        // Restart recovery: in-flight nodes cannot be trusted; resume classifies.
+        // Restart recovery: in-flight nodes cannot be trusted; resume
+        // classifies. A process restart interrupted these nodes mid-attempt,
+        // so the crash must not consume their budget — refund the charged
+        // attempt now (the reconcile re-dispatch charges a fresh one, making
+        // the net cost of the crash zero). This path only runs after real
+        // plugin restarts; live runs keep their root binding and never
+        // reach it, so the refund cannot be farmed mid-run.
         if (Object.values(state.nodes).some((node) => node.state === 'RUNNING') && state.status === 'RUNNING') {
+          for (const node of Object.values(state.nodes)) {
+            if (node.state === 'RUNNING' && node.attempt > 0) node.attempt -= 1;
+          }
           state.status = 'RECOVERY_REQUIRED';
           await store.saveRun(state);
         }
@@ -180,8 +222,20 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       }
       let prompt = typeof args.prompt === 'string' ? args.prompt : '';
       if (decision.nodeId) {
-        prompt = `[RUNNER] Assigned nodeId: ${decision.nodeId}. Submit only this node.\n${prompt}`;
+        // The runner echoes the node's authoritative (token-expanded) scope
+        // and deliverables: the bound implementer's ground truth comes from
+        // the runner, never from planner prose that may still carry tokens.
+        const spec = state.nodes[decision.nodeId]?.spec ?? null;
+        const authoritative = [];
+        if (spec && Array.isArray(spec.writeScope) && spec.writeScope.length) authoritative.push(`[RUNNER] writeScope: ${spec.writeScope.join(', ')}. Write only inside these literal paths.`);
+        if (spec && Array.isArray(spec.deliverables) && spec.deliverables.length) authoritative.push(`[RUNNER] deliverables: ${spec.deliverables.join(', ')}.`);
+        prompt = `[RUNNER] Assigned nodeId: ${decision.nodeId}. Submit only this node.${authoritative.length ? `\n${authoritative.join('\n')}` : ''}\n${prompt}`;
         if (decision.reconcile) prompt = `${reconcilePrompt(state, decision.nodeId)}\n\n${prompt}`;
+        const guidance = revisionPrompt(decision);
+        if (guidance) prompt = `${guidance}\n\n${prompt}`;
+      } else if (decision.free && (subagentType === 'graph-explorer' || subagentType === 'graph-planner')) {
+        const carry = carryOverPrompt(state);
+        if (carry) prompt = `${carry}\n\n${prompt}`;
       }
       output.args = { ...args, prompt };
       return;
@@ -192,7 +246,26 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       deniedCalls.set(`${sessionID}:${callID}`, { tool, target: decision.target, callID });
       runner.recordViolation(decision.state, { nodeId: decision.nodeId, kind: decision.kind, detail: decision.reason, now: NOW() });
       await store.saveRun(decision.state);
+      // Hard block: the host's permission flow may auto-allow this call
+      // (config defaults or manual approval at the native prompt), so the
+      // only deny that cannot be bypassed is throwing from the before-hook.
+      // The serialized queue swallows the rejection (tails settle to
+      // undefined), so this cannot poison subsequent operations.
+      throw new Error(`RUNNER_DENIED(${decision.kind}): ${decision.reason} ${denyGuidance(decision.kind)}`);
     }
+  }
+
+  function denyGuidance(kind) {
+    if (kind === 'blocked-bash') {
+      return 'Do not retry bash. Complete the work with edit/write; if it genuinely requires shell (installs, builds), wrap up and report via graph_submit_change unresolved (or your final task report) that the coordinator must revise the plan: set allowShell=true for this node or split out an install node with its own lane.';
+    }
+    if (kind === 'out-of-scope-bash') {
+      return 'Retarget or remove the out-of-scope write (redirections, tee/cp/mv/rm/sed -i, ...) so every write lands inside your writeScope; the [RUNNER] writeScope line in your dispatch prompt is authoritative.';
+    }
+    if (kind === 'out-of-scope-edit' || kind === 'out-of-scope-write') {
+      return 'Write only inside your declared writeScope; the [RUNNER] writeScope line in your dispatch prompt is authoritative.';
+    }
+    return 'Read-only specialists may not write workspace files; report findings through the structured submit tool instead.';
   }
 
   async function onPermissionAsk(input, output) {
@@ -230,7 +303,14 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     const key = `${sessionID}:${callID}`;
     if (deniedCalls.has(key)) {
       deniedCalls.delete(key);
-      await mutate(binding.runId, (state) => runner.recordViolation(state, { nodeId: binding.nodeId, kind: 'executed-despite-deny', detail: `${tool} ran even though the runner denied it`, now: NOW() }));
+      await mutate(binding.runId, (state) => {
+        runner.recordViolation(state, { nodeId: binding.nodeId, kind: 'executed-despite-deny', detail: `${tool} ran even though the runner denied it`, now: NOW() });
+        // A denied call that ran anyway taints the attempt: strict failure,
+        // the same class as out-of-scope claims. Recovery is a fresh
+        // attempt (or a plan revision), never a resubmission of this one,
+        // so tainted work can never reach SUCCEEDED.
+        runner.taintAttempt(state, { nodeId: binding.nodeId, detail: `${tool} executed despite runner denial`, now: NOW() });
+      });
       return;
     }
     const args = input.args ?? {};
@@ -259,7 +339,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     const binding = bindings.get(sessionID);
     const work = () => {
       if (requireActive && !binding?.root && dispatches.managed(sessionID) && !dispatches.current(binding)) {
-        throw new Error('BINDING_UNAVAILABLE: managed child must have an active, verified dispatch before work');
+        throw new Error('BINDING_UNAVAILABLE: this session has no active, verified dispatch (its previous dispatch finished, was rejected, or was revoked); stop working, report this reason back, and let the coordinator re-dispatch');
       }
       return operation(input, output);
     };

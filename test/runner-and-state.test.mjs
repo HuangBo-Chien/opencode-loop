@@ -30,11 +30,11 @@ function freshRun(graph = changeGraph()) {
   assert.equal(submission.ok, true, JSON.stringify(submission));
   return state;
 }
-async function dispatchCriticAndPass(state, planVersion = 1) {
+async function dispatchCriticAndPass(state, planVersion = 1, approvedParallel = null) {
   const admit = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
   assert.equal(admit.allowed, true, JSON.stringify(admit));
   runner.beginNode(state, admit.nodeId, { now: NOW, sessionId: 'sess-critic' });
-  const review = runner.submitReview(state, { planVersion, verdict: 'PASS', findings: [], now: NOW });
+  const review = runner.submitReview(state, { planVersion, verdict: 'PASS', findings: [], approvedParallel, now: NOW });
   assert.equal(review.ok, true, JSON.stringify(review));
   return admit;
 }
@@ -539,7 +539,7 @@ test('attempts persist across reload and are not reset by restarts', async (t) =
   assert.match(reloaded.pendingDecision.detail, /never delivered/);
 });
 
-test('single-writer: second implementer node cannot run while one is RUNNING', async () => {
+test('writer capacity: disjoint implement nodes run in parallel up to the cap', async () => {
   const graph = validateTaskGraph([
     spec('explore-1', 'explore', 'graph-explorer'),
     spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'] }),
@@ -551,12 +551,51 @@ test('single-writer: second implementer node cannot run while one is RUNNING', a
   const state = newRun({ runId: 'r2', rootSessionId: 'r2', now: NOW });
   runner.submitPlan(state, { intent: 'change', nodes: graph.nodes, now: NOW });
   await dispatchCriticAndPass(state);
+  assert.equal(runner.implementerCapacity(state), 2);
+
   const first = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
   assert.equal(first.nodeId, 'impl-1');
   runner.beginNode(state, 'impl-1', { now: NOW, sessionId: 'i1' });
+  // Default capacity 2: a second disjoint writer is admitted while the first runs.
   const second = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
-  assert.equal(second.allowed, false);
-  assert.equal(second.code, 'ALREADY_RUNNING');
+  assert.equal(second.allowed, true);
+  assert.equal(second.nodeId, 'impl-2');
+  runner.beginNode(state, 'impl-2', { now: NOW, sessionId: 'i2' });
+  assert.equal(state.nodes['impl-1'].state, 'RUNNING');
+  assert.equal(state.nodes['impl-2'].state, 'RUNNING');
+  const third = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
+  assert.equal(third.allowed, false);
+  assert.equal(third.code, 'WRITER_CAPACITY');
+  assert.match(third.detail, /2\/2/);
+
+  // A critic downgrade to approvedParallel=1 mechanically narrows the gate.
+  const capped = newRun({ runId: 'r2b', rootSessionId: 'r2b', now: NOW });
+  runner.submitPlan(capped, { intent: 'change', nodes: graph.nodes, now: NOW });
+  await dispatchCriticAndPass(capped, 1, 1);
+  assert.equal(runner.implementerCapacity(capped), 1);
+  const cappedFirst = runner.admitDispatch(capped, { agent: 'graph-implementer', now: NOW });
+  assert.equal(cappedFirst.allowed, true);
+  runner.beginNode(capped, cappedFirst.nodeId, { now: NOW, sessionId: 'i3' });
+  const cappedSecond = runner.admitDispatch(capped, { agent: 'graph-implementer', now: NOW });
+  assert.equal(cappedSecond.allowed, false);
+  assert.equal(cappedSecond.code, 'WRITER_CAPACITY');
+  assert.match(cappedSecond.detail, /1\/1/);
+
+  // A runner explicitly configured for single-writer keeps the old semantics.
+  const single = createRunner({ maxAttempts: 3, maxPlanRevisions: 2, implementerParallel: 1 });
+  const solo = newRun({ runId: 'r2c', rootSessionId: 'r2c', now: NOW });
+  runner.submitPlan(solo, { intent: 'change', nodes: graph.nodes, now: NOW });
+  const soloCritic = single.admitDispatch(solo, { agent: 'graph-plan-critic', now: NOW });
+  single.beginNode(solo, soloCritic.nodeId, { now: NOW, sessionId: 'c' });
+  single.submitReview(solo, { planVersion: 1, verdict: 'PASS', findings: [], now: NOW });
+  const soloFirst = single.admitDispatch(solo, { agent: 'graph-implementer', now: NOW });
+  single.beginNode(solo, soloFirst.nodeId, { now: NOW, sessionId: 'i4' });
+  const soloSecond = single.admitDispatch(solo, { agent: 'graph-implementer', now: NOW });
+  assert.equal(soloSecond.code, 'WRITER_CAPACITY');
+
+  // Verifiers keep one-in-flight semantics regardless of writer capacity.
+  const verifierBusy = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  assert.equal(verifierBusy.code, 'NO_READY_NODE'); // impl deps not SUCCEEDED yet
 });
 
 test('resume: crash windows classify conservatively and keep counters', async () => {
@@ -787,10 +826,18 @@ test('coordinator-targeted dispatch validates the requested node specifically', 
   const unknown = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-zzz' });
   assert.equal(unknown.code, 'NODE_NOT_FOUND');
 
-  // Targeting a node that is RUNNING is rejected, not silently reassigned.
+  // Targeting a node that is RUNNING is rejected, not silently reassigned;
+  // a different free node within capacity is admitted alongside.
   runner.beginNode(state, 'impl-b', { now: NOW, sessionId: 'sess-b' });
-  const running = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-a' });
-  assert.equal(running.code, 'ALREADY_RUNNING');
+  const running = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-b' });
+  assert.equal(running.code, 'NODE_NOT_ADMISSIBLE');
+  assert.match(running.detail, /RUNNING/);
+  const alongside = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-a' });
+  assert.equal(alongside.allowed, true);
+  assert.equal(alongside.nodeId, 'impl-a');
+  runner.beginNode(state, 'impl-a', { now: NOW, sessionId: 'sess-a' });
+  const full = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-a' });
+  assert.equal(full.code, 'WRITER_CAPACITY');
 });
 
 test('targeted dispatch of an exhausted node keeps sorted-path failure semantics', async () => {
@@ -841,4 +888,195 @@ test('critics are never freely admitted; a not-ready review rejects dispatch up 
   const admitted = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
   assert.equal(admitted.allowed, true);
   assert.equal(admitted.nodeId, 'review-1');
+});
+
+test('excludeNodeIds steers the sorted pick away from reserved nodes', async () => {
+  const graph = validateTaskGraph([
+    spec('plan-1', 'plan', 'graph-planner'),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'] }),
+    spec('impl-a', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['a/**'] }),
+    spec('impl-b', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['b/**'] }),
+  ]);
+  const state = newRun({ runId: 'excl', rootSessionId: 'excl', now: NOW });
+  runner.submitPlan(state, { intent: 'change', nodes: graph.nodes, now: NOW });
+  await dispatchCriticAndPass(state);
+
+  const skipped = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, excludeNodeIds: new Set(['impl-a']) });
+  assert.equal(skipped.allowed, true);
+  assert.equal(skipped.nodeId, 'impl-b');
+
+  const bothExcluded = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, excludeNodeIds: ['impl-a', 'impl-b'] });
+  assert.equal(bothExcluded.code, 'NO_READY_NODE');
+});
+
+test('submitPlan preserves the sessionId of same-id nodes for task_id continuation', async () => {
+  const state = freshRun();
+  await dispatchCriticAndPass(state);
+  // A planner round binds the plan node (REVISE path) and sets its session.
+  state.nodes['plan-1'].state = 'PENDING';
+  state.nodes['plan-1'].sessionId = 'planner-session-1';
+  state.nodes['plan-1'].attempt = 1;
+  const resubmission = runner.submitPlan(state, { intent: 'change', nodes: changeGraph().nodes, now: NOW });
+  assert.equal(resubmission.ok, true, JSON.stringify(resubmission));
+  assert.equal(state.nodes['plan-1'].sessionId, 'planner-session-1');
+  assert.equal(state.nodes['plan-1'].attempt, 1);
+  assert.equal(state.nodes['plan-1'].state, 'SUCCEEDED'); // plan nodes auto-complete
+  // The critic's session survives re-planning the same way.
+  state.nodes['review-1'].sessionId = 'critic-session-1';
+  const third = runner.submitPlan(state, { intent: 'change', nodes: changeGraph().nodes, now: NOW });
+  assert.equal(third.ok, true, JSON.stringify(third));
+  assert.equal(state.nodes['review-1'].sessionId, 'critic-session-1');
+  assert.equal(state.nodes['review-1'].state, 'PENDING');
+});
+
+test('admission carries bounded revision and repair context from artifacts', async () => {
+  const state = freshRun();
+  // Plan admission after a REVISE verdict carries the critic's findings.
+  const critic = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
+  runner.beginNode(state, critic.nodeId, { now: NOW, sessionId: 'c' });
+  runner.submitReview(state, { planVersion: 1, verdict: 'REVISE', findings: ['tighten scope', 'add risk section'], now: NOW });
+  const plannerAdmit = runner.admitDispatch(state, { agent: 'graph-planner', now: NOW });
+  assert.equal(plannerAdmit.allowed, true, JSON.stringify(plannerAdmit));
+  assert.equal(plannerAdmit.nodeId, 'plan-1');
+  assert.deepEqual(plannerAdmit.reviseFindings, ['tighten scope', 'add risk section']);
+  const replan = runner.submitPlan(state, { intent: 'change', nodes: changeGraph().nodes, now: NOW });
+  assert.equal(replan.ok, true, JSON.stringify(replan));
+
+  // Implement admission after a FAILED verification carries the evidence.
+  await dispatchCriticAndPass(state, 2);
+  await dispatchImplementerAndSucceed(state);
+  const verifier = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  runner.beginNode(state, verifier.nodeId, { now: NOW, sessionId: 'v' });
+  runner.submitVerification(state, {
+    nodeId: verifier.nodeId, verdict: 'FAIL', commands: [{ command: 'npm test', exitCode: 1 }],
+    summary: 'tests fail on the new path', now: NOW,
+  });
+  const repairAdmit = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
+  assert.equal(repairAdmit.allowed, true, JSON.stringify(repairAdmit));
+  assert.equal(repairAdmit.repairEvidence.verifier, 'verify-1');
+  assert.equal(repairAdmit.repairEvidence.summary, 'tests fail on the new path');
+  assert.deepEqual(repairAdmit.repairEvidence.commands, ['npm test (exit 1)']);
+});
+
+test('inspect reports mechanical per-node progress from the ledger and deliverables', async () => {
+  const graph = validateTaskGraph([
+    spec('explore-1', 'explore', 'graph-explorer'),
+    spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'] }),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'] }),
+    spec('impl-1', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['src/**'], deliverables: ['src/a.ts', 'src/b.ts', 'src/c.ts'] }),
+    spec('verify-1', 'verify', 'graph-verifier', { dependsOn: ['impl-1'] }),
+  ]);
+  const state = newRun({ runId: 'progress', rootSessionId: 'progress', now: NOW });
+  runner.submitPlan(state, { intent: 'change', nodes: graph.nodes, now: NOW });
+  await dispatchCriticAndPass(state);
+
+  const admit = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
+  runner.beginNode(state, admit.nodeId, { now: NOW, sessionId: 'i' });
+  runner.recordSideEffect(state, { nodeId: 'impl-1', tool: 'edit', target: 'src/a.ts', now: '2026-09-12T01:00:01.000Z' });
+  runner.recordSideEffect(state, { nodeId: 'impl-1', tool: 'bash', target: 'ls src/', now: '2026-09-12T01:00:02.000Z' });
+
+  let report = runner.inspect(state);
+  let impl = report.nodes.find((node) => node.id === 'impl-1');
+  assert.equal(impl.sideEffectCount, 2);
+  assert.equal(impl.lastActivityAt, '2026-09-12T01:00:02.000Z');
+  assert.deepEqual(impl.deliverables, { total: 3, done: 1, pending: ['src/b.ts', 'src/c.ts'] });
+  const review = report.nodes.find((node) => node.id === 'review-1');
+  assert.equal(review.sideEffectCount, 0);
+  assert.equal(review.deliverables, undefined);
+
+  // After submission the claimed file list is the authoritative denominator.
+  runner.submitChange(state, { nodeId: 'impl-1', filesTouched: ['src/a.ts', 'src/b.ts', 'src/c.ts'], summary: 'done', now: NOW });
+  report = runner.inspect(state);
+  impl = report.nodes.find((node) => node.id === 'impl-1');
+  assert.equal(impl.state, 'SUCCEEDED');
+  assert.deepEqual(impl.deliverables, { total: 3, done: 3, pending: [] });
+
+  // Pending lists are bounded at eight entries.
+  const wide = newRun({ runId: 'wide', rootSessionId: 'wide', now: NOW });
+  const wideGraph = validateTaskGraph([
+    spec('plan-w', 'plan', 'graph-planner'),
+    spec('review-w', 'review', 'graph-plan-critic', { dependsOn: ['plan-w'] }),
+    spec('impl-w', 'implement', 'graph-implementer', { dependsOn: ['review-w'], writeScope: ['w/**'], deliverables: Array.from({ length: 10 }, (_, index) => `w/f${index}.ts`) }),
+  ]);
+  runner.submitPlan(wide, { intent: 'change', nodes: wideGraph.nodes, now: NOW });
+  const criticW = runner.admitDispatch(wide, { agent: 'graph-plan-critic', now: NOW });
+  runner.beginNode(wide, criticW.nodeId, { now: NOW, sessionId: 'cw' });
+  runner.submitReview(wide, { planVersion: 1, verdict: 'PASS', findings: [], now: NOW });
+  const admitW = runner.admitDispatch(wide, { agent: 'graph-implementer', now: NOW });
+  runner.beginNode(wide, admitW.nodeId, { now: NOW, sessionId: 'iw' });
+  const wideReport = runner.inspect(wide);
+  const wideImpl = wideReport.nodes.find((node) => node.id === 'impl-w');
+  assert.equal(wideImpl.deliverables.pending.length, 8);
+});
+
+test('run ids with colons persist to platform-safe encoded filenames', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-encoded-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const store = createRunStore({ worktree: dir });
+
+  await store.createRun({ runId: 'root:2', rootSessionId: 'root', now: NOW });
+  const state = store.getRun('root:2');
+  state.failReason = 'x';
+  await store.saveRun(state);
+  await store.releaseRun('root:2');
+
+  const runsDir = join(dir, '.opencode-loop', 'runs');
+  const names = await fsPromises.readdir(runsDir);
+  assert.ok(names.includes('root%3A2.json'), `expected encoded file, got ${names.join(', ')}`);
+  assert.equal(names.some((name) => name.includes(':')), false);
+
+  const fresh = createRunStore({ worktree: dir });
+  const loaded = await fresh.loadRun('root:2');
+  assert.equal(loaded.runId, 'root:2');
+  assert.equal(loaded.failReason, 'x');
+  assert.ok((await fresh.listRunIds()).includes('root:2'));
+});
+
+test('legacy colon filenames are lazily migrated and never duplicated', { skip: process.platform === 'win32' ? 'raw colon filenames are only representable on POSIX' : false }, async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-legacy-migrate-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsDir = join(dir, '.opencode-loop', 'runs');
+  await mkdir(runsDir, { recursive: true });
+  const legacy = newRun({ runId: 'old:1', rootSessionId: 'root', now: NOW });
+  await writeFile(join(runsDir, 'old:1.json'), JSON.stringify(legacy));
+
+  // Direct load still sees the legacy file during the transition.
+  const store = createRunStore({ worktree: dir });
+  const direct = await store.loadRun('old:1');
+  assert.equal(direct.runId, 'old:1');
+
+  // Listing migrates the file to its encoded name and reports the logical id.
+  assert.ok((await store.listRunIds()).includes('old:1'));
+  const names = await fsPromises.readdir(runsDir);
+  assert.ok(names.includes('old%3A1.json'));
+  assert.equal(names.includes('old:1.json'), false);
+});
+
+test('runFileKey output is Windows-filename safe for every representable id', async () => {
+  const { runFileKey } = await import('../src/run-state.mjs');
+  for (const id of ['root', 'root:2', 'ses_abc123', 'ses_x:12', 'a.b-c_d']) {
+    const key = runFileKey(id);
+    assert.match(key, /^[A-Za-z0-9._~-]+(?:%[0-9A-F]{2}[A-Za-z0-9._~-]*)*$/);
+    assert.equal(key.includes(':'), false);
+    assert.equal(decodeURIComponent(key), id);
+  }
+});
+
+test('pre-existing encoded run files are discovered and read by logical id', async (t) => {
+  // Windows-safe companion to the POSIX-only migration test: a hand-written
+  // encoded file (the canonical name since the filename split) must be
+  // decoded by listRunIds and loadable without any rename.
+  const dir = await mkdtemp(join(tmpdir(), 'loop-encoded-discovery-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsDir = join(dir, '.opencode-loop', 'runs');
+  await mkdir(runsDir, { recursive: true });
+  const state = newRun({ runId: 'old:1', rootSessionId: 'root', now: NOW });
+  await writeFile(join(runsDir, 'old%3A1.json'), JSON.stringify(state));
+
+  const store = createRunStore({ worktree: dir });
+  assert.deepEqual(await store.listRunIds(), ['old:1']);
+  const loaded = await store.loadRun('old:1');
+  assert.equal(loaded.runId, 'old:1');
+  const names = await fsPromises.readdir(runsDir);
+  assert.deepEqual(names.filter((name) => name.endsWith('.json')), ['old%3A1.json']);
 });

@@ -5,6 +5,10 @@ import { randomUUID } from 'node:crypto';
 const NOW = () => new Date().toISOString();
 const key = (root, call) => JSON.stringify([root, call]);
 const denied = (code, detail) => ({ allowed: false, code, detail });
+// Roles whose sessions may be continued by identity alone (their structured
+// submissions never require a node binding, so reusing the conversation is
+// low-risk). Write-role continuations still require state-verified identity.
+const CONTINUABLE_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-multimodal']);
 
 export function createDispatchBindings({ store, runner, bindings, client }) {
   const records = new Map();
@@ -45,8 +49,25 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       if (used.length >= 4096) return denied('DISPATCH_LIMIT', 'run dispatch history reached its bounded limit');
       if ([...records.values()].filter((r) => r.runId === root.runId).length >= 128) return denied('DISPATCH_LIMIT', 'too many outstanding task calls');
       const agent = args.subagent_type;
+      // A free-role continuation keeps the session identity: round-1
+      // planners, explorers and multimodal sessions are free-bound (no node
+      // identity to resume), but their conversation can still pick up the
+      // next task. The shared reservation path below re-binds the same
+      // session — node-bound when the runner has a ready node (e.g. the
+      // REVISE'd plan node, attempt charged and revision findings injected),
+      // free again otherwise.
+      let continuationSession = null;
       if (args.task_id !== undefined) {
-        const previous = bindings.get(args.task_id);
+        let previous = bindings.get(args.task_id);
+        // Cross-restart continuation: in-memory bindings are gone after a
+        // plugin restart, but the run state still records which session last
+        // worked each node. Rebuild the continuation identity from state.
+        if (!previous) {
+          const resumed = Object.values(state.nodes).find((node) => node.sessionId === args.task_id
+            && node.spec.agent === agent && ['PENDING', 'INCOMPLETE', 'STALE'].includes(node.state));
+          if (resumed) previous = { runId: root.runId, agent, nodeId: resumed.spec.id, sessionId: args.task_id, root: false, active: false };
+          else if (CONTINUABLE_ROLES.has(agent)) continuationSession = args.task_id; // identity unverifiable here (e.g. the binding was invalidated after a plan submission); parentage is re-verified before the reservation binds
+        }
         const sameRole = previous && !previous.root && previous.runId === root.runId && previous.agent === agent;
         if (sameRole && current(previous)) {
           records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent,
@@ -68,7 +89,9 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
             const decision = runner.admitDispatch(state, { agent, now: NOW(), nodeId: previous.nodeId });
             if (!decision.allowed) {
               await store.saveRun(state);
-              return denied('FRESH_SESSION_REQUIRED', `${previous.nodeId} cannot be continued in this session: ${decision.detail}`);
+              const passthrough = decision.code === 'RECOVERY_REQUIRED' || decision.code === 'AWAITING_DECISION' || decision.code === 'WRITER_CAPACITY';
+              return denied(passthrough ? decision.code : 'FRESH_SESSION_REQUIRED',
+                `${previous.nodeId} cannot be continued in this session: ${decision.detail}`);
             }
             const dispatchId = randomUUID();
             records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent,
@@ -79,32 +102,60 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
             used.push(recordKey);
             try { await store.saveRun(state); }
             catch { records.delete(recordKey); return denied('DISPATCH_PERSISTENCE_FAILED', 'could not save dispatch reservation; inspect storage and use a fresh call'); }
-            return { allowed: true, nodeId: previous.nodeId, continuation: true, resumed: true, reconcile: decision.reconcile };
+            return { allowed: true, nodeId: previous.nodeId, continuation: true, resumed: true,
+              reconcile: decision.reconcile, reviseFindings: decision.reviseFindings, repairEvidence: decision.repairEvidence };
           }
         }
-        return denied('FRESH_SESSION_REQUIRED', 'task_id may only continue an active attempt or resume the unfinished node this session last worked on; other nodes, finished work and retries need a fresh session');
+        if (sameRole && !previous.nodeId) continuationSession = args.task_id;
+        if (!continuationSession) return denied('FRESH_SESSION_REQUIRED', 'task_id may only continue an active attempt, resume the unfinished node this session last worked on, or continue a session of the same role in this run; other nodes and foreign sessions need a fresh session');
       }
-      const pending = [...records.values()].some((r) => r.runId === root.runId && !r.bound && r.nodeId &&
-        (r.agent === agent || (agent === 'graph-implementer' && r.agent === 'graph-implementer')));
-      if (pending) return denied('DISPATCH_PENDING', 'a task for this role is reserved and awaiting host session binding');
-      const decision = runner.admitDispatch(state, { agent, now: NOW(), nodeId: target });
-      if (!decision.allowed) { await store.saveRun(state); return decision; }
+      // Reservations are node-level: a fresh dispatch may not target a node
+      // that another in-flight reservation already holds. Implementer
+      // admission is additionally bounded by the writer capacity gate
+      // (unbound reservations + RUNNING nodes); other roles keep single-flight
+      // per-role pending semantics.
+      const reserved = new Set([...records.values()].filter((r) => r.runId === root.runId && !r.bound && !r.terminal && r.nodeId && r.agent === agent).map((r) => r.nodeId));
+      if (agent === 'graph-implementer') {
+        if (target !== null && reserved.has(target)) return denied('DISPATCH_PENDING', `${target} is reserved and awaiting host session binding`);
+        const running = Object.values(state.nodes).filter((node) => node.spec.kind === 'implement' && node.state === 'RUNNING').length;
+        const capacity = runner.implementerCapacity(state);
+        if (running + reserved.size >= capacity) {
+          return denied('WRITER_CAPACITY', `${running} implement node(s) RUNNING and ${reserved.size} reservation(s) in flight; writer capacity ${running + reserved.size}/${capacity} is full`);
+        }
+      } else if (reserved.size > 0) {
+        return denied('DISPATCH_PENDING', 'a task for this role is reserved and awaiting host session binding');
+      }
+      const decision = runner.admitDispatch(state, { agent, now: NOW(), nodeId: target, excludeNodeIds: reserved });
+      if (!decision.allowed) {
+        // A sorted pick that found nothing because every candidate is already
+        // reserved is a pending reservation, not a missing graph.
+        if (decision.code === 'NO_READY_NODE' && agent === 'graph-implementer' && reserved.size > 0) {
+          return denied('DISPATCH_PENDING', `implement nodes are reserved and awaiting host session binding: ${[...reserved].join(', ')}`);
+        }
+        await store.saveRun(state);
+        return decision;
+      }
       records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent, nodeId: decision.nodeId,
-        dispatchId: randomUUID(), sessionId: null, bound: false, continuation: false,
-        acknowledged: false, idleSeen: false, terminal: false, targeted: target !== null,
+        dispatchId: randomUUID(), sessionId: continuationSession, bound: false, continuation: continuationSession !== null,
+        resumed: continuationSession !== null, acknowledged: false, idleSeen: false, terminal: false, targeted: target !== null,
         planVersion: state.artifacts.plan?.version ?? 0 });
+      if (continuationSession) bindings.delete(continuationSession); // the stale free binding must not block the fresh one
       used.push(recordKey);
       try { await store.saveRun(state); }
       catch { records.delete(recordKey); return denied('DISPATCH_PERSISTENCE_FAILED', 'could not save dispatch reservation; inspect storage and use a fresh call'); }
-      return decision;
+      return continuationSession ? { ...decision, continuation: true } : decision;
     });
   }
 
   async function bind(record) {
     if (record.bound || !record.sessionId || !parents.has(record.sessionId)) return;
     const state = store.getRun(record.runId);
+    // A stale INACTIVE binding (its dispatch finished or was rejected) must
+    // not block a freshly admitted reservation for the same session: allow
+    // the overwrite. An active binding still refuses the collision.
+    const established = bindings.get(record.sessionId);
     if (!state || state.status !== 'RUNNING' || (state.artifacts.plan?.version ?? 0) !== record.planVersion
-      || parents.get(record.sessionId) !== record.rootSessionId || bindings.has(record.sessionId)) return;
+      || parents.get(record.sessionId) !== record.rootSessionId || (established && established.active !== false)) return;
     if (record.nodeId) {
       const node = state.nodes[record.nodeId];
       if (!record.started) {
@@ -125,6 +176,12 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       }
     }
     record.bound = true;
+    // A RESUMED session's pre-bind idle evidence belongs to its previous
+    // lifetime (the session was demonstrably idle before this dispatch) and
+    // must not instantly finish the new attempt. Fresh dispatches keep
+    // their pre-bind evidence (delayed-metadata windows); idle events after
+    // binding complete both kinds normally.
+    if (record.resumed) idleEvidence.delete(record.sessionId);
     bindings.set(record.sessionId, { runId: record.runId, root: false, agent: record.agent,
       nodeId: record.nodeId, sessionId: record.sessionId, dispatchId: record.dispatchId, active: true });
     await consumeIdle(record.sessionId);
@@ -241,7 +298,13 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
   }
 
   async function resolveSession(sessionId) {
-    if (bindings.has(sessionId)) return true;
+    if (bindings.has(sessionId)) {
+      // A stale inactive binding must not mask an admitted reservation that
+      // is still waiting to bind this session: only short-circuit when the
+      // session has nothing pending.
+      const pendingReservation = [...records.values()].some((r) => r.sessionId === sessionId && !r.bound && !r.terminal);
+      if (!pendingReservation) return true;
+    }
     if (!client?.session?.get || !client?.session?.messages) return false;
     try {
       const signal = AbortSignal.timeout(2000);

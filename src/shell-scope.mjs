@@ -78,7 +78,9 @@ export function extractShellWriteTargets(command, toWorkspaceRelative) {
 
   for (const candidate of scanned.matchAll(/(?:[0-9]|&)?>>?\s*([^\s;|&<>()]+)/g)) {
     const raw = candidate[1];
-    if (!raw.startsWith('&')) targets.push(raw);
+    // Lone digits are fd numbers (`1>&2` duplicates stderr), not file targets;
+    // `&`-prefixed captures are fd duplicators and already skipped.
+    if (!raw.startsWith('&') && !/^\d+$/.test(raw)) targets.push(raw);
   }
 
   let cwd = '';

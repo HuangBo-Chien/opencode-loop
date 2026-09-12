@@ -33,7 +33,7 @@ export function parseOptions(input = {}) {
   record(input, 'plugin');
   const defaults = {
     enabled: true, setDefaultAgent: false, models: {},
-    maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 1,
+    maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 2,
     stateDirectory: '.opencode-loop', maxPlanRevisions: undefined, enforcement: 'hooks',
     journal: { enabled: true, includeUserRequest: true, semanticSearch: true, maxUserRequestChars: 8000 },
   };
@@ -45,11 +45,11 @@ export function parseOptions(input = {}) {
   for (const name of ['enabled', 'setDefaultAgent']) {
     if (typeof options[name] !== 'boolean') throw new TypeError(`${name} must be a boolean`);
   }
-  for (const [name, upper] of [['maxAttempts', 10], ['maxParallel', 16], ['maxImplementerParallel', 4]]) {
+  for (const [name, upper] of [['maxAttempts', 20], ['maxParallel', 16], ['maxImplementerParallel', 4]]) {
     if (!Number.isInteger(options[name]) || options[name] < 1 || options[name] > upper) throw new TypeError(`${name} must be an integer from 1 to ${upper}`);
   }
-  if (options.maxPlanRevisions !== undefined && (!Number.isInteger(options.maxPlanRevisions) || options.maxPlanRevisions < 1 || options.maxPlanRevisions > 10)) {
-    throw new TypeError('maxPlanRevisions must be an integer from 1 to 10 when provided');
+  if (options.maxPlanRevisions !== undefined && (!Number.isInteger(options.maxPlanRevisions) || options.maxPlanRevisions < 1 || options.maxPlanRevisions > 20)) {
+    throw new TypeError('maxPlanRevisions must be an integer from 1 to 20 when provided');
   }
   options.maxPlanRevisions = options.maxPlanRevisions ?? options.maxAttempts;
   validateStateDirectory(options.stateDirectory);

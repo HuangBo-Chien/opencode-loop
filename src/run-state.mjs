@@ -1,5 +1,8 @@
 // Persistent run state: one JSON document per orchestrator session under
-// <worktree>/<stateDirectory>/runs/<runId>.json. Writes are atomic
+// <worktree>/<stateDirectory>/runs/<encoded-runId>.json. Filenames are the
+// percent-encoded logical run id — successor runs contain ':' (root:2),
+// which Windows forbids in filenames, while 'root' still encodes to
+// 'root' so legacy colon-free names are untouched. Writes are atomic
 // (temp file + rename); a lock file guards cross-instance mutation.
 // When no worktree is available the store degrades to in-memory only.
 
@@ -67,12 +70,18 @@ function sanitizeRun(state) {
   return cleaned;
 }
 
+// Filename encoding for run ids: percent-encoding escapes ':' (and every
+// other path-hostile character) so logical ids like root:2 map to the
+// platform-safe name root%3A2.json. '*' is escaped explicitly because
+// encodeURIComponent leaves it through and Windows forbids it.
+export const runFileKey = (runId) => encodeURIComponent(runId).replace(/\*/g, '%2A');
+
 export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } = {}) {
   const memory = new Map();
   const runsDir = typeof worktree === 'string' && worktree ? join(worktree, stateDirectory, 'runs') : null;
   const runFile = (runId) => {
     if (!RUN_ID_PATTERN.test(runId)) throw new TypeError('Invalid run id');
-    return join(runsDir, `${runId}.json`);
+    return join(runsDir, `${runFileKey(runId)}.json`);
   };
 
   async function createRun({ runId, rootSessionId, now, request = null, requestCaptureCompleted = false }) {
@@ -112,8 +121,20 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } =
     try {
       raw = await readFile(runFile(runId), 'utf8');
     } catch (error) {
-      if (error?.code === 'ENOENT') return memory.get(runId) ?? null;
-      throw error;
+      if (error?.code !== 'ENOENT') throw error;
+      // Legacy pre-encoding filename (raw ':' ids only ever persisted on
+      // POSIX): readable during the transition until listRunIds' lazy
+      // migration renames it to the encoded form.
+      let recovered = null;
+      if (runFileKey(runId) !== runId) {
+        try {
+          recovered = await readFile(join(runsDir, `${runId}.json`), 'utf8');
+        } catch {
+          recovered = null;
+        }
+      }
+      if (recovered === null) return memory.get(runId) ?? null;
+      raw = recovered;
     }
     const parsed = JSON.parse(raw);
     const state = structuredClone(sanitizeRun(parsed));
@@ -158,8 +179,33 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } =
     try {
       for await (const entry of handle) {
         if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
-        const runId = entry.name.slice(0, -5);
+        const key = entry.name.slice(0, -5);
+        let runId;
+        try {
+          runId = decodeURIComponent(key);
+        } catch {
+          continue; // malformed percent escapes are not run files
+        }
         if (!RUN_ID_PATTERN.test(runId)) continue;
+        if (runFileKey(runId) !== key) {
+          // A legacy pre-encoding filename (raw ':' ids, only creatable on
+          // POSIX): lazily migrate to the encoded name so the run stays
+          // visible and a successor cannot mint a duplicate logical id.
+          // Skip conservatively when the twin exists or the rename fails.
+          if (runId !== key) continue;
+          const target = join(runsDir, `${runFileKey(runId)}.json`);
+          try {
+            await lstat(target);
+            continue; // encoded twin already exists; drop the duplicate
+          } catch (error) {
+            if (error?.code !== 'ENOENT') continue;
+          }
+          try {
+            await rename(join(runsDir, entry.name), target);
+          } catch {
+            continue;
+          }
+        }
         if (skipped < offset) {
           skipped += 1;
           continue;

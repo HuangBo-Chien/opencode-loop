@@ -302,3 +302,99 @@ test('terminal events retain failed binding recovery until it can be durably rec
   assert.equal(state.nodes.impl.attempt, 1);
   assert.equal((await dispatches.admit('root', 'fresh', { subagent_type: 'graph-implementer' })).allowed, true);
 });
+
+test('parallel implementer reservations occupy distinct nodes up to writer capacity', async () => {
+  const store = createRunStore();
+  const runner = createRunner({ maxAttempts: 3, maxPlanRevisions: 3 });
+  const state = await store.createRun({ runId: 'root', rootSessionId: 'root', now: 'now' });
+  const node = (id, scope) => ({ spec: { id, kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: [scope] }, state: 'PENDING', attempt: 0 });
+  state.nodes['impl-a'] = node('impl-a', 'pkg-a/**');
+  state.nodes['impl-b'] = node('impl-b', 'pkg-b/**');
+  const bindings = new Map([['root', { runId: 'root', root: true, agent: 'graph-orchestrator' }]]);
+  const dispatches = createDispatchBindings({ store, runner, bindings });
+  const part = (call, session) => ({
+    type: 'tool', tool: 'task', callID: call, sessionID: 'root',
+    state: { status: 'running', input: { subagent_type: 'graph-implementer' }, metadata: { parentSessionId: 'root', sessionId: session } },
+  });
+
+  // Two concurrent admissions reserve DIFFERENT nodes before either binds.
+  const first = await dispatches.admit('root', 'a', { subagent_type: 'graph-implementer' });
+  assert.equal(first.allowed, true, JSON.stringify(first));
+  assert.equal(first.nodeId, 'impl-a');
+  const second = await dispatches.admit('root', 'b', { subagent_type: 'graph-implementer' });
+  assert.equal(second.allowed, true, JSON.stringify(second));
+  assert.equal(second.nodeId, 'impl-b');
+
+  // Capacity 2 is fully reserved: a third admission is refused up front,
+  // and a targeted duplicate of a reserved node reports DISPATCH_PENDING.
+  const third = await dispatches.admit('root', 'c', { subagent_type: 'graph-implementer' });
+  assert.equal(third.code, 'WRITER_CAPACITY');
+  const duplicate = await dispatches.admit('root', 'd', { subagent_type: 'graph-implementer' }, 'impl-a');
+  assert.equal(duplicate.code, 'DISPATCH_PENDING');
+  assert.match(duplicate.detail, /impl-a is reserved/);
+
+  // Both sessions bind and both nodes run concurrently.
+  await dispatches.onSession({ id: 'child-a', parentID: 'root' });
+  await dispatches.onSession({ id: 'child-b', parentID: 'root' });
+  await dispatches.onPart(part('a', 'child-a'));
+  await dispatches.onPart(part('b', 'child-b'));
+  assert.equal(state.nodes['impl-a'].state, 'RUNNING');
+  assert.equal(state.nodes['impl-b'].state, 'RUNNING');
+  assert.equal(state.nodes['impl-a'].sessionId, 'child-a');
+  assert.equal(state.nodes['impl-b'].sessionId, 'child-b');
+
+  // Finishing one writer frees a capacity slot for the next dispatch.
+  await dispatches.onIdle('child-a', 'idle-a1');
+  await dispatches.onIdle('child-a', 'idle-a2');
+  assert.equal(state.nodes['impl-a'].state, 'INCOMPLETE');
+  const next = await dispatches.admit('root', 'e', { subagent_type: 'graph-implementer' });
+  assert.equal(next.allowed, true, JSON.stringify(next));
+  assert.equal(next.nodeId, 'impl-a');
+});
+
+test('round-1 free-role sessions continue their next task through task_id', async () => {
+  const store = createRunStore();
+  const runner = createRunner({ maxAttempts: 3, maxPlanRevisions: 3 });
+  const state = await store.createRun({ runId: 'root', rootSessionId: 'root', now: 'now' });
+  state.nodes['plan-1'] = { spec: { id: 'plan-1', kind: 'plan', agent: 'graph-planner', dependsOn: [], inputs: [], outputs: ['plan'] }, state: 'PENDING', attempt: 0 };
+  // A round-1 planner finished free-bound: inactive binding without a node.
+  const bindings = new Map([
+    ['root', { runId: 'root', root: true, agent: 'graph-orchestrator' }],
+    ['p1', { runId: 'root', root: false, agent: 'graph-planner', nodeId: null, sessionId: 'p1', dispatchId: 'd0', active: false }],
+  ]);
+  const dispatches = createDispatchBindings({ store, runner, bindings });
+  const part = (call, session) => ({
+    type: 'tool', tool: 'task', callID: call, sessionID: 'root',
+    state: { status: 'running', input: { subagent_type: 'graph-planner' }, metadata: { parentSessionId: 'root', sessionId: session } },
+  });
+
+  const continuation = await dispatches.admit('root', 'c2', { subagent_type: 'graph-planner', task_id: 'p1' });
+  assert.equal(continuation.allowed, true, JSON.stringify(continuation));
+  assert.equal(continuation.nodeId, 'plan-1'); // ready plan node binds the session
+  assert.equal(continuation.continuation, true);
+
+  // The stale inactive binding is replaced, and the resumed session begins
+  // the plan node with its own identity.
+  await dispatches.onSession({ id: 'p1', parentID: 'root' });
+  await dispatches.onPart(part('c2', 'p1'));
+  assert.equal(state.nodes['plan-1'].state, 'RUNNING');
+  assert.equal(state.nodes['plan-1'].attempt, 1);
+  assert.equal(state.nodes['plan-1'].sessionId, 'p1');
+  assert.equal(bindings.get('p1').active, true);
+  assert.equal(bindings.get('p1').nodeId, 'plan-1');
+
+  // A free-role continuation without any ready node (explorer) re-establishes
+  // a free binding for the same session instead of failing.
+  const idle = await harness();
+  idle.bindings.set('e1', { runId: 'root', root: false, agent: 'graph-explorer', nodeId: null, sessionId: 'e1', dispatchId: 'd1', active: false });
+  const freeContinuation = await idle.dispatches.admit('root', 'cx', { subagent_type: 'graph-explorer', task_id: 'e1' });
+  assert.equal(freeContinuation.allowed, true, JSON.stringify(freeContinuation));
+  assert.equal(freeContinuation.free, true);
+  await idle.dispatches.onSession({ id: 'e1', parentID: 'root' });
+  await idle.dispatches.onPart({
+    type: 'tool', tool: 'task', callID: 'cx', sessionID: 'root',
+    state: { status: 'running', input: { subagent_type: 'graph-explorer' }, metadata: { parentSessionId: 'root', sessionId: 'e1' } },
+  });
+  assert.equal(idle.bindings.get('e1').active, true);
+  assert.equal(idle.bindings.get('e1').nodeId, null);
+});

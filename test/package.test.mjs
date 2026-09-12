@@ -25,7 +25,7 @@ test('package pins the SDK and publishes only self-contained runtime files', () 
   const pkg = JSON.parse(readFileSync(manifest, 'utf8'));
   const lock = JSON.parse(readFileSync(lockfile, 'utf8'));
   assert.equal(pkg.name, 'opencode-loop');
-  assert.equal(pkg.version, '0.3.0-alpha.4');
+  assert.equal(pkg.version, '0.3.0-alpha.11');
   assert.equal(pkg.type, 'module');
   assert.equal(pkg.exports, './src/index.mjs');
   assert.deepEqual(pkg.dependencies, {
@@ -68,8 +68,8 @@ test('packed entry imports and runs outside workspace with declared tool depende
     assert.equal(packed.status, 0, packed.stderr);
     const parsed = JSON.parse(packed.stdout);
     const info = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0];
-    assert.equal(info.filename, 'opencode-loop-0.3.0-alpha.4.tgz');
-    assert.equal(info.version, '0.3.0-alpha.4');
+    assert.equal(info.filename, 'opencode-loop-0.3.0-alpha.11.tgz');
+    assert.equal(info.version, '0.3.0-alpha.11');
     assert.deepEqual(
       info.files.map(file => file.path).sort(),
       ['package.json', 'README.md', ...relativeFiles(path.join(root, 'src'))].sort(),

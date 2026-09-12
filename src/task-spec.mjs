@@ -65,6 +65,29 @@ export function matchScopePath(pattern, candidate) {
   return new RegExp(`^${source}$`).test(normalizedCandidate);
 }
 
+// The run's unique path token: runId with path-hostile separators replaced.
+// Planners reference it as {{run}} in writeScope/deliverables entries; the
+// runner expands it before validation so run-unique lanes never depend on
+// the planner guessing the run id.
+export function runToken(runId) {
+  return String(runId).replaceAll(':', '-');
+}
+
+// Expands {{run}} in the enforced path fields (writeScope, deliverables) of
+// raw TaskSpec objects before validation. Prose fields are left untouched:
+// the submit response echoes the expanded paths for the planner to quote.
+export function expandRunTokens(specs, runId) {
+  const token = runToken(runId);
+  const expand = (entry) => (typeof entry === 'string' ? entry.replaceAll('{{run}}', token) : entry);
+  return specs.map((spec) => {
+    if (!spec || typeof spec !== 'object') return spec;
+    const next = { ...spec };
+    if (Array.isArray(next.writeScope)) next.writeScope = next.writeScope.map(expand);
+    if (Array.isArray(next.deliverables)) next.deliverables = next.deliverables.map(expand);
+    return next;
+  });
+}
+
 // Conservative overlap test for two write-scope patterns: compares the literal
 // directory prefix (segments before the first glob-bearing segment). Overlap is
 // assumed whenever one prefix contains the other.
@@ -85,7 +108,7 @@ function scopePathsOverlap(patternA, patternB) {
   return shorter.length > 0 && (longer === shorter || longer.startsWith(`${shorter}/`));
 }
 
-export function validateTaskSpec(spec, { maxAttemptsCeiling = 10 } = {}) {
+export function validateTaskSpec(spec, { maxAttemptsCeiling = 20 } = {}) {
   const errors = [];
   const fail = (detail) => errors.push(detail);
   if (!isPlainObject(spec)) return { ok: false, errors: ['task spec must be a plain object'], spec: null };
@@ -114,6 +137,7 @@ export function validateTaskSpec(spec, { maxAttemptsCeiling = 10 } = {}) {
       if (field === 'outputs' && !NAME_PATTERN.test(entry)) fail(`${entry}: invalid artifact name`);
       if ((field === 'writeScope' || field === 'acceptance') && !nonemptyText(entry)) fail(`${field} entries must be nonempty text`);
       if (field === 'writeScope' && nonemptyText(entry) && !normalizeScopePath(entry)) fail(`${entry}: writeScope entries must be relative workspace paths or globs`);
+      if (field === 'writeScope' && nonemptyText(entry) && /[<>{}]/.test(entry)) fail(`${entry}: unsubstituted template placeholder; use the {{run}} token (expanded by the runner before validation) or a literal path`);
     }
   }
   if (kind === 'implement') {
@@ -121,6 +145,25 @@ export function validateTaskSpec(spec, { maxAttemptsCeiling = 10 } = {}) {
     if (!Array.isArray(spec.acceptance) || spec.acceptance.length < 1) fail('implement nodes require acceptance criteria');
   } else if (Array.isArray(spec.writeScope) && spec.writeScope.length > 0) {
     fail('only implement nodes may declare a writeScope');
+  }
+  // Optional concrete deliverable list (implement nodes only): literal
+  // workspace-relative files inside the node's writeScope. graph_inspect
+  // uses it as the denominator for mechanical progress reporting.
+  if (spec.deliverables !== undefined) {
+    if (kind !== 'implement') {
+      fail('only implement nodes may declare deliverables');
+    } else if (!Array.isArray(spec.deliverables) || spec.deliverables.length > 32 || spec.deliverables.some((entry) => typeof entry !== 'string')) {
+      fail('deliverables must be an array of strings (max 32)');
+    } else if (Array.isArray(spec.writeScope) && spec.writeScope.length > 0) {
+      for (const entry of spec.deliverables) {
+        const checked = validateFileClaim(entry);
+        if (!checked.ok) fail(`deliverables: ${checked.detail}`);
+        else if (/[<>{}]/.test(entry)) fail(`deliverables: ${entry}: unsubstituted template placeholder; use the {{run}} token (expanded by the runner before validation) or a literal path`);
+        else if (!spec.writeScope.some((pattern) => matchScopePath(pattern, checked.path))) {
+          fail(`deliverables: ${checked.path} is outside this node's writeScope`);
+        }
+      }
+    }
   }
   const maxAttempts = spec.maxAttempts === undefined ? undefined : spec.maxAttempts;
   if (maxAttempts !== undefined && (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > maxAttemptsCeiling)) {
@@ -132,7 +175,7 @@ export function validateTaskSpec(spec, { maxAttemptsCeiling = 10 } = {}) {
   return { ok: errors.length === 0, errors, spec: { ...spec } };
 }
 
-export function validateTaskGraph(specs, { planOnly = false, maxAttemptsCeiling = 10 } = {}) {
+export function validateTaskGraph(specs, { planOnly = false, maxAttemptsCeiling = 20 } = {}) {
   const errors = [];
   if (!Array.isArray(specs) || specs.length < 1 || specs.length > MAX_SPECS) {
     return { ok: false, errors: [`specs must be a non-empty array (max ${MAX_SPECS})`], order: null, nodes: null };
