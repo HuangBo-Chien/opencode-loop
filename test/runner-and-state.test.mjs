@@ -438,6 +438,68 @@ test('review verdict must target the current plan version (no stale PASS)', () =
   assert.equal(oldPass.code, 'STALE_PLAN_VERSION');
 });
 
+// Regression: a planner authors the graph before the runner assigns the plan
+// version, so review inputs copied from a previous revision (plan@1) or pins
+// on the not-yet-produced review (review@1) can never resolve after a REVISE
+// cycle. submitPlan must rewrite them mechanically or the review node stays
+// inadmissible forever and the critic can never review the new plan.
+function pinnedChangeGraph() {
+  return validateTaskGraph([
+    spec('explore-1', 'explore', 'graph-explorer', { outputs: ['findings'] }),
+    spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'], outputs: ['plan'] }),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'], inputs: ['findings@1', 'plan@1'], outputs: ['review'] }),
+    spec('impl-1', 'implement', 'graph-implementer', { dependsOn: ['review-1'], inputs: ['review@1'], writeScope: ['src/a.ts'], outputs: ['change:impl-1'] }),
+    spec('verify-1', 'verify', 'graph-verifier', { dependsOn: ['impl-1'], outputs: ['verification:verify-1'] }),
+  ]);
+}
+
+test('revision re-pins stale plan@N inputs so the review node stays admissible', () => {
+  const state = newRun({ runId: 'run-1', rootSessionId: 'sess-root', now: NOW });
+  state.artifacts.findings = { kind: 'findings', nodeId: 'explore-1', version: 1, basedOn: [], payload: {}, status: 'valid', createdAt: NOW };
+  assert.equal(runner.submitPlan(state, { intent: 'change', nodes: pinnedChangeGraph().nodes, now: NOW }).version, 1);
+
+  const critic = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
+  runner.beginNode(state, critic.nodeId, { now: NOW, sessionId: 'c' });
+  assert.equal(runner.submitReview(state, { planVersion: 1, verdict: 'REVISE', findings: ['tighten scope'], now: NOW }).effect, 'revise');
+
+  // The resubmitted graph carries the same stale pins the planner authored
+  // (plan@1, review@1): the runner re-pins plan to the new version and
+  // unpins review instead of stranding the gates behind dead references.
+  const replan = runner.submitPlan(state, { intent: 'change', nodes: pinnedChangeGraph().nodes, now: NOW });
+  assert.equal(replan.version, 2);
+  assert.deepEqual(state.nodes['review-1'].spec.inputs, ['findings@1', 'plan@2']);
+  assert.deepEqual(state.nodes['impl-1'].spec.inputs, ['review']);
+  const recorded = state.artifacts.plan.payload.specs.find((entry) => entry.id === 'review-1');
+  assert.deepEqual(recorded.inputs, ['findings@1', 'plan@2']);
+
+  // Before the fix this dispatch died with NODE_NOT_ADMISSIBLE forever.
+  const reCritic = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
+  assert.equal(reCritic.allowed, true, JSON.stringify(reCritic));
+  runner.beginNode(state, reCritic.nodeId, { now: NOW, sessionId: 'c' });
+  assert.equal(runner.submitReview(state, { planVersion: 2, verdict: 'PASS', now: NOW }).effect, 'advance');
+
+  // The unpinned review input keeps the implement gate closed until a valid
+  // PASS review exists, then admits normally.
+  const implementer = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
+  assert.equal(implementer.allowed, true, JSON.stringify(implementer));
+});
+
+test('unpinned plan inputs are pinned to the submitted version, and foreign pins are untouched', () => {
+  const state = newRun({ runId: 'run-1', rootSessionId: 'sess-root', now: NOW });
+  const graph = validateTaskGraph([
+    spec('explore-1', 'explore', 'graph-explorer', { outputs: ['findings'] }),
+    spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'], inputs: ['findings@3'], outputs: ['plan'] }),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'], inputs: ['plan'], outputs: ['review'] }),
+    spec('impl-1', 'implement', 'graph-implementer', { dependsOn: ['review-1'], inputs: ['findings@3'], writeScope: ['src/a.ts'], outputs: ['change:impl-1'] }),
+    spec('verify-1', 'verify', 'graph-verifier', { dependsOn: ['impl-1'], inputs: ['change:impl-1@2'], outputs: ['verification:verify-1'] }),
+  ]);
+  assert.equal(runner.submitPlan(state, { intent: 'change', nodes: graph.nodes, now: NOW }).version, 1);
+  assert.deepEqual(state.nodes['review-1'].spec.inputs, ['plan@1']);
+  assert.deepEqual(state.nodes['plan-1'].spec.inputs, ['findings@3']);
+  assert.deepEqual(state.nodes['impl-1'].spec.inputs, ['findings@3']);
+  assert.deepEqual(state.nodes['verify-1'].spec.inputs, ['change:impl-1@2']);
+});
+
 test('happy path: PASS chain completes the run and requires command evidence', async () => {
   const state = freshRun();
   await dispatchCriticAndPass(state);
