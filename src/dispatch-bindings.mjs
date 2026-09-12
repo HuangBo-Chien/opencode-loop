@@ -46,7 +46,17 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       if ([...records.values()].filter((r) => r.runId === root.runId).length >= 128) return denied('DISPATCH_LIMIT', 'too many outstanding task calls');
       const agent = args.subagent_type;
       if (args.task_id !== undefined) {
-        const previous = bindings.get(args.task_id);
+        let previous = bindings.get(args.task_id);
+        // Cross-restart continuation: in-memory bindings are gone after a
+        // plugin restart, but the run state still records which session last
+        // worked each node. Rebuild the continuation identity from state;
+        // host task metadata and the bounded parentage lookup re-verify the
+        // session relationship before any work is trusted.
+        if (!previous) {
+          const resumed = Object.values(state.nodes).find((node) => node.sessionId === args.task_id
+            && node.spec.agent === agent && ['PENDING', 'INCOMPLETE', 'STALE'].includes(node.state));
+          if (resumed) previous = { runId: root.runId, agent, nodeId: resumed.spec.id, sessionId: args.task_id, root: false, active: false };
+        }
         const sameRole = previous && !previous.root && previous.runId === root.runId && previous.agent === agent;
         if (sameRole && current(previous)) {
           records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent,
@@ -68,7 +78,9 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
             const decision = runner.admitDispatch(state, { agent, now: NOW(), nodeId: previous.nodeId });
             if (!decision.allowed) {
               await store.saveRun(state);
-              return denied('FRESH_SESSION_REQUIRED', `${previous.nodeId} cannot be continued in this session: ${decision.detail}`);
+              const passthrough = decision.code === 'RECOVERY_REQUIRED' || decision.code === 'AWAITING_DECISION' || decision.code === 'WRITER_CAPACITY';
+              return denied(passthrough ? decision.code : 'FRESH_SESSION_REQUIRED',
+                `${previous.nodeId} cannot be continued in this session: ${decision.detail}`);
             }
             const dispatchId = randomUUID();
             records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent,
@@ -79,7 +91,8 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
             used.push(recordKey);
             try { await store.saveRun(state); }
             catch { records.delete(recordKey); return denied('DISPATCH_PERSISTENCE_FAILED', 'could not save dispatch reservation; inspect storage and use a fresh call'); }
-            return { allowed: true, nodeId: previous.nodeId, continuation: true, resumed: true, reconcile: decision.reconcile };
+            return { allowed: true, nodeId: previous.nodeId, continuation: true, resumed: true,
+              reconcile: decision.reconcile, reviseFindings: decision.reviseFindings, repairEvidence: decision.repairEvidence };
           }
         }
         return denied('FRESH_SESSION_REQUIRED', 'task_id may only continue an active attempt or resume the unfinished node this session last worked on; other nodes, finished work and retries need a fresh session');

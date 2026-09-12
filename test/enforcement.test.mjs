@@ -429,20 +429,23 @@ test('crash window: side effects lead to RECOVERY_REQUIRED; resume preserves att
   const state = h.store.getRun('root');
   assert.equal(state.status, 'RECOVERY_REQUIRED');
   assert.equal(state.nodes['impl-1'].state, 'RUNNING');
+  // The interrupted attempt was refunded: a crash must not burn the budget.
+  assert.equal(state.nodes['impl-1'].attempt, 0);
 
   const resume = JSON.parse(await h.tools.graph_run_resume.execute({}, ctx(h, 'root', 'graph-orchestrator')));
   assert.equal(resume.ok, true, JSON.stringify(resume));
   assert.deepEqual(resume.report.recoveryRequired, ['impl-1']);
-  assert.equal(h.store.getRun('root').nodes['impl-1'].attempt, 1);
+  assert.equal(h.store.getRun('root').nodes['impl-1'].attempt, 0);
 
   const before = await dispatch(h, 'graph-implementer');
   assert.match(before.args.prompt, /副作用/);
   assert.match(before.args.prompt, /src\/a.ts/);
-  assert.equal(h.store.getRun('root').nodes['impl-1'].attempt, 1);
+  assert.equal(h.store.getRun('root').nodes['impl-1'].attempt, 0);
   await bindChild(h, 'recovered-impl', 'graph-implementer');
   const after = h.store.getRun('root');
   assert.equal(after.nodes['impl-1'].state, 'RUNNING');
-  assert.equal(after.nodes['impl-1'].attempt, 2);
+  // Refunded crash (0) + one fresh reconcile attempt = 1: the crash cost nothing.
+  assert.equal(after.nodes['impl-1'].attempt, 1);
   await assert.rejects(h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-impl', callID: 'late' }, { args: { filePath: join(dir, 'src', 'a.ts') } }), /BINDING_UNAVAILABLE/);
   await mkdir(join(dir, 'src'), { recursive: true });
   await writeFile(join(dir, 'src', 'a.ts'), 'reconciled');
@@ -984,4 +987,196 @@ test('critic approvedParallel downgrade mechanically serializes writers', async 
   assert.match(second.args.prompt, /RUNNER_REJECTED/);
   assert.match(second.args.prompt, /WRITER_CAPACITY/);
   assert.match(second.args.prompt, /1\/1/);
+});
+
+test('crash on the final attempt: refund plus cross-restart task_id continuation avoids reset', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-crash-final-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  let h = harness(dir);
+  await startRun(h);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  await h.tools.graph_submit_plan.execute({ intent: 'change', specs: SPECS }, ctx(h, 'child-planner', 'graph-planner'));
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
+  await dispatch(h, 'graph-implementer');
+  await bindChild(h, 'child-impl', 'graph-implementer');
+  await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-impl', callID: 'e1', args: { filePath: join(dir, 'src', 'a.ts') } }, { title: 'edit', output: 'ok' });
+  // The crash happened on the node's third and final attempt.
+  const preCrash = h.store.getRun('root');
+  preCrash.nodes['impl-1'].attempt = 3;
+  await h.store.saveRun(preCrash);
+
+  // Restart: fresh plugin state over the same directory.
+  h = harness(dir);
+  await startRun(h);
+  const restarted = h.store.getRun('root');
+  assert.equal(restarted.status, 'RECOVERY_REQUIRED');
+  assert.equal(restarted.nodes['impl-1'].attempt, 2); // interrupted attempt refunded
+
+  const resume = JSON.parse(await h.tools.graph_run_resume.execute({}, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(resume.ok, true, JSON.stringify(resume));
+  assert.equal(restarted.nodes['impl-1'].state, 'PENDING');
+  assert.equal(restarted.nodes['impl-1'].sessionId, 'child-impl');
+
+  // task_id continuation picks the interrupted session back up across the
+  // restart; its side-effect ledger travels with the dispatch.
+  const continuation = await dispatch(h, 'graph-implementer', { prompt: 'continue where you stopped', task_id: 'child-impl' });
+  assert.ok(!continuation.args.prompt.includes('RUNNER_REJECTED'), continuation.args.prompt);
+  assert.match(continuation.args.prompt, /Assigned nodeId: impl-1/);
+  assert.match(continuation.args.prompt, /副作用/);
+  await bindChild(h, 'child-impl', 'graph-implementer');
+  const after = h.store.getRun('root');
+  assert.equal(after.nodes['impl-1'].state, 'RUNNING');
+  assert.equal(after.nodes['impl-1'].attempt, 3); // refunded crash + one fresh charge
+  assert.equal(after.nodes['impl-1'].sessionId, 'child-impl');
+
+  await mkdir(join(dir, 'src'), { recursive: true });
+  await writeFile(join(dir, 'src', 'a.ts'), 'recovered');
+  const change = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/a.ts'], summary: 'recovered after crash' }, ctx(h, 'child-impl', 'graph-implementer')));
+  assert.equal(change.ok, true, JSON.stringify(change));
+  await dispatch(h, 'graph-verifier');
+  await bindChild(h, 'child-verify', 'graph-verifier');
+  const verdict = JSON.parse(await h.tools.graph_submit_verification.execute(
+    { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }] },
+    ctx(h, 'child-verify', 'graph-verifier'),
+  ));
+  assert.equal(verdict.ok, true, JSON.stringify(verdict));
+  assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
+});
+
+test('REVISE returns to the same planner and critic via task_id with injected findings', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-revise-continue-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  await h.tools.graph_submit_findings.execute({ summary: 'evidence for the plan', evidence: ['a.ts:1'] }, ctx(h, 'child-explore', 'graph-explorer'));
+  await childIdle(h, 'child-explore');
+
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'p1', 'graph-planner');
+  const v1 = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'p1', 'graph-planner')));
+  assert.equal(v1.ok, true, JSON.stringify(v1));
+  await childIdle(h, 'p1');
+
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'c1', 'graph-plan-critic');
+  const revise1 = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'REVISE', findings: ['add risk section'] }, ctx(h, 'c1', 'graph-plan-critic')));
+  assert.equal(revise1.ok, true, JSON.stringify(revise1));
+  await childIdle(h, 'c1');
+
+  // The revision dispatch binds the plan node and mechanically carries the
+  // critic's findings — no relay required.
+  const round2 = await dispatch(h, 'graph-planner');
+  assert.match(round2.args.prompt, /Assigned nodeId: plan-1/);
+  assert.match(round2.args.prompt, /修訂要求/);
+  assert.match(round2.args.prompt, /add risk section/);
+  await bindChild(h, 'p2', 'graph-planner');
+  const v2 = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'p2', 'graph-planner')));
+  assert.equal(v2.ok, true, JSON.stringify(v2));
+
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'c2', 'graph-plan-critic');
+  const revise2 = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 2, verdict: 'REVISE', findings: ['shrink scope'] }, ctx(h, 'c2', 'graph-plan-critic')));
+  assert.equal(revise2.ok, true, JSON.stringify(revise2));
+  await childIdle(h, 'c2');
+
+  // The SAME planner session continues its next task after the second
+  // rejection: sessionId survived the plan rebuild.
+  const round3 = await dispatch(h, 'graph-planner', { prompt: 'apply the second round', task_id: 'p2' });
+  assert.ok(!round3.args.prompt.includes('RUNNER_REJECTED'), round3.args.prompt);
+  assert.match(round3.args.prompt, /Assigned nodeId: plan-1/);
+  assert.match(round3.args.prompt, /修訂要求/);
+  assert.match(round3.args.prompt, /shrink scope/);
+  await bindChild(h, 'p2', 'graph-planner');
+  const v3 = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'p2', 'graph-planner')));
+  assert.equal(v3.ok, true, JSON.stringify(v3));
+
+  // The SAME critic session re-reviews the new plan version.
+  const criticAgain = await dispatch(h, 'graph-plan-critic', { prompt: 'review v3', task_id: 'c2' });
+  assert.ok(!criticAgain.args.prompt.includes('RUNNER_REJECTED'), criticAgain.args.prompt);
+  await bindChild(h, 'c2', 'graph-plan-critic');
+  const pass = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 3, verdict: 'PASS', findings: [] }, ctx(h, 'c2', 'graph-plan-critic')));
+  assert.equal(pass.ok, true, JSON.stringify(pass));
+  assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
+});
+
+test('user reset carries prior rejections and findings into the successor run', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-carryover-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  await h.tools.graph_submit_findings.execute({ summary: 'auth flow spans three modules', evidence: ['src/auth.ts:1'] }, ctx(h, 'child-explore', 'graph-explorer'));
+  await childIdle(h, 'child-explore');
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(plan.ok, true, JSON.stringify(plan));
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  const fail = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['misses token rotation entirely'] }, ctx(h, 'child-critic', 'graph-plan-critic')));
+  assert.equal(fail.effect, 'await-decision');
+  await childIdle(h, 'child-critic');
+
+  const reset = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'reset', reason: 'user wants the rotation handled' }, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(reset.ok, true, JSON.stringify(reset));
+  assert.equal(reset.carryOver.reviewFindings, 1);
+
+  const successor = h.store.getRun('root:2');
+  assert.equal(successor.carryOver.predecessorRunId, 'root');
+  assert.deepEqual(successor.carryOver.reviewFindings, ['misses token rotation entirely']);
+  assert.equal(successor.carryOver.findingsDigest, 'auth flow spans three modules');
+  const inspected = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(inspected.carryOver.predecessorRunId, 'root');
+
+  const exploration = await dispatch(h, 'graph-explorer');
+  assert.match(exploration.args.prompt, /前次 run 資訊/);
+  assert.match(exploration.args.prompt, /root 因使用者 reset/);
+  assert.match(exploration.args.prompt, /misses token rotation entirely/);
+  assert.match(exploration.args.prompt, /auth flow spans three modules/);
+  assert.match(exploration.args.prompt, /重新驗證/);
+  const planning = await dispatch(h, 'graph-planner');
+  assert.match(planning.args.prompt, /前次 run 資訊/);
+});
+
+test('repair dispatches carry the verifier failure evidence', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-repair-evidence-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  await h.tools.graph_submit_plan.execute({ intent: 'change', specs: SPECS }, ctx(h, 'child-planner', 'graph-planner'));
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
+  await dispatch(h, 'graph-implementer');
+  await bindChild(h, 'child-impl', 'graph-implementer');
+  await mkdir(join(dir, 'src'), { recursive: true });
+  await writeFile(join(dir, 'src', 'a.ts'), 'first try');
+  const change = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/a.ts'], summary: 'first try' }, ctx(h, 'child-impl', 'graph-implementer')));
+  assert.equal(change.ok, true, JSON.stringify(change));
+  await childIdle(h, 'child-impl');
+  await dispatch(h, 'graph-verifier');
+  await bindChild(h, 'child-verify', 'graph-verifier');
+  const failed = JSON.parse(await h.tools.graph_submit_verification.execute(
+    { nodeId: 'verify-1', verdict: 'FAIL', commands: [{ command: 'npm test', exitCode: 1 }], summary: 'regression in auth errors' },
+    ctx(h, 'child-verify', 'graph-verifier'),
+  ));
+  assert.equal(failed.effect, 'repair');
+  await childIdle(h, 'child-verify');
+
+  const repair = await dispatch(h, 'graph-implementer');
+  assert.match(repair.args.prompt, /修復要求/);
+  assert.match(repair.args.prompt, /regression in auth errors/);
+  assert.match(repair.args.prompt, /npm test \(exit 1\)/);
+  // The failed verification is durable evidence, not a dropped verdict.
+  assert.equal(h.store.getRun('root').artifacts['verification:verify-1'].payload.verdict, 'FAIL');
 });

@@ -908,3 +908,52 @@ test('excludeNodeIds steers the sorted pick away from reserved nodes', async () 
   const bothExcluded = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, excludeNodeIds: ['impl-a', 'impl-b'] });
   assert.equal(bothExcluded.code, 'NO_READY_NODE');
 });
+
+test('submitPlan preserves the sessionId of same-id nodes for task_id continuation', async () => {
+  const state = freshRun();
+  await dispatchCriticAndPass(state);
+  // A planner round binds the plan node (REVISE path) and sets its session.
+  state.nodes['plan-1'].state = 'PENDING';
+  state.nodes['plan-1'].sessionId = 'planner-session-1';
+  state.nodes['plan-1'].attempt = 1;
+  const resubmission = runner.submitPlan(state, { intent: 'change', nodes: changeGraph().nodes, now: NOW });
+  assert.equal(resubmission.ok, true, JSON.stringify(resubmission));
+  assert.equal(state.nodes['plan-1'].sessionId, 'planner-session-1');
+  assert.equal(state.nodes['plan-1'].attempt, 1);
+  assert.equal(state.nodes['plan-1'].state, 'SUCCEEDED'); // plan nodes auto-complete
+  // The critic's session survives re-planning the same way.
+  state.nodes['review-1'].sessionId = 'critic-session-1';
+  const third = runner.submitPlan(state, { intent: 'change', nodes: changeGraph().nodes, now: NOW });
+  assert.equal(third.ok, true, JSON.stringify(third));
+  assert.equal(state.nodes['review-1'].sessionId, 'critic-session-1');
+  assert.equal(state.nodes['review-1'].state, 'PENDING');
+});
+
+test('admission carries bounded revision and repair context from artifacts', async () => {
+  const state = freshRun();
+  // Plan admission after a REVISE verdict carries the critic's findings.
+  const critic = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
+  runner.beginNode(state, critic.nodeId, { now: NOW, sessionId: 'c' });
+  runner.submitReview(state, { planVersion: 1, verdict: 'REVISE', findings: ['tighten scope', 'add risk section'], now: NOW });
+  const plannerAdmit = runner.admitDispatch(state, { agent: 'graph-planner', now: NOW });
+  assert.equal(plannerAdmit.allowed, true, JSON.stringify(plannerAdmit));
+  assert.equal(plannerAdmit.nodeId, 'plan-1');
+  assert.deepEqual(plannerAdmit.reviseFindings, ['tighten scope', 'add risk section']);
+  const replan = runner.submitPlan(state, { intent: 'change', nodes: changeGraph().nodes, now: NOW });
+  assert.equal(replan.ok, true, JSON.stringify(replan));
+
+  // Implement admission after a FAILED verification carries the evidence.
+  await dispatchCriticAndPass(state, 2);
+  await dispatchImplementerAndSucceed(state);
+  const verifier = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  runner.beginNode(state, verifier.nodeId, { now: NOW, sessionId: 'v' });
+  runner.submitVerification(state, {
+    nodeId: verifier.nodeId, verdict: 'FAIL', commands: [{ command: 'npm test', exitCode: 1 }],
+    summary: 'tests fail on the new path', now: NOW,
+  });
+  const repairAdmit = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
+  assert.equal(repairAdmit.allowed, true, JSON.stringify(repairAdmit));
+  assert.equal(repairAdmit.repairEvidence.verifier, 'verify-1');
+  assert.equal(repairAdmit.repairEvidence.summary, 'tests fail on the new path');
+  assert.deepEqual(repairAdmit.repairEvidence.commands, ['npm test (exit 1)']);
+});

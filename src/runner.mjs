@@ -107,6 +107,43 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     return Math.max(1, Math.min(implementerParallel, approved ?? implementerParallel));
   }
 
+  // Bounded revision/repair context derived from artifacts so dispatches
+  // mechanically carry the critic's findings or the verifier's failure
+  // evidence instead of relying on the coordinator to relay them.
+  function revisionContext(state, chosen) {
+    if (chosen.spec.kind === 'plan') {
+      const reviews = Object.values(state.artifacts)
+        .filter((artifact) => artifact.kind === 'review' && artifact.payload?.verdict === 'REVISE')
+        .sort((a, b) => b.version - a.version);
+      const latest = reviews[0];
+      const findings = Array.isArray(latest?.payload?.findings)
+        ? latest.payload.findings.slice(0, 8).map((finding) => String(finding).slice(0, 500))
+        : [];
+      return findings.length ? { reviseFindings: findings } : null;
+    }
+    if (chosen.spec.kind === 'implement') {
+      const failures = Object.values(state.artifacts)
+        .filter((artifact) => {
+          if (artifact.kind !== 'verification' || artifact.payload?.verdict !== 'FAIL') return false;
+          const verifier = state.nodes[artifact.nodeId];
+          return Array.isArray(verifier?.spec?.dependsOn) && verifier.spec.dependsOn.includes(chosen.spec.id);
+        })
+        .sort((a, b) => b.version - a.version);
+      const latest = failures[0];
+      if (!latest) return null;
+      return {
+        repairEvidence: {
+          verifier: latest.nodeId,
+          summary: String(latest.payload?.summary ?? '').slice(0, 500),
+          commands: (Array.isArray(latest.payload?.commands) ? latest.payload.commands : [])
+            .slice(0, 5)
+            .map((command) => `${String(command?.command ?? '').slice(0, 200)} (exit ${command?.exitCode ?? '?'})`),
+        },
+      };
+    }
+    return null;
+  }
+
   // Per-node admissibility shared by the sorted and coordinator-targeted paths.
   // Attempt exhaustion keeps sorted-path semantics: the node fails, and write
   // agents additionally fail the run.
@@ -124,7 +161,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       pauseForDecision(state, 'attempt-budget-exhausted', `${chosen.spec.id} exhausted its attempt budget`, now);
       return { allowed: false, code: 'ATTEMPTS_EXHAUSTED', detail: `${chosen.spec.id} has no attempts left` };
     }
-    return { allowed: true, nodeId: chosen.spec.id, reconcile: chosen.reconcile === true || state.sideEffects.some((effect) => effect.nodeId === chosen.spec.id) };
+    return { allowed: true, nodeId: chosen.spec.id, reconcile: chosen.reconcile === true || state.sideEffects.some((effect) => effect.nodeId === chosen.spec.id), ...(revisionContext(state, chosen) ?? {}) };
   }
 
   function admitDispatch(state, { agent, now, nodeId = null, excludeNodeIds = null }) {
@@ -229,15 +266,18 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     state.status = 'RUNNING';
     state.blockedReason = null;
 
-    const preservedAttempts = new Map(Object.values(state.nodes).map((node) => [node.spec.id, node.attempt]));
+    const preservedNodes = new Map(Object.values(state.nodes).map((node) => [node.spec.id, { attempt: node.attempt, sessionId: node.sessionId ?? null }]));
     state.nodes = {};
     for (const [id, spec] of nodes) {
-      const preserved = preservedAttempts.get(id);
+      const preserved = preservedNodes.get(id);
       state.nodes[id] = {
         spec,
         state: 'PENDING',
-        attempt: typeof preserved === 'number' && spec.kind !== 'explore' && spec.kind !== 'analyze' ? preserved : 0,
-        sessionId: null,
+        attempt: typeof preserved?.attempt === 'number' && spec.kind !== 'explore' && spec.kind !== 'analyze' ? preserved.attempt : 0,
+        // The session that last worked this node survives plan replacement,
+        // so a REVISE'd planner, a re-reviewing critic or a repaired
+        // implementer can continue its conversation through task_id.
+        sessionId: preserved?.sessionId ?? null,
         startedAt: null,
         finishedAt: null,
         reconcile: false,
@@ -441,6 +481,15 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       state.revisionCounters['implement-verify'] += 1;
       node.state = 'PENDING';
       node.finishedAt = now;
+      // Failed verification is durable evidence: store it (superseded — it
+      // gates nothing) so repair dispatches and audits can cite the exact
+      // commands and summary instead of relying on free-text relay.
+      const name = `verification:${nodeId}`;
+      const previous = state.artifacts[name];
+      const version = previous ? previous.version + 1 : 1;
+      if (previous && previous.status === 'valid') previous.status = 'superseded';
+      const refs = node.spec.dependsOn.map((dep) => `change:${dep}@${state.artifacts[`change:${dep}`]?.version ?? 1}`);
+      state.artifacts[name] = { kind: 'verification', nodeId, version, basedOn: refs, payload: { verdict, commands, summary }, snapshot, status: 'superseded', createdAt: now };
       if (state.revisionCounters['implement-verify'] >= maxAttempts) {
         pauseForDecision(state, 'verification-repair-exhausted', 'verification repair loop exhausted (maxAttempts reached)', now);
         return { ok: true, effect: 'await-decision', detail: 'verification repair loop exhausted; awaiting user decision' };
@@ -452,7 +501,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         repair.finishedAt = now;
       }
       state.updatedAt = now;
-      return { ok: true, effect: 'repair' };
+      return { ok: true, effect: 'repair', detail: 'verification failed; implementer repair dispatches will carry this evidence' };
     }
     if (verdict === 'UNVERIFIED') {
       node.state = 'PENDING';
@@ -572,6 +621,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       pendingDecision: state.pendingDecision ?? null,
       decision: state.decision ?? null,
       successorRunId: state.successorRunId ?? null,
+      carryOver: state.carryOver ?? null,
       blockedReason: state.blockedReason, revisionCounters: state.revisionCounters,
       nodes, artifacts: Object.entries(state.artifacts).map(([name, artifact]) => ({ name, kind: artifact.kind, version: artifact.version, status: artifact.status, basedOn: artifact.basedOn })),
       violations: state.violations.slice(-20), sideEffectCount: state.sideEffects.length, mermaid,

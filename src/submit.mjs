@@ -269,7 +269,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         }
       }
       await store.saveRun(state);
-      return reply({ ok: true, ...resume, next: 'continue the workflow; attempts and counters were preserved and reconcile context will be attached to affected dispatches' });
+      return reply({ ok: true, ...resume, next: 'continue the workflow: interrupted attempts were refunded at restart; prefer task_id continuation to pick the interrupted session back up (its context and side-effect ledger travel with it), otherwise re-dispatch — reconcile context is injected automatically; if the run is paused, report to the user and use graph_run_decide' });
     },
   });
 
@@ -311,13 +311,31 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         break;
       }
       if (!runId) return rejected('RUN_LIMIT', 'this session reached its successor-run limit');
-      await store.createRun({ runId, rootSessionId: state.rootSessionId, now: NOW(), request: null, requestCaptureCompleted: true });
+      const created = await store.createRun({ runId, rootSessionId: state.rootSessionId, now: NOW(), request: null, requestCaptureCompleted: true });
+      // Carry a bounded digest of the archived run into the successor so the
+      // new explorer/planner start from its lessons (revalidation mandatory)
+      // instead of re-deriving everything — and re-collecting the same
+      // rejections — from zero.
+      const priorReview = state.artifacts.review;
+      const carriedFindings = priorReview && ['REVISE', 'FAIL'].includes(priorReview.payload?.verdict) && Array.isArray(priorReview.payload?.findings)
+        ? priorReview.payload.findings.slice(0, 8).map((finding) => String(finding).slice(0, 500))
+        : [];
+      created.carryOver = {
+        predecessorRunId: state.runId,
+        reason: args.reason.slice(0, 2000),
+        at: NOW(),
+        reviewFindings: carriedFindings,
+        findingsDigest: typeof state.artifacts.findings?.payload?.summary === 'string'
+          ? state.artifacts.findings.payload.summary.slice(0, 400) : null,
+      };
+      await store.saveRun(created);
       runner.archiveForReset(state, { reason: args.reason, successorRunId: runId, now: NOW() });
       await store.saveRun(state);
       bindings.set(context.sessionID, { runId, agent: context.agent, nodeId: null, root: true });
       return reply({ ok: true, action: 'reset', runId,
         previousRun: { runId: state.runId, status: state.status, decision: state.decision },
-        next: 'dispatch read-only exploration/planning for the new goal; counters start fresh, gates re-apply and no side effects are replayed' });
+        carryOver: { predecessorRunId: created.carryOver.predecessorRunId, reviewFindings: created.carryOver.reviewFindings.length },
+        next: 'dispatch read-only exploration/planning for the new goal; counters start fresh, gates re-apply and no side effects are replayed — the successor run carries a bounded digest of this run\'s findings and rejections' });
     },
   });
 
