@@ -353,21 +353,37 @@ test('hashFiles snapshots literals, reports globs and missing files conservative
   assert.equal((await memory.hashFiles(['a.ts']))['a.ts'], 'UNVERIFIABLE');
 });
 
-test('scenario: critic FAIL terminates the run; implementer dispatch is rejected', () => {
+test('scenario: critic FAIL pauses the run for a user decision; dispatch is rejected', () => {
   const state = freshRun();
   const critic = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
   runner.beginNode(state, critic.nodeId, { now: NOW, sessionId: 'c' });
   const review = runner.submitReview(state, { planVersion: 1, verdict: 'FAIL', findings: ['plan misses the error path'], now: NOW });
-  assert.equal(review.effect, 'run-failed');
-  assert.equal(state.status, 'FAILED');
+  assert.equal(review.effect, 'await-decision');
+  assert.equal(state.status, 'AWAITING_USER_DECISION');
+  assert.equal(state.pendingDecision.cause, 'plan-rejected-by-critic');
+  assert.match(state.pendingDecision.detail, /plan rejected by critic/);
+  assert.equal(state.nodes['review-1'].state, 'PENDING');
+  assert.equal(state.artifacts.review.payload.verdict, 'FAIL');
 
   const denied = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
   assert.equal(denied.allowed, false);
-  assert.equal(denied.code, 'RUN_TERMINATED');
+  assert.equal(denied.code, 'AWAITING_DECISION');
+  assert.match(denied.detail, /graph_run_decide/);
   for (const agent of ['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-verifier']) {
     assert.equal(runner.admitDispatch(state, { agent, now: NOW }).allowed, false, agent);
   }
-  assert.equal(runner.submitPlan(state, { intent: 'change', nodes: changeGraph().nodes, now: NOW }).code, 'RUN_TERMINATED');
+  // The pause cannot be bypassed by replacing the plan, and resume is a no-op.
+  assert.equal(runner.submitPlan(state, { intent: 'change', nodes: changeGraph().nodes, now: NOW }).code, 'AWAITING_DECISION');
+  assert.equal(runner.resumeRun(state, { now: NOW }).code, 'AWAITING_DECISION');
+  assert.equal(runner.inspect(state).pendingDecision.cause, 'plan-rejected-by-critic');
+
+  // The user's abort decision terminates irreversibly while keeping evidence.
+  runner.abortRun(state, { reason: 'user gave up on this goal', now: NOW });
+  assert.equal(state.status, 'ABORTED');
+  assert.match(state.failReason, /aborted by user: user gave up on this goal/);
+  assert.equal(state.decision.action, 'abort');
+  assert.equal(runner.admitDispatch(state, { agent: 'graph-explorer', now: NOW }).code, 'RUN_TERMINATED');
+  assert.equal(state.artifacts.review.payload.verdict, 'FAIL');
 });
 
 test('scenario: implementer cannot be dispatched before review PASS (gate skip rejected)', () => {
@@ -396,9 +412,12 @@ test('REVISE returns to planner, is capped, and burns the plan artifact version'
   const critic = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
   runner.beginNode(state, critic.nodeId, { now: NOW, sessionId: 'c' });
   const third = runner.submitReview(state, { planVersion: 3, verdict: 'REVISE', findings: ['again'], now: NOW });
-  assert.equal(third.effect, 'run-failed');
-  assert.equal(state.status, 'FAILED');
-  assert.match(state.failReason, /revisions exhausted/);
+  assert.equal(third.effect, 'await-decision');
+  assert.equal(state.status, 'AWAITING_USER_DECISION');
+  assert.equal(state.pendingDecision.cause, 'plan-revisions-exhausted');
+  assert.match(state.pendingDecision.detail, /maxPlanRevisions=2/);
+  assert.equal(state.nodes['review-1'].state, 'PENDING');
+  assert.equal(state.nodes['plan-1'].state, 'PENDING');
 });
 
 test('review verdict must target the current plan version (no stale PASS)', () => {
@@ -451,9 +470,9 @@ test('verification FAIL triggers a capped repair loop and supersedes the change'
   assert.equal(second.effect, 'repair');
   await dispatchImplementerAndSucceed(state);
   const third = await dispatchVerifier(state, 'FAIL', [{ command: 'npm test', exitCode: 1 }]);
-  assert.equal(third.effect, 'run-failed');
-  assert.equal(state.status, 'FAILED');
-  assert.match(state.failReason, /repair loop exhausted/);
+  assert.equal(third.effect, 'await-decision');
+  assert.equal(state.status, 'AWAITING_USER_DECISION');
+  assert.equal(state.pendingDecision.cause, 'verification-repair-exhausted');
 });
 
 test('UNVERIFIED blocks the run without faking success', async () => {
@@ -515,8 +534,9 @@ test('attempts persist across reload and are not reset by restarts', async (t) =
   runner.beginNode(reloaded, admit.nodeId, { now: NOW, sessionId: 'i' });
   assert.equal(reloaded.nodes['impl-1'].attempt, 3);
   runner.markIncomplete(reloaded, { nodeId: admit.nodeId, now: NOW });
-  assert.equal(reloaded.status, 'FAILED');
-  assert.match(reloaded.failReason, /never delivered/);
+  assert.equal(reloaded.status, 'AWAITING_USER_DECISION');
+  assert.equal(reloaded.pendingDecision.cause, 'attempt-budget-exhausted');
+  assert.match(reloaded.pendingDecision.detail, /never delivered/);
 });
 
 test('single-writer: second implementer node cannot run while one is RUNNING', async () => {
@@ -780,7 +800,8 @@ test('targeted dispatch of an exhausted node keeps sorted-path failure semantics
   const denied = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW, nodeId: 'impl-1' });
   assert.equal(denied.code, 'ATTEMPTS_EXHAUSTED');
   assert.equal(state.nodes['impl-1'].state, 'FAILED');
-  assert.equal(state.status, 'FAILED');
+  assert.equal(state.status, 'AWAITING_USER_DECISION');
+  assert.equal(state.pendingDecision.cause, 'attempt-budget-exhausted');
 });
 
 test('recorded side effects mark redispatches as reconcile work', async () => {

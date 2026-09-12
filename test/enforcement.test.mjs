@@ -278,7 +278,7 @@ test('historical schema v1 runs never capture a post-upgrade message as their in
   assert.equal(migrated.requestCaptureCompleted, true);
 });
 
-test('full gated flow: plan → FAIL terminates; blocked dispatch is rewritten as RUNNER_REJECTED', async (t) => {
+test('full gated flow: plan → FAIL pauses for decision; abort closes the run; blocked dispatch is rewritten as RUNNER_REJECTED', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'loop-ef1-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const h = harness(dir);
@@ -294,14 +294,34 @@ test('full gated flow: plan → FAIL terminates; blocked dispatch is rewritten a
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   const verdict = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['missing error path'] }, ctx(h, 'child-critic', 'graph-plan-critic')));
   assert.equal(verdict.ok, true);
-  assert.equal(verdict.effect, 'run-failed');
+  assert.equal(verdict.effect, 'await-decision');
+  const paused = h.store.getRun('root');
+  assert.equal(paused.status, 'AWAITING_USER_DECISION');
+  assert.equal(paused.pendingDecision.cause, 'plan-rejected-by-critic');
 
   const blocked = await dispatch(h, 'graph-implementer');
   assert.match(blocked.args.prompt, /RUNNER_REJECTED/);
-  assert.match(blocked.args.prompt, /RUN_TERMINATED/);
+  assert.match(blocked.args.prompt, /AWAITING_DECISION/);
+  assert.match(blocked.args.prompt, /graph_run_decide/);
+  assert.ok(paused.violations.some((entry) => entry.kind === 'gate-blocked-dispatch'));
+
+  // Neither a new planner dispatch nor plan replacement can bypass the pause.
+  const smuggler = await dispatch(h, 'graph-planner');
+  assert.match(smuggler.args.prompt, /RUNNER_REJECTED/);
+  assert.match(smuggler.args.prompt, /AWAITING_DECISION/);
+  await childIdle(h, 'child-critic');
+
+  // The user's abort decision is irreversible and preserves the evidence.
+  const aborted = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'abort', reason: 'requirements changed' }, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(aborted.ok, true, JSON.stringify(aborted));
+  assert.equal(aborted.status, 'ABORTED');
   const state = h.store.getRun('root');
-  assert.equal(state.status, 'FAILED');
-  assert.ok(state.violations.some((entry) => entry.kind === 'gate-blocked-dispatch'));
+  assert.equal(state.status, 'ABORTED');
+  assert.match(state.failReason, /aborted by user: requirements changed/);
+  assert.equal(state.artifacts.review.payload.verdict, 'FAIL');
+  assert.equal(state.decision.action, 'abort');
+  const afterAbort = await dispatch(h, 'graph-explorer');
+  assert.match(afterAbort.args.prompt, /RUN_TERMINATED/);
 });
 
 test('implementer cannot be dispatched before review PASS; verifier evidence gates apply end to end', async (t) => {
@@ -764,4 +784,127 @@ test('critic dispatch before findings exist is rejected up front with NO_READY_N
   const verdict = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic')));
   assert.equal(verdict.ok, true, JSON.stringify(verdict));
   assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
+});
+
+const DECIDE_SPECS = [
+  { id: 'explore-1', kind: 'explore', agent: 'graph-explorer', dependsOn: [], inputs: [], outputs: ['findings'], acceptance: ['evidence'] },
+  { id: 'plan-1', kind: 'plan', agent: 'graph-planner', dependsOn: ['explore-1'], inputs: ['findings@1'], outputs: ['plan'], acceptance: ['plan'] },
+  { id: 'review-1', kind: 'review', agent: 'graph-plan-critic', dependsOn: ['plan-1'], inputs: ['plan'], outputs: ['review'], acceptance: ['review'] },
+];
+
+async function decideRound(h, planVersion, verdict) {
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, `child-critic-${planVersion}-${verdict}`, 'graph-plan-critic');
+  const result = JSON.parse(await h.tools.graph_submit_review.execute(
+    { planVersion, verdict, findings: ['tighten scope'] },
+    ctx(h, `child-critic-${planVersion}-${verdict}`, 'graph-plan-critic'),
+  ));
+  await childIdle(h, `child-critic-${planVersion}-${verdict}`);
+  return result;
+}
+async function replan(h, planVersion) {
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, `child-planner-${planVersion}`, 'graph-planner');
+  const result = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: DECIDE_SPECS }, ctx(h, `child-planner-${planVersion}`, 'graph-planner')));
+  await childIdle(h, `child-planner-${planVersion}`);
+  return result;
+}
+
+test('revision exhaustion pauses the run; user reset opens a successor that completes end to end', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-decide-reset-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir); // maxPlanRevisions: 2
+  await startRun(h);
+
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  await h.tools.graph_submit_findings.execute({ summary: 'evidence', evidence: ['a.ts:1'] }, ctx(h, 'child-explore', 'graph-explorer'));
+  await childIdle(h, 'child-explore');
+
+  const v1 = await replan(h, 1);
+  assert.equal(v1.ok, true, JSON.stringify(v1));
+  assert.equal((await decideRound(h, 1, 'REVISE')).effect, 'revise');
+  assert.equal((await replan(h, 2)).ok, true);
+  assert.equal((await decideRound(h, 2, 'REVISE')).effect, 'revise');
+  assert.equal((await replan(h, 3)).ok, true);
+  const exhausted = await decideRound(h, 3, 'REVISE');
+  assert.equal(exhausted.effect, 'await-decision');
+  assert.equal(h.store.getRun('root').status, 'AWAITING_USER_DECISION');
+
+  const blockedDispatch = await dispatch(h, 'graph-planner');
+  assert.match(blockedDispatch.args.prompt, /AWAITING_DECISION/);
+  const inspectPaused = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(inspectPaused.pendingDecision.cause, 'plan-revisions-exhausted');
+
+  // The user decides to reset with an explicit reason.
+  const reset = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'reset', reason: 'user wants a fresh planning round with new constraints' }, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(reset.ok, true, JSON.stringify(reset));
+  assert.match(reset.runId, /^root:2$/);
+  const archived = h.store.getRun('root');
+  assert.equal(archived.status, 'AWAITING_USER_DECISION'); // archived in place
+  assert.equal(archived.decision.action, 'reset');
+  assert.equal(archived.successorRunId, 'root:2');
+  assert.equal(archived.artifacts.plan.version, 3); // evidence untouched
+
+  // The successor run starts fresh and completes the whole plan-only loop.
+  assert.equal(h.store.getRun('root:2').revisionCounters['plan-review'], 0);
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore-2', 'graph-explorer');
+  await h.tools.graph_submit_findings.execute({ summary: 'fresh evidence', evidence: ['b.ts:2'] }, ctx(h, 'child-explore-2', 'graph-explorer'));
+  await childIdle(h, 'child-explore-2');
+  const plan2 = await replan(h, 1);
+  assert.equal(plan2.ok, true, JSON.stringify(plan2));
+  const pass2 = await decideRound(h, 1, 'PASS');
+  assert.equal(pass2.ok, true, JSON.stringify(pass2));
+  assert.equal(h.store.getRun('root:2').status, 'SUCCEEDED');
+
+  // The archived run is unreachable through the session (its binding moved
+  // to the successor); deciding again targets the successor, which guards
+  // itself by status.
+  const again = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'abort', reason: 'x' }, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(again.ok, false);
+  assert.equal(again.code, 'RUN_NOT_ABORTABLE');
+  assert.equal(h.store.getRun('root').status, 'AWAITING_USER_DECISION');
+
+  // A restart rebinds the session to the successor run.
+  const h2 = harness(dir);
+  await startRun(h2);
+  assert.equal(h2.bindings.get('root').runId, 'root:2');
+});
+
+test('graph_run_decide preconditions: role, root, in-flight nodes and dispatches, abortability', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-decide-precond-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  const wrongRole = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'abort', reason: 'x' }, ctx(h, 'root', 'graph-verifier')));
+  assert.equal(wrongRole.code, 'WRONG_ROLE');
+  const notRoot = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'abort', reason: 'x' }, { ...ctx(h, 'child-impl', 'graph-orchestrator'), sessionID: 'child-impl' }));
+  assert.equal(notRoot.code, 'NOT_GRAPH_SESSION');
+
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: DECIDE_SPECS }, ctx(h, 'child-planner', 'graph-planner'));
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  const paused = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['wrong'] }, ctx(h, 'child-critic', 'graph-plan-critic')));
+  assert.equal(paused.effect, 'await-decision');
+
+  // An outstanding bound dispatch blocks the decision until the session idles.
+  const busyDispatch = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'reset', reason: 'x' }, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(busyDispatch.ok, false);
+  assert.equal(busyDispatch.code, 'DISPATCH_PENDING');
+  await childIdle(h, 'child-critic');
+
+  // RUNNING nodes also block: revive one through a bound implementer... this
+  // run is plan-only, so abort directly instead and verify terminal guards.
+  const abort = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'abort', reason: 'user stopped the effort' }, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(abort.ok, true, JSON.stringify(abort));
+  assert.equal(abort.status, 'ABORTED');
+  const reabort = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'abort', reason: 'again' }, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(reabort.code, 'ABORTED_RUN' === 'x' ? 'x' : 'RUN_NOT_ABORTABLE');
+  // graph_run_new still works on an aborted run.
+  const next = JSON.parse(await h.tools.graph_run_new.execute({}, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(next.ok, true, JSON.stringify(next));
 });

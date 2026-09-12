@@ -4,7 +4,7 @@ import { JOURNAL_STAGE_ERRORS, safeJournalStage } from './journal-errors.mjs';
 const z = tool.schema;
 const READ_ROLES = new Set(['graph-orchestrator', 'graph-explorer', 'graph-planner', 'graph-plan-critic']);
 const ORCHESTRATOR = new Set(['graph-orchestrator']);
-const TERMINAL_STATUSES = new Set(['SUCCEEDED', 'FAILED']);
+const TERMINAL_STATUSES = new Set(['SUCCEEDED', 'FAILED', 'ABORTED']);
 const ID = /^[a-f0-9]{64}$/;
 const SAFE_SERVICE_CODES = new Set([
   'JOURNAL_DISABLED',

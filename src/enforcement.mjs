@@ -77,13 +77,12 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     } else {
       state = await store.loadRun(sessionID);
       if (state) {
-        // A terminal run may have an explicit successor started through
-        // graph_run_new; follow the recorded chain so a restart rebinds to
-        // the newest run of this session instead of the finished one.
-        for (let hops = 0; hops < 16 && (state.status === 'SUCCEEDED' || state.status === 'FAILED'); hops += 1) {
-          const successorId = state.successorRunId;
-          if (typeof successorId !== 'string' || !successorId.length) break;
-          const successor = await store.loadRun(successorId);
+        // A run may have an explicit successor started through graph_run_new
+        // or a user reset decision; follow the recorded chain so a restart
+        // rebinds to the newest run of this session, whatever the archived
+        // status of its predecessors is.
+        for (let hops = 0; hops < 32 && typeof state.successorRunId === 'string' && state.successorRunId.length; hops += 1) {
+          const successor = await store.loadRun(state.successorRunId);
           if (!successor) break;
           state = successor;
         }

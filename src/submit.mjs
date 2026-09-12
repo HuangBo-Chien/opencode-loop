@@ -211,7 +211,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
   });
 
   const graph_run_new = tool({
-    description: 'Orchestrator starts a fresh gated run in this session after the previous run reached a terminal state (SUCCEEDED/FAILED). Write journal insights for the finished run first; the new run starts empty.',
+    description: 'Orchestrator starts a fresh gated run in this session after the previous run reached a terminal state (SUCCEEDED/FAILED/ABORTED). Write journal insights for the finished run first; the new run starts empty.',
     args: {},
     async execute(_args, context) {
       const wrong = requireRole(context, 'graph-orchestrator');
@@ -220,8 +220,8 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (!binding?.root) return rejected('NOT_GRAPH_SESSION', 'only the root orchestrator of this session may start a new run');
       const state = store.getRun(binding.runId);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
-      if (state.status !== 'SUCCEEDED' && state.status !== 'FAILED') {
-        return rejected('RUN_NOT_TERMINAL', `the current run is ${state.status}; finish or recover it before starting a new one`);
+      if (state.status !== 'SUCCEEDED' && state.status !== 'FAILED' && state.status !== 'ABORTED') {
+        return rejected('RUN_NOT_TERMINAL', `the current run is ${state.status}; finish, recover or decide it first`);
       }
       dispatches?.invalidate(state.runId);
       let runId = null;
@@ -251,7 +251,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (!binding?.root) return rejected('NOT_GRAPH_SESSION', 'only the orchestrator of this run may resume it');
       const state = store.getRun(binding.runId);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
-      if (state.status !== 'SUCCEEDED' && state.status !== 'FAILED') dispatches?.invalidate(state.runId);
+      if (state.status !== 'SUCCEEDED' && state.status !== 'FAILED' && state.status !== 'ABORTED') dispatches?.invalidate(state.runId);
       const resume = runner.resumeRun(state, { now: NOW() });
       if (!resume.ok) return rejected(resume.code, resume.detail);
       // Auto-reconcile: recovery-required nodes return to PENDING with a
@@ -273,9 +273,57 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
     },
   });
 
+  const graph_run_decide = tool({
+    description: 'Orchestrator delivers the user\'s decision for a run paused by exhaustion (AWAITING_USER_DECISION) or deliberately rotates/terminates a run. action="abort" irreversibly marks the run ABORTED (all findings, plans, reviews, violations and dispatch history preserved; dispatch closed). action="reset" archives the run in place (decision + successorRunId, original status and evidence untouched) and starts a fresh successor run with reset counters that re-walks the explorer → planner → critic gates without replaying any implementer work or side effects. A user-provided reason is required; native permission ask enforces user confirmation.',
+    args: {
+      action: z.enum(['reset', 'abort']),
+      reason: z.string().min(1).max(2000),
+    },
+    async execute(args, context) {
+      const wrong = requireRole(context, 'graph-orchestrator');
+      if (wrong) return wrong;
+      const binding = bindings.get(context.sessionID);
+      if (!binding?.root) return rejected('NOT_GRAPH_SESSION', 'only the root orchestrator of this run may deliver a user decision');
+      const state = store.getRun(binding.runId);
+      if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
+      if (state.successorRunId) return rejected('RUN_SUPERSEDED', `this run was already reset; its successor ${state.successorRunId} owns the session now`);
+      const running = Object.values(state.nodes).filter((node) => node.state === 'RUNNING');
+      if (running.length) return rejected('RUN_BUSY', `nodes are still in flight: ${running.map((node) => node.spec.id).join(', ')}; let them finish or idle first`);
+      const outstanding = dispatches ? dispatches.inspect(state.runId) : [];
+      if (outstanding.length) return rejected('DISPATCH_PENDING', 'task dispatches are still registered for this run; wait for their sessions to finish first');
+
+      if (args.action === 'abort') {
+        if (state.status === 'SUCCEEDED') return rejected('RUN_NOT_ABORTABLE', 'a succeeded run has nothing to abort');
+        if (state.status === 'ABORTED') return rejected('RUN_NOT_ABORTABLE', 'this run is already aborted');
+        dispatches?.invalidate(state.runId);
+        runner.abortRun(state, { reason: args.reason, now: NOW() });
+        await store.saveRun(state);
+        return reply({ ok: true, action: 'abort', runId: state.runId, status: state.status,
+          next: 'report the preserved evidence and the user reason back to the user; no further dispatch is possible' });
+      }
+
+      dispatches?.invalidate(state.runId);
+      let runId = null;
+      for (let counter = 2; counter <= 99; counter += 1) {
+        const candidate = `${state.rootSessionId}:${counter}`;
+        if (store.loadRun && await store.loadRun(candidate)) continue;
+        runId = candidate;
+        break;
+      }
+      if (!runId) return rejected('RUN_LIMIT', 'this session reached its successor-run limit');
+      await store.createRun({ runId, rootSessionId: state.rootSessionId, now: NOW(), request: null, requestCaptureCompleted: true });
+      runner.archiveForReset(state, { reason: args.reason, successorRunId: runId, now: NOW() });
+      await store.saveRun(state);
+      bindings.set(context.sessionID, { runId, agent: context.agent, nodeId: null, root: true });
+      return reply({ ok: true, action: 'reset', runId,
+        previousRun: { runId: state.runId, status: state.status, decision: state.decision },
+        next: 'dispatch read-only exploration/planning for the new goal; counters start fresh, gates re-apply and no side effects are replayed' });
+    },
+  });
+
   const definitions = {
       graph_submit_plan, graph_submit_review, graph_submit_change, graph_submit_verification,
-      graph_submit_findings, graph_inspect, graph_run_resume, graph_run_new,
+      graph_submit_findings, graph_inspect, graph_run_resume, graph_run_new, graph_run_decide,
   };
   const tools = Object.fromEntries(Object.entries(definitions).map(([name, definition]) => [name, !dispatches ? definition : {
     ...definition,

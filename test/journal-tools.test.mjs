@@ -288,10 +288,13 @@ test('insight and promotion require the root orchestrator, and insight requires 
   state = { ...state, status: 'FAILED' };
   assert.equal((await execute(tools.graph_journal_write_insight, insightArgs, 'root', 'graph-orchestrator')).ok, true);
   assert.equal(writes, 1);
+  state = { ...state, status: 'ABORTED' };
+  assert.equal((await execute(tools.graph_journal_write_insight, insightArgs, 'root', 'graph-orchestrator')).ok, true);
+  assert.equal(writes, 2);
   state = { ...state, status: 'SUCCEEDED' };
   assert.equal((await execute(tools.graph_journal_write_insight, insightArgs, 'root', 'graph-orchestrator')).ok, true);
   assert.equal((await execute(tools.graph_journal_promote, promoteArgs, 'root', 'graph-orchestrator')).ok, true);
-  assert.equal(writes, 2);
+  assert.equal(writes, 3);
   assert.equal(promotions, 1);
 });
 

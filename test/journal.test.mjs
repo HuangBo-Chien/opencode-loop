@@ -366,7 +366,7 @@ test('projection does not inspect malformed list items beyond its cap', async (t
 
 test('nonterminal and disabled services do not project run summaries', async (t) => {
   const { worktree, runStore, store, service } = await serviceWithRealStore(t);
-  for (const status of ['RUNNING', 'BLOCKED', 'RECOVERY_REQUIRED']) {
+  for (const status of ['RUNNING', 'BLOCKED', 'RECOVERY_REQUIRED', 'AWAITING_USER_DECISION']) {
     await service.projectRun(terminalRun({ runId: `run-${status.toLowerCase()}`, status }));
   }
   const disabled = createJournalService({
@@ -379,6 +379,20 @@ test('nonterminal and disabled services do not project run summaries', async (t)
   await disabled.projectRun(terminalRun({ runId: 'run-disabled' }));
 
   assert.deepEqual(await store.list('project'), []);
+});
+
+test('ABORTED runs project a terminal summary with the user decision reason', async (t) => {
+  const { worktree, store, service } = await serviceWithRealStore(t);
+  const state = terminalRun({ runId: 'run-aborted', status: 'ABORTED', request: null });
+  state.failReason = 'aborted by user: requirements changed';
+
+  await service.projectRun(state);
+
+  const entry = await store.read('project', summaryId(worktree, state.runId));
+  assert.ok(entry, 'aborted run must project a run summary');
+  assert.equal(entry.metadata.status, 'ABORTED');
+  assert.ok(entry.tags.includes('ABORTED'));
+  assert.equal(entry.metadata.failReason, 'aborted by user: requirements changed');
 });
 
 test('repeated and concurrent projection publishes one identical entry', async (t) => {

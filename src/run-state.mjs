@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { cleanJson } from './json-safe.mjs';
 import { validateFileClaim } from './task-spec.mjs';
 export const SCHEMA_VERSION = 2;
-export const RUN_STATUSES = Object.freeze(['RUNNING', 'BLOCKED', 'FAILED', 'SUCCEEDED', 'RECOVERY_REQUIRED']);
+export const RUN_STATUSES = Object.freeze(['RUNNING', 'BLOCKED', 'FAILED', 'SUCCEEDED', 'RECOVERY_REQUIRED', 'AWAITING_USER_DECISION', 'ABORTED']);
 export const NODE_STATES = Object.freeze(['PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'SKIPPED', 'STALE', 'INCOMPLETE', 'RECOVERY_REQUIRED']);
 export const ARTIFACT_STATUSES = Object.freeze(['valid', 'stale', 'superseded']);
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;

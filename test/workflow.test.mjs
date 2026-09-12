@@ -35,6 +35,7 @@ test('native permissions restrict writes, delegation and submit tools by role', 
     assert.equal(p.graph_submit_verification ?? p['*'], name === 'graph-verifier' ? 'allow' : 'deny');
     assert.equal(p.graph_run_resume ?? p['*'], name === 'graph-orchestrator' ? 'allow' : 'deny');
     assert.equal(p.graph_run_new ?? p['*'], name === 'graph-orchestrator' ? 'allow' : 'deny');
+    assert.equal(p.graph_run_decide ?? p['*'], name === 'graph-orchestrator' ? 'ask' : 'deny');
     assert.equal(p.graph_journal_search ?? p['*'], journalReaders.has(name) ? 'allow' : 'deny');
     assert.equal(p.graph_journal_read ?? p['*'], journalReaders.has(name) ? 'allow' : 'deny');
     assert.equal(p.graph_journal_write_insight ?? p['*'], name === 'graph-orchestrator' ? 'allow' : 'deny');

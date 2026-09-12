@@ -15,7 +15,7 @@ import { matchScopePath, normalizeScopePath, validateFileClaim } from './task-sp
 const READ_ONLY_AGENTS = new Set(['graph-explorer', 'graph-multimodal', 'graph-planner', 'graph-plan-critic']);
 const WRITE_AGENTS = new Set(['graph-implementer', 'graph-verifier']);
 const ELIGIBLE_STATES = new Set(['PENDING', 'INCOMPLETE', 'STALE']);
-const TERMINAL_RUN = new Set(['FAILED', 'SUCCEEDED']);
+const TERMINAL_RUN = new Set(['FAILED', 'SUCCEEDED', 'ABORTED']);
 
 function nodeMaxAttempts(node, fallback) {
   return Number.isInteger(node.spec.maxAttempts) ? node.spec.maxAttempts : fallback;
@@ -54,13 +54,31 @@ export function depsSatisfied(state, node) {
   return { ok: missing.length === 0, missing };
 }
 
-function failRun(state, reason, now) {
-  state.status = 'FAILED';
-  state.failReason = reason;
+// Exhaustion and fundamental rejection no longer fail the run silently: the
+// run pauses for an explicit user decision (graph_run_decide). Nodes, attempt
+// counters, artifacts and violations stay exactly as they were for audit.
+function pauseForDecision(state, cause, detail, now) {
+  state.status = 'AWAITING_USER_DECISION';
+  state.pendingDecision = { cause, detail, at: now };
   state.blockedReason = null;
-  for (const node of Object.values(state.nodes)) {
-    if (node.state === 'RUNNING' || node.state === 'PENDING' || node.state === 'INCOMPLETE' || node.state === 'STALE') node.state = 'SKIPPED';
-  }
+  state.updatedAt = now;
+}
+
+// Irreversible user termination. Evidence is preserved untouched; only the
+// status, the reason and the decision record change.
+function abortRun(state, { reason, now }) {
+  state.status = 'ABORTED';
+  state.failReason = `aborted by user: ${reason}`;
+  state.blockedReason = null;
+  state.decision = { action: 'abort', reason, at: now };
+  state.updatedAt = now;
+}
+
+// Reset archives the run in place: original status, pendingDecision and all
+// evidence remain; the successor link transfers session ownership.
+function archiveForReset(state, { reason, successorRunId, now }) {
+  state.decision = { action: 'reset', reason, at: now };
+  state.successorRunId = successorRunId;
   state.updatedAt = now;
 }
 
@@ -93,7 +111,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
     if (chosen.attempt >= nodeMaxAttempts(chosen, maxAttempts)) {
       chosen.state = 'FAILED';
       chosen.finishedAt = now;
-      if (WRITE_AGENTS.has(agent)) failRun(state, `${chosen.spec.id} exhausted its attempt budget`, now);
+      pauseForDecision(state, 'attempt-budget-exhausted', `${chosen.spec.id} exhausted its attempt budget`, now);
       return { allowed: false, code: 'ATTEMPTS_EXHAUSTED', detail: `${chosen.spec.id} has no attempts left` };
     }
     return { allowed: true, nodeId: chosen.spec.id, reconcile: chosen.reconcile === true || state.sideEffects.some((effect) => effect.nodeId === chosen.spec.id) };
@@ -105,6 +123,10 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
     }
     if (state.status === 'RECOVERY_REQUIRED') {
       return { allowed: false, code: 'RECOVERY_REQUIRED', detail: 'run needs graph_run_resume before further dispatch' };
+    }
+    if (state.status === 'AWAITING_USER_DECISION') {
+      const pending = state.pendingDecision;
+      return { allowed: false, code: 'AWAITING_DECISION', detail: pending ? `run is awaiting a user decision (${pending.cause}: ${pending.detail}); report to the user and use graph_run_decide to reset or abort` : 'run is awaiting a user decision; use graph_run_decide to reset or abort' };
     }
     if (state.status === 'BLOCKED') {
       return { allowed: false, code: 'RUN_BLOCKED', detail: state.blockedReason ? `${state.blockedReason.kind}: ${state.blockedReason.detail}` : 'run is blocked' };
@@ -176,7 +198,10 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
   }
 
   function submitPlan(state, { intent, nodes, basedOn = [], parallel = null, now }) {
-    if (state.status === 'FAILED' || state.status === 'SUCCEEDED') return { ok: false, code: 'RUN_TERMINATED', detail: state.failReason ?? 'run already finished' };
+    if (TERMINAL_RUN.has(state.status)) return { ok: false, code: 'RUN_TERMINATED', detail: state.failReason ?? 'run already finished' };
+    if (state.status === 'AWAITING_USER_DECISION') {
+      return { ok: false, code: 'AWAITING_DECISION', detail: 'the run is paused awaiting a user decision; deliver it with graph_run_decide before replacing the plan' };
+    }
     if (intent !== 'plan-only' && intent !== 'change') return { ok: false, code: 'INVALID_INTENT', detail: 'intent must be plan-only or change' };
     if (!(nodes instanceof Map) || nodes.size < 1) return { ok: false, code: 'INVALID_GRAPH', detail: 'nodes must be a non-empty validated graph' };
     const previous = state.artifacts.plan;
@@ -236,22 +261,24 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
     if (verdict === 'REVISE') {
       state.revisionCounters['plan-review'] += 1;
       state.artifacts.review = { kind: 'review', nodeId: reviewNode.spec.id, version, basedOn: [`plan@${planVersion}`], payload: { verdict, findings }, status: 'superseded', createdAt: now };
-      if (state.revisionCounters['plan-review'] > maxPlanRevisions) {
-        failRun(state, 'plan revisions exhausted (maxPlanRevisions reached)', now);
-        return { ok: true, effect: 'run-failed', detail: 'plan revisions exhausted' };
-      }
       plan.status = 'superseded';
       reviewNode.state = 'PENDING';
       reviewNode.finishedAt = now;
       const planner = Object.values(state.nodes).find((node) => node.spec.kind === 'plan');
       if (planner) planner.state = 'PENDING';
+      if (state.revisionCounters['plan-review'] > maxPlanRevisions) {
+        pauseForDecision(state, 'plan-revisions-exhausted', `plan revisions exhausted (maxPlanRevisions=${maxPlanRevisions} reached)`, now);
+        return { ok: true, effect: 'await-decision', detail: 'plan revisions exhausted; awaiting user decision' };
+      }
       state.updatedAt = now;
       return { ok: true, effect: 'revise' };
     }
     if (verdict === 'FAIL') {
       state.artifacts.review = { kind: 'review', nodeId: reviewNode.spec.id, version, basedOn: [`plan@${planVersion}`], payload: { verdict, findings }, status: 'valid', createdAt: now };
-      failRun(state, findings.length ? `plan rejected by critic: ${findings[0]}` : 'plan rejected by critic', now);
-      return { ok: true, effect: 'run-failed' };
+      reviewNode.state = 'PENDING';
+      reviewNode.finishedAt = now;
+      pauseForDecision(state, 'plan-rejected-by-critic', findings.length ? `plan rejected by critic: ${findings[0]}` : 'plan rejected by critic', now);
+      return { ok: true, effect: 'await-decision', detail: 'plan rejected by critic; awaiting user decision' };
     }
     return { ok: false, code: 'INVALID_VERDICT', detail: 'verdict must be PASS, REVISE or FAIL' };
   }
@@ -397,8 +424,8 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
       node.state = 'PENDING';
       node.finishedAt = now;
       if (state.revisionCounters['implement-verify'] >= maxAttempts) {
-        failRun(state, 'verification repair loop exhausted (maxAttempts reached)', now);
-        return { ok: true, effect: 'run-failed', detail: 'verification repair loop exhausted' };
+        pauseForDecision(state, 'verification-repair-exhausted', 'verification repair loop exhausted (maxAttempts reached)', now);
+        return { ok: true, effect: 'await-decision', detail: 'verification repair loop exhausted; awaiting user decision' };
       }
       const repairs = node.spec.dependsOn.map((dep) => state.nodes[dep]).filter((dep) => dep && dep.spec.kind === 'implement');
       for (const repair of repairs) {
@@ -433,7 +460,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
     node.finishedAt = now;
     if (node.attempt >= nodeMaxAttempts(node, maxAttempts)) {
       node.state = 'FAILED';
-      failRun(state, `${nodeId} never delivered a structured submission within its attempt budget`, now);
+      pauseForDecision(state, 'attempt-budget-exhausted', `${nodeId} never delivered a structured submission within its attempt budget`, now);
     }
     state.updatedAt = now;
     return { changed: true };
@@ -443,6 +470,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
   // counters, and never blindly redo recorded side effects.
   function resumeRun(state, { now }) {
     if (TERMINAL_RUN.has(state.status)) return { ok: false, code: 'RUN_TERMINATED', changed: false };
+    if (state.status === 'AWAITING_USER_DECISION') return { ok: false, code: 'AWAITING_DECISION', changed: false };
     const report = { recovered: [], recoveryRequired: [] };
     for (const node of Object.values(state.nodes)) {
       if (node.state === 'RUNNING') {
@@ -523,6 +551,9 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
     const mermaid = ['graph TD', ...nodes.map((node) => `  ${node.id}["${node.id} · ${node.kind} · ${node.state}${node.attempt ? ` · try ${node.attempt}` : ''}"]`), ...edges.map(([from, to]) => `  ${from} --> ${to}`)].join('\n');
     return {
       runId: state.runId, status: state.status, mode: state.mode, failReason: state.failReason,
+      pendingDecision: state.pendingDecision ?? null,
+      decision: state.decision ?? null,
+      successorRunId: state.successorRunId ?? null,
       blockedReason: state.blockedReason, revisionCounters: state.revisionCounters,
       nodes, artifacts: Object.entries(state.artifacts).map(([name, artifact]) => ({ name, kind: artifact.kind, version: artifact.version, status: artifact.status, basedOn: artifact.basedOn })),
       violations: state.violations.slice(-20), sideEffectCount: state.sideEffects.length, mermaid,
@@ -532,5 +563,6 @@ export function createRunner({ maxAttempts, maxPlanRevisions }) {
   return Object.freeze({
     admitDispatch, beginNode, attachSession, submitPlan, submitReview, checkChange, submitChange, submitVerification,
     recordSideEffect, recordViolation, captureRequest, completeRequestCapture, markIncomplete, resumeRun, reconcileNode, revalidateArtifacts, inspect,
+    abortRun, archiveForReset,
   });
 }

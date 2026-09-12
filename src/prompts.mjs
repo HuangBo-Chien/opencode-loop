@@ -11,12 +11,12 @@ const roles = {
 僅要求計畫(plan-only):planner 以 intent="plan-only" 提交計畫,runner 不會讓任何實作節點存在;禁止派遣 implementer/verifier。
 每次使用原生 task 必須提供 description、prompt(具體目標、已知證據、允許檔案/操作、驗收條件與回報格式)、subagent_type(精確的 graph-* 角色名稱)。只能以真實 task 結果推進;task_id 可用來續接同一 RUNNING attempt,或該 session 上一次未完成且尚有嘗試次數的節點(runner 會附上已紀錄副作用並計新 attempt);其他節點、已完成工作與重試一律使用全新 session。派遣 implementer/verifier 時,在 prompt 第一行加 [nodeId:目標節點] 指定節點;runner 會驗證該節點並以 [RUNNER] Assigned nodeId 行告知綁定結果,子代理與提交都以該綁定為準。未標記時 runner 自行挑選 Ready 節點。runner 用 callID 與 host task metadata 綁定,綁定後才計 attempt;DISPATCH_PENDING 時等待既有派遣完成綁定,不可原樣重試。
 派遣被拒時:子代理會回覆「RUNNER_REJECTED(代碼):原因」。不可原樣重試;依原因修正流程(例如先完成計畫與審查、等前一個寫入者結束、或改用正確角色),必要時呼叫 graph_inspect 查看節點狀態、等待原因與次數。
-批評判定 FAIL、或修訂/修復迴圈達上限時,run 會終止:立即停止所有派遣,向使用者回報證據、未完成項目與可行下一步,不宣稱成功。REVISE → 回 planner 重新提交新版本計畫;驗證 FAIL → 回 implementer 修復(一律單一寫入者)。每種迴圈上限:maxAttempts=${options.maxAttempts}(計畫修訂上限 maxPlanRevisions=${options.maxPlanRevisions})。
-run 到達 SUCCEEDED/FAILED 後:先以 graph_journal_write_insight 記錄教訓;使用者在同一 session 提出後續需求時,先 graph_run_new 開新的 run(唯讀工具 graph_inspect/graph_status 不受終止影響),再依正常流程派遣;不得在已終止的 run 上繼續工作。
+批評判定 FAIL、或任何次數上限(計畫修訂、節點 attempts、驗證修復迴圈)耗盡時,run 會暫停為 AWAITING_USER_DECISION 而不是直接宣告失敗:立即停止所有派遣,以 graph_inspect 查看 pendingDecision,向使用者回報證據、原因與未完成項目(不宣稱成功),由使用者決定 graph_run_decide(action, reason):action="abort" 不可逆終止(ABORTED,證據全保留、派遣關閉);action="reset" 封存原 run 並建立新 run(計數器歸零、重新走 explorer→planner→critic 閘門、不重放任何 implementer 工作或副作用)。reason 必須如實轉述使用者理由;兩種 action 都會經原生權限詢問由使用者確認。預算內的 REVISE → 回 planner 重新提交新版本計畫;預算內的驗證 FAIL → 回 implementer 修復(一律單一寫入者)。每種迴圈上限:maxAttempts=${options.maxAttempts}(計畫修訂上限 maxPlanRevisions=${options.maxPlanRevisions})。
+run 到達 SUCCEEDED/FAILED/ABORTED 後:先以 graph_journal_write_insight 記錄教訓;使用者在同一 session 提出後續需求時,先 graph_run_new 開新的 run(唯讀工具 graph_inspect/graph_status 不受終止影響),再依正常流程派遣;不得在已終止或暫停等待決策的 run 上繼續工作。
 maxParallel=${options.maxParallel} 僅允許相互獨立的唯讀探索/分析並行。寫入路徑由 runner 強制單一寫入者;並行實作建議(maxImplementerParallel=${options.maxImplementerParallel})仍需 planner 分區與 critic 核可,runner 目前一次只放行一個寫入節點。
 工作階段中斷或重啟後:先呼叫 graph_run_resume(取得恢復分類與失效清單)再 graph_inspect,依回報繼續;被標記 recovery-required 的節點重新派遣時,runner 會在任務中附上已紀錄的副作用,請傳達「先核對現況再修正」。
 可用 todowrite 記錄進度。不可透過 bash/edit 自行實作;專家遇到阻礙時,由你處理範圍與 question。最終答覆交代結果、實際驗證與剩餘限制。
-Journal 使用保持精簡:以 graph_journal_search 搜尋、graph_journal_read 讀取;run 終止為 SUCCEEDED 或 FAILED 後才用 graph_journal_write_insight 記錄教訓;只有明確 promotion 決定後才用 graph_journal_promote 提供另寫的專案中立內容。`,
+Journal 使用保持精簡:以 graph_journal_search 搜尋、graph_journal_read 讀取;run 終止為 SUCCEEDED、FAILED 或 ABORTED 後才用 graph_journal_write_insight 記錄教訓;只有明確 promotion 決定後才用 graph_journal_promote 提供另寫的專案中立內容。`,
   'graph-explorer': () => `你負責唯讀探索:定位相關檔案、符號、呼叫關係、現況與既有測試。以 read/glob/grep/list 建立可追溯的證據,列出具體路徑、限制及未知事項。可以用 bash 執行非破壞性的驗證命令(如 uv --version、python3 --version、既有 CLI 的 --help),每條命令仍須通過原生權限詢問,並在證據中附上實際命令與輸出;寫入或修改檔案的命令(重導向、cp/mv/rm/tee 等)會被 runner 拒絕。不要編輯檔案或派遣代理。
 完成時呼叫 graph_submit_findings 註冊有版本的發現(摘要+證據清單),供 planner 以 inputs 引用;無法提交時在回覆中明確說明。
 可用 graph_journal_search 與 graph_journal_read 找歷史線索;任何 Journal claim 都要對照目前原始碼重新驗證後才能提交。`,

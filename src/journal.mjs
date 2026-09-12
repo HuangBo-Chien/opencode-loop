@@ -3,7 +3,7 @@ import { JOURNAL_SCHEMA_VERSION, stableJournalId } from './journal-store.mjs';
 import { sanitizeJournalText } from './journal-text.mjs';
 import { safeJournalStage } from './journal-errors.mjs';
 
-const TERMINAL_STATUSES = new Set(['SUCCEEDED', 'FAILED']);
+const TERMINAL_STATUSES = new Set(['SUCCEEDED', 'FAILED', 'ABORTED']);
 const MAX_REQUEST_CHARS = 8000;
 const MAX_BODY_CHARS = 32_000;
 const MAX_TITLE_CHARS = 512;

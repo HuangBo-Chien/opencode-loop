@@ -1,6 +1,6 @@
 # opencode-loop
 
-`0.3.0-alpha.3` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
+`0.3.0-alpha.4` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
 
 ## How the gate works
 
@@ -9,7 +9,7 @@ The model proposes; the runner decides. Every hook decision is persisted to a ru
 | Gate | Mechanism |
 | --- | --- |
 | Implementer/verifier may only be dispatched when a plan passed review | `tool.execute.before` on `task` consults the runner; illegal dispatches are rewritten into an explicit `RUNNER_REJECTED` child turn (soft block — the child session still spawns, reports the rejection, and burns no work) |
-| Critic `FAIL` terminates the run; nothing may be dispatched afterwards | Runner verdict table: PASS advances, REVISE returns to the planner (capped by `maxPlanRevisions`), FAIL fails the run, UNVERIFIED blocks it honestly |
+| Exhaustion and rejection pause the run for an explicit user decision; nothing may be dispatched while paused | Runner verdict table: PASS advances, REVISE returns to the planner (capped by `maxPlanRevisions`), FAIL and every exhausted budget (plan revisions, node attempts, the verification repair loop) move the run to `AWAITING_USER_DECISION` with a recorded `pendingDecision` cause; UNVERIFIED blocks it honestly. The user then decides through `graph_run_decide` (native `ask`): **abort** marks the run irreversibly `ABORTED` (terminal, all evidence preserved), **reset** archives the run in place and opens a fresh successor run |
 | Writes stay inside the assigned `writeScope` | `permission.ask` denies out-of-scope `edit` **and `write`** (and implementer `bash` without `allowShell`) for bound graph sessions before execution; violations are recorded. For `allowShell` implementers and read-only specialists, a best-effort static screen also rejects shell commands whose write targets (redirections, `tee`/`cp`/`mv`/`rm`/`dd of=`/`sed -i`/`truncate`/heredocs) resolve inside the workspace but outside the allowed scope |
 | `testsPassed`-style claims are not trusted | Verdicts travel only through `graph_submit_*` tools; `PASS` requires at least one cited command with `exitCode 0`, and change submissions are cross-checked against the runner's own edit ledger (undisclosed files fail the node) |
 | Reviews and verifications bind to versions | A review targets `plan@v`; a resubmitted plan supersedes the old PASS. Verifications bind change versions plus file-hash snapshots; on resume, drifted hashes mark stale evidence and its node `STALE` |
@@ -45,7 +45,8 @@ Work packages are `TaskSpec` nodes (`id`, `kind`, `agent`, `dependsOn`, `inputs`
 - The critic is never freely admitted: its verdict can only travel through a bound review node, so when the review node exists but is not yet admissible the dispatch is rejected up front with `NO_READY_NODE` and the waiting reasons (plus the artifact-naming hint when an input references a name nothing produces) instead of stranding a child session that could never submit. Explorer, planner and multimodal keep free consultation because their findings/plan submissions do not require a node binding.
 - `task_id` may continue the same active RUNNING attempt and role in the same run without charging another attempt. It may also **resume the unfinished node the session last worked on** when that node is `INCOMPLETE`/`PENDING`/`STALE` with attempts left: a new attempt is charged, the recorded side-effect ledger travels with the dispatch, and the old inactive binding is superseded. Completed nodes, foreign sessions and exhausted attempts still require a fresh session (`FRESH_SESSION_REQUIRED`, and rejection messages name the bound node).
 - Read-only tools (`read`, `glob`, `grep`, `list`, `graph_status`, `graph_inspect`, `graph_journal_search`, `graph_journal_read`) are never collaterally blocked by the dispatch-binding gate. Rejected or finished children resolve the owning run through the host-verified parent chain, so inspection and journal history stay available even after a run reaches a terminal state. Write paths keep failing closed.
-- `graph_run_new` starts a successor run in the same orchestrator session once the current run is `SUCCEEDED` or `FAILED` (write journal insights first). The successor run id is `<session>:<n>`; the finished run records `successorRunId`, and a restart follows the chain so the orchestrator rebinds to the newest run instead of the terminal one.
+- `graph_run_decide(action, reason)` delivers the user's decision for a run paused at `AWAITING_USER_DECISION` (or deliberately rotates/terminates a quiet run). A user-provided reason is required, and native permission `ask` means the host confirms with the human before the tool runs. **abort** irreversibly marks the run `ABORTED`: findings, plans, reviews, violations and dispatch history stay untouched, dispatch is closed (`RUN_TERMINATED`), and the terminal run projects a journal summary with the reason. **reset** archives the run in place — original status, `pendingDecision`, counters and evidence remain, plus a `decision` record and `successorRunId` — and creates a fresh successor run whose counters start at zero; it re-walks the explorer → planner → critic gates and never replays implementer work or recorded side effects. Both actions require no `RUNNING` nodes and no outstanding dispatch reservations first.
+- `graph_run_new` starts a successor run in the same orchestrator session once the current run is `SUCCEEDED`, `FAILED` or `ABORTED` (write journal insights first). The successor run id is `<session>:<n>`; the finished run records `successorRunId`, and a restart follows the chain (regardless of the archived predecessors' statuses) so the orchestrator rebinds to the newest run.
 - A reservation awaiting host metadata blocks another dispatch of that node/role (`DISPATCH_PENDING`) without consuming an attempt. Failed unbound task calls release their reservation.
 - Both foreground running metadata and completed **background** task metadata are supported. Pending continuations survive the preceding prompt's idle event. Host event IDs deduplicate repeated idle notifications; ID-less legacy notifications are consumed once per session and rely on terminal task events for additional completions.
 - Before child work, delayed metadata can be resolved through bounded host reads (64 parent messages, at most 256 parts per message, a 2-second request deadline). An unresolved session cannot silently bypass enforcement; it fails with `BINDING_UNAVAILABLE` until its relationship is established.
@@ -80,12 +81,12 @@ Global promotion never copies a project entry. It accepts only a project `insigh
 
 ## Project-local installation
 
-Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.3.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
+Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.4.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
 
 From the project where you want to use the plugin, install that local tarball:
 
 ```powershell
-npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.3.tgz
+npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.4.tgz
 node --input-type=module -e "import {pathToFileURL} from 'node:url'; import path from 'node:path'; console.log(pathToFileURL(path.resolve('node_modules/opencode-loop/src/index.mjs')).href)"
 ```
 
@@ -118,7 +119,7 @@ Consider adding the state directory to `.gitignore`. Start OpenCode in that proj
 
 | Agent | Mode | Responsibility | Submit tool | Additional native permission |
 | --- | --- | --- | --- | --- |
-| `graph-orchestrator` | primary | Route, dispatch, recover, summarize | `graph_run_resume`, `graph_run_new` | `task` only to the six specialists; `question`, `todowrite` allowed |
+| `graph-orchestrator` | primary | Route, dispatch, recover, summarize | `graph_run_resume`, `graph_run_new`, `graph_run_decide` (ask) | `task` only to the six specialists; `question`, `todowrite` allowed |
 | `graph-explorer` | subagent | Read source, gather versioned findings | `graph_submit_findings` | `bash` ask for non-mutating checks (workspace writes denied by the screen); `webfetch`, `websearch` ask |
 | `graph-planner` | subagent | Submit a validated task graph | `graph_submit_plan` | `webfetch`, `websearch` ask |
 | `graph-plan-critic` | subagent | Verdict bound to a plan version | `graph_submit_review` | `webfetch`, `websearch` ask |
