@@ -518,6 +518,65 @@ test('happy path: PASS chain completes the run and requires command evidence', a
   assert.equal(after.code, 'RUN_TERMINATED');
 });
 
+test('PASS over deliverable-backed implement nodes requires an artifact and stores evidence fields', async () => {
+  const specs = [
+    spec('explore-1', 'explore', 'graph-explorer', { outputs: ['findings'] }),
+    spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'], outputs: ['plan'] }),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'], outputs: ['review'] }),
+    spec('impl-1', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['src/a.ts'], deliverables: ['src/a.ts'], outputs: ['change:impl-1'] }),
+    spec('verify-1', 'verify', 'graph-verifier', { dependsOn: ['impl-1'], outputs: ['verification:verify-1'] }),
+  ];
+  const state = freshRun(validateTaskGraph(specs));
+  await dispatchCriticAndPass(state);
+  await dispatchImplementerAndSucceed(state, { snapshot: { 'src/a.ts': '1'.repeat(64) } });
+
+  const admit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  assert.equal(admit.allowed, true, JSON.stringify(admit));
+  runner.beginNode(state, admit.nodeId, { now: NOW, sessionId: 'sess-verify' });
+  const bare = runner.submitVerification(state, { nodeId: admit.nodeId, verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], now: NOW });
+  assert.equal(bare.ok, false, JSON.stringify(bare));
+  assert.equal(bare.code, 'ARTIFACT_REQUIRED');
+  assert.match(bare.detail, /impl-1/);
+  // A rejected verdict never mutated the node or the run.
+  assert.equal(state.nodes['verify-1'].state, 'RUNNING');
+
+  const rich = runner.submitVerification(state, {
+    nodeId: admit.nodeId, verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }],
+    artifacts: ['logs/run.log'], probed: ['malformed input rejected with 400'], skipped: ['concurrency n/a: single-threaded CLI'],
+    now: NOW,
+  });
+  assert.equal(rich.ok, true, JSON.stringify(rich));
+  assert.equal(state.status, 'SUCCEEDED');
+  const payload = state.artifacts['verification:verify-1'].payload;
+  assert.deepEqual(payload.artifacts, ['logs/run.log']);
+  assert.equal(payload.probed.length, 1);
+  assert.equal(payload.skipped.length, 1);
+  const counts = runner.inspect(state).artifacts.find((entry) => entry.name === 'verification:verify-1').counts;
+  assert.deepEqual(counts, { artifacts: 1, probed: 1, skipped: 1 });
+});
+
+test('change submissions store implementer-reported risks and inspect surfaces counts', async () => {
+  const state = freshRun();
+  await dispatchCriticAndPass(state);
+  const admit = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
+  assert.equal(admit.allowed, true, JSON.stringify(admit));
+  runner.beginNode(state, admit.nodeId, { now: NOW, sessionId: 'sess-impl' });
+  runner.recordSideEffect(state, { nodeId: admit.nodeId, tool: 'edit', target: 'src/a.ts', now: NOW });
+  const change = runner.submitChange(state, { nodeId: admit.nodeId, filesTouched: ['src/a.ts'], summary: 'fixed', risks: ['edge case: empty input still falls through'], snapshot: { 'src/a.ts': '1'.repeat(64) }, now: NOW });
+  assert.equal(change.ok, true, JSON.stringify(change));
+  assert.deepEqual(state.artifacts['change:impl-1'].payload.risks, ['edge case: empty input still falls through']);
+  const counts = runner.inspect(state).artifacts.find((entry) => entry.name === 'change:impl-1').counts;
+  assert.deepEqual(counts, { risks: 1 });
+});
+
+test('inspect surfaces learning counts on findings artifacts', () => {
+  const state = freshRun();
+  state.artifacts.findings = { kind: 'findings', nodeId: 'free', version: 1, basedOn: [], payload: { summary: 's', evidence: [], learnings: ['pitfall one', 'pitfall two'] }, status: 'valid', createdAt: NOW };
+  const counts = runner.inspect(state).artifacts.find((entry) => entry.name === 'findings').counts;
+  assert.deepEqual(counts, { learnings: 2 });
+});
+
+
 test('verification FAIL triggers a capped repair loop and supersedes the change', async () => {
   const state = freshRun();
   await dispatchCriticAndPass(state);

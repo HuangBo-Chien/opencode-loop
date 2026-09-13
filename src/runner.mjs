@@ -457,7 +457,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     return { ok: true, claimed: [...claimed] };
   }
 
-  function submitChange(state, { nodeId, filesTouched, filesDeleted = [], summary, checksRun = [], unresolved = [], snapshot = {}, now }) {
+  function submitChange(state, { nodeId, filesTouched, filesDeleted = [], summary, checksRun = [], unresolved = [], risks = [], snapshot = {}, now }) {
     const checked = checkChange(state, { nodeId, filesTouched, filesDeleted, now });
     if (!checked.ok) return checked;
     const node = state.nodes[nodeId];
@@ -473,7 +473,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     const previous = state.artifacts[name];
     const version = previous ? previous.version + 1 : 1;
     if (previous && previous.status === 'valid') previous.status = 'superseded';
-    state.artifacts[name] = { kind: 'change', nodeId, version, basedOn: [`review@${state.artifacts.review?.version ?? 1}`], payload: { filesTouched: checked.claimed, filesDeleted: [...new Set(filesDeleted)], summary, checksRun, unresolved }, snapshot, status: 'valid', createdAt: now };
+    state.artifacts[name] = { kind: 'change', nodeId, version, basedOn: [`review@${state.artifacts.review?.version ?? 1}`], payload: { filesTouched: checked.claimed, filesDeleted: [...new Set(filesDeleted)], summary, checksRun, unresolved, risks }, snapshot, status: 'valid', createdAt: now };
     node.state = 'SUCCEEDED';
     node.lastFailure = null;
     node.finishedAt = now;
@@ -496,7 +496,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     state.updatedAt = now;
   }
 
-  function submitVerification(state, { nodeId, verdict, commands = [], changeRefs = null, summary = '', snapshot = {}, now }) {
+  function submitVerification(state, { nodeId, verdict, commands = [], artifacts = [], probed = [], skipped = [], changeRefs = null, summary = '', snapshot = {}, now }) {
     if (TERMINAL_RUN.has(state.status)) return { ok: false, code: 'RUN_TERMINATED', detail: state.failReason ?? 'run already finished' };
     const node = state.nodes[nodeId];
     if (!node || node.spec.kind !== 'verify') return { ok: false, code: 'NOT_VERIFY_NODE', detail: `${nodeId} is not a verify node` };
@@ -505,6 +505,14 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     if (verdict === 'PASS') {
       if (!commands.length || commands.some((command) => command.exitCode !== 0)) {
         return { ok: false, code: 'INSUFFICIENT_EVIDENCE', detail: 'PASS requires at least one command and every exitCode must be 0' };
+      }
+      // Deliverable-backed work earns real-surface evidence: when any
+      // dependency implement node declared deliverables, PASS must cite at
+      // least one existing artifact path (log, output file, screenshot),
+      // not only a green command.
+      const deliverableDeps = node.spec.dependsOn.map((dep) => state.nodes[dep]).filter((dep) => dep && dep.spec.kind === 'implement' && Array.isArray(dep.spec.deliverables) && dep.spec.deliverables.length);
+      if (deliverableDeps.length && !artifacts.length) {
+        return { ok: false, code: 'ARTIFACT_REQUIRED', detail: `implement nodes with declared deliverables (${deliverableDeps.map((dep) => dep.spec.id).join(', ')}) require at least one artifact path (an existing evidence file) on PASS` };
       }
       const refs = changeRefs ?? node.spec.dependsOn.map((dep) => `change:${dep}@${state.artifacts[`change:${dep}`]?.version ?? 1}`);
       for (const ref of refs) {
@@ -515,7 +523,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       const previous = state.artifacts[name];
       const version = previous ? previous.version + 1 : 1;
       if (previous && previous.status === 'valid') previous.status = 'superseded';
-      state.artifacts[name] = { kind: 'verification', nodeId, version, basedOn: refs, payload: { verdict, commands, summary }, snapshot, status: 'valid', createdAt: now };
+      state.artifacts[name] = { kind: 'verification', nodeId, version, basedOn: refs, payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot, status: 'valid', createdAt: now };
       node.state = 'SUCCEEDED';
       node.finishedAt = now;
       completeIfDone(state, now);
@@ -533,7 +541,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       const version = previous ? previous.version + 1 : 1;
       if (previous && previous.status === 'valid') previous.status = 'superseded';
       const refs = node.spec.dependsOn.map((dep) => `change:${dep}@${state.artifacts[`change:${dep}`]?.version ?? 1}`);
-      state.artifacts[name] = { kind: 'verification', nodeId, version, basedOn: refs, payload: { verdict, commands, summary }, snapshot, status: 'superseded', createdAt: now };
+      state.artifacts[name] = { kind: 'verification', nodeId, version, basedOn: refs, payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot, status: 'superseded', createdAt: now };
       if (state.revisionCounters['implement-verify'] >= maxAttempts) {
         pauseForDecision(state, 'verification-repair-exhausted', 'verification repair loop exhausted (maxAttempts reached)', now);
         return { ok: true, effect: 'await-decision', detail: 'verification repair loop exhausted; awaiting user decision' };
@@ -696,7 +704,22 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       successorRunId: state.successorRunId ?? null,
       carryOver: state.carryOver ?? null,
       blockedReason: state.blockedReason, revisionCounters: state.revisionCounters,
-      nodes, artifacts: Object.entries(state.artifacts).map(([name, artifact]) => ({ name, kind: artifact.kind, version: artifact.version, status: artifact.status, basedOn: artifact.basedOn })),
+      nodes, artifacts: Object.entries(state.artifacts).map(([name, artifact]) => {
+        const payload = artifact.payload ?? {};
+        let counts;
+        if (artifact.kind === 'verification') {
+          counts = {
+            artifacts: Array.isArray(payload.artifacts) ? payload.artifacts.length : 0,
+            probed: Array.isArray(payload.probed) ? payload.probed.length : 0,
+            skipped: Array.isArray(payload.skipped) ? payload.skipped.length : 0,
+          };
+        } else if (artifact.kind === 'change') {
+          counts = { risks: Array.isArray(payload.risks) ? payload.risks.length : 0 };
+        } else if (artifact.kind === 'findings') {
+          counts = { learnings: Array.isArray(payload.learnings) ? payload.learnings.length : 0 };
+        }
+        return { name, kind: artifact.kind, version: artifact.version, status: artifact.status, basedOn: artifact.basedOn, ...(counts ? { counts } : {}) };
+      }),
       violations: state.violations.slice(-20), sideEffectCount: state.sideEffects.length, mermaid,
     };
   }

@@ -1435,3 +1435,116 @@ test('graph_inspect counts on-disk deliverables the ledger never saw', async (t)
   const impl = report.nodes.find((node) => node.id === 'impl-1');
   assert.deepEqual(impl.deliverables, { total: 2, done: 1, pending: ['src/a.ts'] });
 });
+
+test('evidence fields flow end to end: learnings reach the planner, risks reach the verifier, artifacts gate PASS', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-evidence-fields-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  const findings = JSON.parse(await h.tools.graph_submit_findings.execute(
+    { summary: 'auth flow located', evidence: ['src/auth.ts:1'], learnings: ['token refresh is rate-limited per session'] },
+    ctx(h, 'child-explore', 'graph-explorer'),
+  ));
+  assert.equal(findings.ok, true, JSON.stringify(findings));
+  await childIdle(h, 'child-explore');
+
+  const planning = await dispatch(h, 'graph-planner');
+  assert.match(planning.args.prompt, /Explorer learnings from findings@1/);
+  assert.match(planning.args.prompt, /token refresh is rate-limited per session/);
+  await bindChild(h, 'child-planner', 'graph-planner');
+  const deliverableSpecs = SPECS.map((entry) => (entry.id === 'impl-1' ? { ...entry, deliverables: ['src/a.ts'] } : entry));
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs: deliverableSpecs }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(plan.ok, true, JSON.stringify(plan));
+
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  const pass = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic')));
+  assert.equal(pass.ok, true);
+
+  await dispatch(h, 'graph-implementer');
+  await bindChild(h, 'child-impl', 'graph-implementer');
+  await mkdir(join(dir, 'src'), { recursive: true });
+  await writeFile(join(dir, 'src', 'a.ts'), 'fixed auth errors');
+  await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-impl', callID: 'e1', args: { filePath: join(dir, 'src', 'a.ts') } }, { title: 'edit', output: 'ok' });
+  const change = JSON.parse(await h.tools.graph_submit_change.execute(
+    { nodeId: 'impl-1', filesTouched: ['src/a.ts'], summary: 'fixed auth errors', risks: ['empty input still falls through to the legacy path'] },
+    ctx(h, 'child-impl', 'graph-implementer'),
+  ));
+  assert.equal(change.ok, true, JSON.stringify(change));
+  await childIdle(h, 'child-impl');
+
+  const verifying = await dispatch(h, 'graph-verifier');
+  assert.match(verifying.args.prompt, /implementer-reported risks/);
+  assert.match(verifying.args.prompt, /empty input still falls through/);
+  await bindChild(h, 'child-verify', 'graph-verifier');
+
+  const missing = JSON.parse(await h.tools.graph_submit_verification.execute(
+    { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], artifacts: ['logs/missing.log'] },
+    ctx(h, 'child-verify', 'graph-verifier'),
+  ));
+  assert.equal(missing.ok, false);
+  assert.equal(missing.code, 'ARTIFACT_MISSING');
+  assert.equal(missing.retryable, undefined); // plain rejected reply, no claim failure recorded
+  assert.equal(h.store.getRun('root').nodes['verify-1'].state, 'RUNNING');
+
+  const bare = JSON.parse(await h.tools.graph_submit_verification.execute(
+    { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }] },
+    ctx(h, 'child-verify', 'graph-verifier'),
+  ));
+  assert.equal(bare.ok, false);
+  assert.equal(bare.code, 'ARTIFACT_REQUIRED');
+  assert.match(bare.hint, /artifact path/);
+  assert.equal(h.store.getRun('root').nodes['verify-1'].state, 'RUNNING');
+
+  await mkdir(join(dir, 'logs'), { recursive: true });
+  await writeFile(join(dir, 'logs', 'run.log'), 'ok');
+  const rich = JSON.parse(await h.tools.graph_submit_verification.execute(
+    { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], artifacts: ['logs/run.log'], probed: ['malformed input rejected with 400'], skipped: ['concurrency n/a: single-threaded CLI'] },
+    ctx(h, 'child-verify', 'graph-verifier'),
+  ));
+  assert.equal(rich.ok, true, JSON.stringify(rich));
+  assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
+  const inspected = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'root', 'graph-orchestrator')));
+  const verification = inspected.artifacts.find((entry) => entry.name === 'verification:verify-1');
+  assert.deepEqual(verification.counts, { artifacts: 1, probed: 1, skipped: 1 });
+  const changeEntry = inspected.artifacts.find((entry) => entry.name === 'change:impl-1');
+  assert.deepEqual(changeEntry.counts, { risks: 1 });
+  const findingsEntry = inspected.artifacts.find((entry) => entry.name === 'findings');
+  assert.deepEqual(findingsEntry.counts, { learnings: 1 });
+});
+
+test('reset carry-over includes explorer learnings', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-carryover-learnings-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  await h.tools.graph_submit_findings.execute(
+    { summary: 'auth flow spans three modules', evidence: ['src/auth.ts:1'], learnings:['rotate tokens before refresh-window expiry'] },
+    ctx(h, 'child-explore', 'graph-explorer'),
+  );
+  await childIdle(h, 'child-explore');
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(plan.ok, true, JSON.stringify(plan));
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  const fail = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['misses token rotation entirely'] }, ctx(h, 'child-critic', 'graph-plan-critic')));
+  assert.equal(fail.effect, 'await-decision');
+  await childIdle(h, 'child-critic');
+
+  const reset = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'reset', reason: 'user wants the rotation handled' }, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(reset.ok, true, JSON.stringify(reset));
+  assert.equal(reset.carryOver.learnings, 1);
+  const successor = h.store.getRun('root:2');
+  assert.deepEqual(successor.carryOver.learnings, ['rotate tokens before refresh-window expiry']);
+  const planning = await dispatch(h, 'graph-planner');
+  assert.match(planning.args.prompt, /learnings/);
+  assert.match(planning.args.prompt, /rotate tokens before refresh-window expiry/);
+});
