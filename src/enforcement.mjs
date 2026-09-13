@@ -62,8 +62,21 @@ function carryOverPrompt(state) {
     `[RUNNER 前次 run 資訊] 此 run 由 ${carry.predecessorRunId} 因使用者 reset 而來(原因:${String(carry.reason ?? '').slice(0, 300)})。`,
     findings,
     typeof carry.findingsDigest === 'string' && carry.findingsDigest.length ? `前次探索摘要:${carry.findingsDigest}` : '',
+    Array.isArray(carry.learnings) && carry.learnings.length
+      ? `前次探索 learnings(採納前必須對目前工作樹重新驗證):\n${carry.learnings.map((item) => `- ${String(item)}`).join('\n')}`
+      : '',
     '可用 graph_journal_read/graph_journal_search 查前次完整紀錄;所有引用都必須對目前工作樹重新驗證後才能採用。',
   ].filter(Boolean).join('\n');
+}
+
+// Durable explorer lessons travel with the findings artifact: the planner
+// (and a successor run via carry-over) incorporates them instead of
+// re-deriving the same pitfalls from zero.
+function learningsPrompt(state) {
+  const artifact = state.artifacts.findings;
+  const learnings = Array.isArray(artifact?.payload?.learnings) ? artifact.payload.learnings : [];
+  if (!learnings.length) return null;
+  return `[RUNNER] Explorer learnings from findings@${artifact.version} (incorporate these; re-validate against current state before relying on them):\n${learnings.slice(0, 16).map((item) => `- ${String(item)}`).join('\n')}`;
 }
 
 const NODE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -229,6 +242,16 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
         const authoritative = [];
         if (spec && Array.isArray(spec.writeScope) && spec.writeScope.length) authoritative.push(`[RUNNER] writeScope: ${spec.writeScope.join(', ')}. Write only inside these literal paths.`);
         if (spec && Array.isArray(spec.deliverables) && spec.deliverables.length) authoritative.push(`[RUNNER] deliverables: ${spec.deliverables.join(', ')}.`);
+        if (spec && spec.kind === 'verify') {
+          // Implementer-reported risks are relayed mechanically so the
+          // verifier probes them first instead of trusting green commands.
+          const risks = [...new Set((spec.dependsOn ?? []).flatMap((dep) => state.artifacts[`change:${dep}`]?.payload?.risks ?? []))].slice(0, 16).map(String);
+          if (risks.length) authoritative.push(`[RUNNER] implementer-reported risks (probe these first): ${risks.join(' | ')}`);
+        }
+        if (spec && spec.kind === 'plan') {
+          const learnings = learningsPrompt(state);
+          if (learnings) authoritative.push(learnings);
+        }
         prompt = `[RUNNER] Assigned nodeId: ${decision.nodeId}. Submit only this node.${authoritative.length ? `\n${authoritative.join('\n')}` : ''}\n${prompt}`;
         if (decision.reconcile) prompt = `${reconcilePrompt(state, decision.nodeId)}\n\n${prompt}`;
         const guidance = revisionPrompt(decision);
@@ -236,6 +259,10 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       } else if (decision.free && (subagentType === 'graph-explorer' || subagentType === 'graph-planner')) {
         const carry = carryOverPrompt(state);
         if (carry) prompt = `${carry}\n\n${prompt}`;
+        if (subagentType === 'graph-planner') {
+          const learnings = learningsPrompt(state);
+          if (learnings) prompt = `${learnings}\n\n${prompt}`;
+        }
       }
       output.args = { ...args, prompt };
       return;

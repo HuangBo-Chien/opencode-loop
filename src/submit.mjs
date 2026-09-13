@@ -7,7 +7,7 @@ import { tool } from '@opencode-ai/plugin/tool';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { cleanJson } from './json-safe.mjs';
-import { validateTaskGraph, expandRunTokens, runToken } from './task-spec.mjs';
+import { validateTaskGraph, expandRunTokens, runToken, validateFileClaim } from './task-spec.mjs';
 
 const z = tool.schema;
 const NOW = () => new Date().toISOString();
@@ -17,6 +17,17 @@ function reply(payload) {
 }
 function rejected(code, detail, hint = null) {
   return reply({ ok: false, code, detail, ...(hint ? { hint } : {}) });
+}
+
+// Artifact paths follow the file-claim rules (literal workspace-relative
+// files, no directories or globs) with one exception: the verifier scratch
+// root /tmp/ may be referenced absolutely because scratch scripts and their
+// outputs legitimately live outside the worktree.
+function artifactPathProblem(input) {
+  if (typeof input !== 'string' || !input.length) return 'empty artifact path';
+  if (input.startsWith('/tmp/')) return null;
+  const checked = validateFileClaim(input);
+  return checked.ok ? null : checked.detail;
 }
 
 export function createSubmitTools({ store, runner, bindings, worktree, dispatches }) {
@@ -121,6 +132,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       summary: z.string().min(1).max(2000),
       checksRun: z.array(z.string().max(2000)).max(16).default([]),
       unresolved: z.array(z.string().max(2000)).max(16).default([]),
+      risks: z.array(z.string().max(2000)).max(16).default([]),
     },
     async execute(args, context) {
       const wrong = requireRole(context, 'graph-implementer');
@@ -146,11 +158,14 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
   });
 
   const graph_submit_verification = tool({
-    description: 'Verifier submits evidence-bound verification. PASS requires at least one command with exitCode 0 and binds to the current change versions; FAIL returns work to the implementer (capped); UNVERIFIED blocks the run honestly.',
+    description: 'Verifier submits evidence-bound verification. PASS requires at least one command with exitCode 0 and binds to the current change versions; FAIL returns work to the implementer (capped); UNVERIFIED blocks the run honestly. artifacts are existing evidence file paths (logs, output files, screenshots); probed records adversarial scenarios exercised with their observed results; skipped records scenarios ruled out with a one-line reason. When the verified implement nodes declared deliverables, PASS additionally requires at least one artifact.',
     args: {
       nodeId: z.string().min(1).max(128),
       verdict: z.enum(['PASS', 'FAIL', 'UNVERIFIED']),
       commands: z.array(z.object({ command: z.string().min(1).max(2000), exitCode: z.number().int() })).max(32).default([]),
+      artifacts: z.array(z.string().min(1).max(512)).max(32).default([]),
+      probed: z.array(z.string().max(2000)).max(16).default([]),
+      skipped: z.array(z.string().max(2000)).max(16).default([]),
       summary: z.string().max(2000).optional(),
     },
     async execute(args, context) {
@@ -163,21 +178,34 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (args.nodeId !== located.binding.nodeId) {
         return rejected('NOT_DISPATCHED_NODE', `nodeId must match the node bound to this session; this session is bound to ${located.binding.nodeId}`);
       }
+      for (const artifact of args.artifacts ?? []) {
+        const problem = artifact.startsWith('/tmp/') ? null : artifactPathProblem(artifact);
+        if (problem) return rejected('INVALID_FILE_CLAIM', problem, 'artifacts are literal workspace-relative file paths (a /tmp/-prefixed absolute path is also accepted), never directories or globs');
+        const resolved = artifact.startsWith('/tmp/') ? artifact : join(worktree, artifact);
+        if (!existsSync(resolved)) return rejected('ARTIFACT_MISSING', `${artifact}: cited evidence artifact does not exist at submission time`, 'ARTIFACT_MISSING is correctable within this attempt; check the path and resubmit without redoing verified work');
+      }
       const files = (bound.node.spec.dependsOn ?? []).flatMap((dep) => located.state.artifacts[`change:${dep}`]?.payload?.filesTouched ?? []);
       const snapshot = await store.hashFiles(files);
       const result = runner.submitVerification(located.state, { ...args, snapshot, now: NOW() });
-      if (!result.ok) return rejected(result.code, result.detail, result.code === 'INSUFFICIENT_EVIDENCE' ? 'cite the actual commands and their exit codes' : null);
+      if (!result.ok) {
+        const hints = {
+          INSUFFICIENT_EVIDENCE: 'cite the actual commands and their exit codes',
+          ARTIFACT_REQUIRED: 'cite at least one existing artifact path (log, output file, screenshot) produced by the verified work',
+        };
+        return rejected(result.code, result.detail, hints[result.code] ?? null);
+      }
       await store.saveRun(located.state);
       return reply({ ok: true, effect: result.effect, ...(result.detail ? { detail: result.detail } : {}) });
     },
   });
 
   const graph_submit_findings = tool({
-    description: 'Explorer or multimodal analyst registers versioned findings the planner can reference as inputs (artifact name "findings").',
+    description: 'Explorer or multimodal analyst registers versioned findings the planner can reference as inputs (artifact name "findings"). learnings are durable patterns, pitfalls and principles the planner should incorporate (and later runs may re-derive from), distinct from the evidence trail.',
     args: {
       nodeId: z.string().min(1).max(128).optional(),
       summary: z.string().min(1).max(4000),
       evidence: z.array(z.string().max(2000)).max(32).default([]),
+      learnings: z.array(z.string().max(2000)).max(16).default([]),
     },
     async execute(args, context) {
       if (context.agent !== 'graph-explorer' && context.agent !== 'graph-multimodal') {
@@ -191,7 +219,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         if (previous && previous.status === 'valid') previous.status = 'superseded';
         located.state.artifacts.findings = {
           kind: 'findings', nodeId: located.binding.nodeId ?? 'free', version,
-          basedOn: [], payload: cleanJson({ summary: args.summary, evidence: args.evidence }),
+          basedOn: [], payload: cleanJson({ summary: args.summary, evidence: args.evidence ?? [], learnings: args.learnings ?? [] }),
           status: 'valid', createdAt: NOW(),
         };
         await store.saveRun(located.state);
@@ -357,6 +385,9 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         reviewFindings: carriedFindings,
         findingsDigest: typeof state.artifacts.findings?.payload?.summary === 'string'
           ? state.artifacts.findings.payload.summary.slice(0, 400) : null,
+        learnings: Array.isArray(state.artifacts.findings?.payload?.learnings)
+          ? state.artifacts.findings.payload.learnings.slice(0, 8).map((item) => String(item).slice(0, 500))
+          : [],
       };
       await store.saveRun(created);
       runner.archiveForReset(state, { reason: args.reason, successorRunId: runId, now: NOW() });
@@ -364,7 +395,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       bindings.set(context.sessionID, { runId, agent: context.agent, nodeId: null, root: true });
       return reply({ ok: true, action: 'reset', runId,
         previousRun: { runId: state.runId, status: state.status, decision: state.decision },
-        carryOver: { predecessorRunId: created.carryOver.predecessorRunId, reviewFindings: created.carryOver.reviewFindings.length },
+        carryOver: { predecessorRunId: created.carryOver.predecessorRunId, reviewFindings: created.carryOver.reviewFindings.length, learnings: created.carryOver.learnings.length },
         next: 'dispatch read-only exploration/planning for the new goal; counters start fresh, gates re-apply and no side effects are replayed — the successor run carries a bounded digest of this run\'s findings and rejections' });
     },
   });
