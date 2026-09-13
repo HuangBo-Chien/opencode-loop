@@ -171,11 +171,18 @@ export function validateTaskSpec(spec, { maxAttemptsCeiling = 20 } = {}) {
   }
   const allowShell = spec.allowShell === undefined ? undefined : spec.allowShell;
   if (allowShell !== undefined && typeof allowShell !== 'boolean') fail('allowShell must be a boolean');
+  // Baseline verify nodes capture pre-change suite evidence (which commands
+  // already fail before any implement node writes); only verify nodes may
+  // declare the flag.
+  if (spec.baseline !== undefined) {
+    if (kind !== 'verify') fail('only verify nodes may declare baseline');
+    else if (typeof spec.baseline !== 'boolean') fail('baseline must be a boolean');
+  }
   if (typeof spec.title === 'string' && !nonemptyText(spec.title)) fail('title must be nonempty text');
   return { ok: errors.length === 0, errors, spec: { ...spec } };
 }
 
-export function validateTaskGraph(specs, { planOnly = false, maxAttemptsCeiling = 20 } = {}) {
+export function validateTaskGraph(specs, { planOnly = false, light = false, maxAttemptsCeiling = 20 } = {}) {
   const errors = [];
   if (!Array.isArray(specs) || specs.length < 1 || specs.length > MAX_SPECS) {
     return { ok: false, errors: [`specs must be a non-empty array (max ${MAX_SPECS})`], order: null, nodes: null };
@@ -199,11 +206,12 @@ export function validateTaskGraph(specs, { planOnly = false, maxAttemptsCeiling 
   if (errors.length) return { ok: false, errors, order: null, nodes: null };
 
   // Artifact naming contract. The runner always stores evidence under fixed
-  // names (findings, plan, review, change:<id>, verification:<id>); declared
-  // `outputs` must match them and `inputs` may only reference them, so an
-  // input can never chase a name that nothing produces and strand a node.
+  // names (findings, plan, review, change:<id>, verification:<id>,
+  // baseline:<id>); declared `outputs` must match them and `inputs` may only
+  // reference them, so an input can never chase a name that nothing produces
+  // and strand a node.
   const canonicalOutput = (spec) => spec.kind === 'implement' ? `change:${spec.id}`
-    : spec.kind === 'verify' ? `verification:${spec.id}`
+    : spec.kind === 'verify' ? (spec.baseline === true ? `baseline:${spec.id}` : `verification:${spec.id}`)
     : spec.kind === 'plan' ? 'plan' : spec.kind === 'review' ? 'review' : 'findings';
   for (const [id, spec] of byId) {
     const canonical = canonicalOutput(spec);
@@ -216,10 +224,12 @@ export function validateTaskGraph(specs, { planOnly = false, maxAttemptsCeiling 
       const name = ref.split('@', 1)[0];
       const changeTarget = name.startsWith('change:') ? byId.get(name.slice('change:'.length)) : null;
       const verificationTarget = name.startsWith('verification:') ? byId.get(name.slice('verification:'.length)) : null;
+      const baselineTarget = name.startsWith('baseline:') ? byId.get(name.slice('baseline:'.length)) : null;
       const producible = name === 'findings' || name === 'plan' || name === 'review'
-        || changeTarget?.kind === 'implement' || verificationTarget?.kind === 'verify';
+        || changeTarget?.kind === 'implement' || verificationTarget?.kind === 'verify'
+        || (baselineTarget?.kind === 'verify' && baselineTarget.baseline === true);
       if (!producible) {
-        errors.push(`${id}: inputs reference ${ref}, which no runner-managed artifact can satisfy; allowed names are findings, plan, review, change:<implement node id>, verification:<verify node id> (optional @version)`);
+        errors.push(`${id}: inputs reference ${ref}, which no runner-managed artifact can satisfy; allowed names are findings, plan, review, change:<implement node id>, verification:<verify node id>, baseline:<baseline verify node id> (optional @version)`);
       }
     }
   }
@@ -261,10 +271,35 @@ export function validateTaskGraph(specs, { planOnly = false, maxAttemptsCeiling 
     if (!spec.dependsOn.some((dep) => byId.get(dep)?.kind === 'plan')) errors.push(`${spec.id}: review nodes must depend on the plan node`);
   }
   for (const spec of kindCount('implement')) {
-    if (!spec.dependsOn.some((dep) => byId.get(dep)?.kind === 'review')) errors.push(`${spec.id}: implement nodes must depend on a review node (review gate is mandatory)`);
+    if (!light) {
+      if (!spec.dependsOn.some((dep) => byId.get(dep)?.kind === 'review')) errors.push(`${spec.id}: implement nodes must depend on a review node (review gate is mandatory; use intent "light" for a critic-free small change)`);
+    } else if (!spec.dependsOn.some((dep) => ['plan', 'review'].includes(byId.get(dep)?.kind))) {
+      errors.push(`${spec.id}: implement nodes must depend on the plan node in light graphs`);
+    }
   }
+  if (light && kindCount('implement').length > 1) errors.push('light graphs allow at most one implement node');
+  const baselineNodes = kindCount('verify').filter((spec) => spec.baseline === true);
   for (const spec of kindCount('verify')) {
-    if (!spec.dependsOn.some((dep) => byId.get(dep)?.kind === 'implement')) errors.push(`${spec.id}: verify nodes must depend on at least one implement node`);
+    if (spec.baseline === true) {
+      // Baseline verify nodes capture pre-change suite evidence, so they must
+      // never wait on implement output and must sit behind the review gate
+      // (full flow) or the plan node (light flow).
+      if (spec.dependsOn.some((dep) => byId.get(dep)?.kind === 'implement')) errors.push(`${spec.id}: baseline verify nodes must not depend on implement nodes (they capture pre-change evidence)`);
+      if (!light) {
+        if (!spec.dependsOn.some((dep) => byId.get(dep)?.kind === 'review')) errors.push(`${spec.id}: baseline verify nodes must depend on the review node`);
+      } else if (!spec.dependsOn.some((dep) => byId.get(dep)?.kind === 'plan')) {
+        errors.push(`${spec.id}: baseline verify nodes must depend on the plan node in light graphs`);
+      }
+    } else if (!spec.dependsOn.some((dep) => byId.get(dep)?.kind === 'implement')) {
+      errors.push(`${spec.id}: verify nodes must depend on at least one implement node`);
+    }
+  }
+  // When a baseline is declared, every implement node depends on it so the
+  // capture is mechanically ordered before any change lands.
+  if (baselineNodes.length) {
+    for (const spec of kindCount('implement')) {
+      if (!spec.dependsOn.some((dep) => byId.get(dep)?.baseline === true)) errors.push(`${spec.id}: implement nodes must depend on a baseline verify node when one is declared (baseline evidence must be captured before any change)`);
+    }
   }
   if (planOnly && (kindCount('implement').length || kindCount('verify').length)) {
     errors.push('plan-only graphs must not contain implement or verify nodes');

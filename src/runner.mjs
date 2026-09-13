@@ -25,8 +25,19 @@ function nodeMaxAttempts(node, fallback) {
 // contract instead of looking like a missing deliverable.
 function artifactNameHint(entries) {
   return entries.some((entry) => typeof entry === 'string' && entry.includes('does not exist'))
-    ? ' (runner artifact names are findings, plan, review, change:<implement node id>, verification:<verify node id>; resubmit a corrected plan if an input name is wrong)'
+    ? ' (runner artifact names are findings, plan, review, change:<implement node id>, verification:<verify node id>, baseline:<baseline verify node id>; resubmit a corrected plan if an input name is wrong)'
     : '';
+}
+
+// A nonzero command on a PASS verdict is tolerated only when the exact
+// command string and exit code match a still-valid baseline entry, i.e. the
+// failure predates the change and did not get worse. Matching stays purely
+// mechanical (no output parsing) and therefore ecosystem-agnostic.
+function baselineMatches(state, command) {
+  return Object.values(state.artifacts).some((artifact) => artifact.kind === 'baseline'
+    && artifact.status === 'valid'
+    && Array.isArray(artifact.payload?.commands)
+    && artifact.payload.commands.some((entry) => entry?.command === command.command && entry?.exitCode === command.exitCode));
 }
 
 function artifactRef(state, ref) {
@@ -287,11 +298,16 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     if (state.status === 'AWAITING_USER_DECISION') {
       return { ok: false, code: 'AWAITING_DECISION', detail: 'the run is paused awaiting a user decision; deliver it with graph_run_decide before replacing the plan' };
     }
-    if (intent !== 'plan-only' && intent !== 'change') return { ok: false, code: 'INVALID_INTENT', detail: 'intent must be plan-only or change' };
+    if (intent !== 'plan-only' && intent !== 'change' && intent !== 'light') return { ok: false, code: 'INVALID_INTENT', detail: 'intent must be plan-only, change or light' };
     if (!(nodes instanceof Map) || nodes.size < 1) return { ok: false, code: 'INVALID_GRAPH', detail: 'nodes must be a non-empty validated graph' };
     const previous = state.artifacts.plan;
     const version = previous ? previous.version + 1 : 1;
     if (previous && previous.status === 'valid') previous.status = 'superseded';
+    // Baseline evidence is plan-specific: a replaced plan must not let stale
+    // pre-change records tolerate failures under the new graph.
+    for (const artifact of Object.values(state.artifacts)) {
+      if (artifact.kind === 'baseline' && artifact.status === 'valid') artifact.status = 'superseded';
+    }
     state.mode = intent;
     state.status = 'RUNNING';
     state.blockedReason = null;
@@ -473,7 +489,10 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     const previous = state.artifacts[name];
     const version = previous ? previous.version + 1 : 1;
     if (previous && previous.status === 'valid') previous.status = 'superseded';
-    state.artifacts[name] = { kind: 'change', nodeId, version, basedOn: [`review@${state.artifacts.review?.version ?? 1}`], payload: { filesTouched: checked.claimed, filesDeleted: [...new Set(filesDeleted)], summary, checksRun, unresolved, risks }, snapshot, status: 'valid', createdAt: now };
+    const basedOn = state.artifacts.review
+      ? [`review@${state.artifacts.review.version}`]
+      : [`plan@${state.artifacts.plan?.version ?? 1}`];
+    state.artifacts[name] = { kind: 'change', nodeId, version, basedOn, payload: { filesTouched: checked.claimed, filesDeleted: [...new Set(filesDeleted)], summary, checksRun, unresolved, risks }, snapshot, status: 'valid', createdAt: now };
     node.state = 'SUCCEEDED';
     node.lastFailure = null;
     node.finishedAt = now;
@@ -502,9 +521,35 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     if (!node || node.spec.kind !== 'verify') return { ok: false, code: 'NOT_VERIFY_NODE', detail: `${nodeId} is not a verify node` };
     if (node.state !== 'RUNNING') return { ok: false, code: 'NOT_RUNNING', detail: `${nodeId} is ${node.state}` };
 
+    // Baseline capture: pre-change suite evidence recorded before any
+    // implement node writes. The artifact is what later PASS verdicts match
+    // nonzero commands against, so failures that predate the change can be
+    // told apart from regressions the change introduced.
+    if (verdict === 'BASELINE') {
+      if (node.spec.baseline !== true) return { ok: false, code: 'INVALID_VERDICT', detail: 'BASELINE verdicts are only accepted on baseline verify nodes (declare baseline: true in the plan)' };
+      if (!commands.length) return { ok: false, code: 'INSUFFICIENT_EVIDENCE', detail: 'BASELINE requires at least one recorded command (the pre-change suite evidence)' };
+      const name = `baseline:${nodeId}`;
+      const previous = state.artifacts[name];
+      const version = previous ? previous.version + 1 : 1;
+      if (previous && previous.status === 'valid') previous.status = 'superseded';
+      state.artifacts[name] = { kind: 'baseline', nodeId, version, basedOn: [], payload: { commands, summary }, status: 'valid', createdAt: now };
+      node.state = 'SUCCEEDED';
+      node.finishedAt = now;
+      completeIfDone(state, now);
+      return { ok: true, effect: 'baseline' };
+    }
+    if (node.spec.baseline === true && (verdict === 'PASS' || verdict === 'FAIL')) {
+      return { ok: false, code: 'INVALID_VERDICT', detail: 'baseline verify nodes only accept BASELINE or UNVERIFIED verdicts (there is no change to judge yet)' };
+    }
     if (verdict === 'PASS') {
-      if (!commands.length || commands.some((command) => command.exitCode !== 0)) {
-        return { ok: false, code: 'INSUFFICIENT_EVIDENCE', detail: 'PASS requires at least one command and every exitCode must be 0' };
+      // Nonzero exit codes are tolerated only when the exact command and
+      // exit code match a valid baseline entry: a pre-existing failure that
+      // did not get worse. Everything else is a regression this change owns.
+      const unmatched = commands.filter((command) => command.exitCode !== 0 && !baselineMatches(state, command));
+      if (!commands.length || !commands.some((command) => command.exitCode === 0) || unmatched.length) {
+        return { ok: false, code: 'INSUFFICIENT_EVIDENCE', detail: unmatched.length
+          ? `nonzero commands not covered by a baseline entry: ${unmatched.map((command) => command.command).join('; ')} — every failing command on PASS must match a declared baseline (same command and exitCode)`
+          : 'PASS requires at least one command with exitCode 0 (baseline matches tolerate pre-existing failures but never substitute for a green command)' };
       }
       // Deliverable-backed work earns real-surface evidence: when any
       // dependency implement node declared deliverables, PASS must cite at
@@ -713,6 +758,8 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
             probed: Array.isArray(payload.probed) ? payload.probed.length : 0,
             skipped: Array.isArray(payload.skipped) ? payload.skipped.length : 0,
           };
+        } else if (artifact.kind === 'baseline') {
+          counts = { commands: Array.isArray(payload.commands) ? payload.commands.length : 0 };
         } else if (artifact.kind === 'change') {
           counts = { risks: Array.isArray(payload.risks) ? payload.risks.length : 0 };
         } else if (artifact.kind === 'findings') {
