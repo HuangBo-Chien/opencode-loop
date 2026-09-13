@@ -1548,3 +1548,104 @@ test('reset carry-over includes explorer learnings', async (t) => {
   assert.match(planning.args.prompt, /learnings/);
   assert.match(planning.args.prompt, /rotate tokens before refresh-window expiry/);
 });
+
+test('light path: small fix runs plan → implement → verify without a critic', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-light-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({
+    intent: 'light',
+    specs: [
+      { id: 'plan-1', kind: 'plan', agent: 'graph-planner', dependsOn: [], inputs: [], outputs: [], acceptance: ['plan'] },
+      { id: 'impl-1', kind: 'implement', agent: 'graph-implementer', dependsOn: ['plan-1'], inputs: [], outputs: [], writeScope: ['README.md'], acceptance: ['typo fixed'] },
+      { id: 'verify-1', kind: 'verify', agent: 'graph-verifier', dependsOn: ['impl-1'], inputs: [], outputs: [], acceptance: ['verify'] },
+    ],
+  }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(plan.ok, true, JSON.stringify(plan));
+  assert.equal(plan.mode, 'light');
+  assert.match(plan.next, /critic-free/);
+
+  const impl = await dispatch(h, 'graph-implementer');
+  assert.ok(!impl.args.prompt.includes('RUNNER_REJECTED'));
+  assert.match(impl.args.prompt, /Assigned nodeId: impl-1/);
+  await bindChild(h, 'child-impl', 'graph-implementer');
+  await writeFile(join(dir, 'README.md'), '#fixed typo');
+  await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-impl', callID: 'e1', args: { filePath: join(dir, 'README.md') } }, { title: 'edit', output: 'ok' });
+  const change = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['README.md'], summary: 'fixed typo' }, ctx(h, 'child-impl', 'graph-implementer')));
+  assert.equal(change.ok, true, JSON.stringify(change));
+  await childIdle(h, 'child-impl');
+
+  await dispatch(h, 'graph-verifier');
+  await bindChild(h, 'child-verify', 'graph-verifier');
+  const pass = JSON.parse(await h.tools.graph_submit_verification.execute(
+    { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: "grep -q fixed README.md", exitCode: 0 }] },
+    ctx(h, 'child-verify', 'graph-verifier'),
+  ));
+  assert.equal(pass.ok, true, JSON.stringify(pass));
+  assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
+  assert.deepEqual(h.store.getRun('root').artifacts['change:impl-1'].basedOn, ['plan@1']);
+});
+
+test('baseline flow end to end: pre-change red suite does not block an honest PASS', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-baseline-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  const BASELINE_SPECS = SPECS.map((entry) => {
+    if (entry.id === 'impl-1') return { ...entry, dependsOn: ['review-1', 'base-1'] };
+    return entry;
+  }).concat([
+    { id: 'base-1', kind: 'verify', agent: 'graph-verifier', dependsOn: ['review-1'], inputs: [], outputs: ['baseline:base-1'], baseline: true, acceptance: ['capture baseline'] },
+  ]);
+
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs: BASELINE_SPECS }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(plan.ok, true, JSON.stringify(plan));
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  const review = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic')));
+  assert.equal(review.ok, true, JSON.stringify(review));
+
+  // The implementer must wait for the baseline: only the baseline verifier is admissible now.
+  const earlyImpl = await dispatch(h, 'graph-implementer');
+  assert.match(earlyImpl.args.prompt, /RUNNER_REJECTED/);
+  assert.match(earlyImpl.args.prompt, /base-1/);
+
+  await dispatch(h, 'graph-verifier');
+  await bindChild(h, 'child-base', 'graph-verifier');
+  assert.equal(h.bindings.get('child-base').nodeId, 'base-1');
+  const baseline = JSON.parse(await h.tools.graph_submit_verification.execute(
+    { nodeId: 'base-1', verdict: 'BASELINE', commands: [{ command: 'npm test', exitCode: 1 }, { command: 'npm run lint', exitCode: 0 }], summary: 'suite partially red before the change' },
+    ctx(h, 'child-base', 'graph-verifier'),
+  ));
+  assert.equal(baseline.ok, true, JSON.stringify(baseline));
+  await childIdle(h, 'child-base');
+
+  await dispatch(h, 'graph-implementer');
+  await bindChild(h, 'child-impl', 'graph-implementer');
+  await mkdir(join(dir, 'src'), { recursive: true });
+  await writeFile(join(dir, 'src', 'a.ts'), 'fixed auth errors');
+  await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-impl', callID: 'e1', args: { filePath: join(dir, 'src', 'a.ts') } }, { title: 'edit', output: 'ok' });
+  const change = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/a.ts'], summary: 'fixed auth errors' }, ctx(h, 'child-impl', 'graph-implementer')));
+  assert.equal(change.ok, true, JSON.stringify(change));
+  await childIdle(h, 'child-impl');
+
+  await dispatch(h, 'graph-verifier');
+  await bindChild(h, 'child-verify', 'graph-verifier');
+  // npm test still fails exactly as it did before the change (baseline match) + a green command.
+  const pass = JSON.parse(await h.tools.graph_submit_verification.execute(
+    { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 1 }, { command: 'grep -q fixed src/a.ts', exitCode: 0 }], probed: ['pre-existing failure matched baseline: npm test exit 1'] },
+    ctx(h, 'child-verify', 'graph-verifier'),
+  ));
+  assert.equal(pass.ok, true, JSON.stringify(pass));
+  assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
+  const inspected = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'root', 'graph-orchestrator')));
+  const baselineEntry = inspected.artifacts.find((entry) => entry.name === 'baseline:base-1');
+  assert.deepEqual(baselineEntry.counts, { commands: 2 });
+});
