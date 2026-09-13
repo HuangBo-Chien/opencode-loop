@@ -52,9 +52,9 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
   }
 
   const graph_submit_plan = tool({
-    description: 'Planner delivers the task graph: an intent (plan-only or change) plus an array of TaskSpec nodes. The runner validates ids, dependencies, cycles, write-scope disjointness and mandatory gates before accepting it.',
+    description: 'Planner delivers the task graph: an intent (plan-only, change, or light) plus an array of TaskSpec nodes. The runner validates ids, dependencies, cycles, write-scope disjointness and mandatory gates before accepting it. light is a critic-free small-change lane: at most one implement node, review node omitted, all write-scope and evidence gates still enforced.',
     args: {
-      intent: z.enum(['plan-only', 'change']),
+      intent: z.enum(['plan-only', 'change', 'light']),
       specs: z.array(z.record(z.string(), z.unknown())).min(1).max(64),
       basedOn: z.array(z.string()).max(16).optional(),
       parallel: z.object({ suggested: z.number().int().min(1).max(4), reason: z.string().max(2000) }).optional(),
@@ -70,12 +70,12 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       // {{run}} expands to this run's unique token before validation, so
       // run-unique lanes never depend on the planner guessing the run id.
       const expanded = expandRunTokens(args.specs, located.state.runId);
-      const graph = validateTaskGraph(expanded, { planOnly: args.intent === 'plan-only', maxAttemptsCeiling: 20 });
+      const graph = validateTaskGraph(expanded, { planOnly: args.intent === 'plan-only', light: args.intent === 'light', maxAttemptsCeiling: 20 });
       if (!graph.ok) {
         return rejected('INVALID_GRAPH', graph.errors.join('; '), [
-          'TaskSpec schema: {id, kind(explore|analyze|plan|review|implement|verify), agent — must be the kind-mapped graph-* specialist (explore→graph-explorer, analyze→graph-multimodal, plan→graph-planner, review→graph-plan-critic, implement→graph-implementer, verify→graph-verifier), dependsOn:[node ids] (required), inputs:[artifact refs like findings@1], outputs:[bare artifact names only — versions are runner-assigned], writeScope:[relative workspace paths/globs] (implement nodes only, non-empty, pairwise disjoint; use the {{run}} token for run-unique lanes — the runner expands it before validation), deliverables:[literal expected files within writeScope] (implement nodes, optional, enables progress reporting), acceptance:[criteria] (implement nodes required), maxAttempts?, allowShell?}',
-          'Gates: exactly one plan node; review depends on plan; implement depends on review; verify depends on implement; plan-only intents contain no implement/verify nodes.',
-          'Artifact names are runner-assigned: outputs must be findings (explore/analyze), plan (plan), review (review), change:<own id> (implement) or verification:<own id> (verify) — or omitted; inputs may only reference those names, with an optional @version.',
+          'TaskSpec schema: {id, kind(explore|analyze|plan|review|implement|verify), agent — must be the kind-mapped graph-* specialist (explore→graph-explorer, analyze→graph-multimodal, plan→graph-planner, review→graph-plan-critic, implement→graph-implementer, verify→graph-verifier), dependsOn:[node ids] (required), inputs:[artifact refs like findings@1], outputs:[bare artifact names only — versions are runner-assigned], writeScope:[relative workspace paths/globs] (implement nodes only, non-empty, pairwise disjoint; use the {{run}} token for run-unique lanes — the runner expands it before validation), deliverables:[literal expected files within writeScope] (implement nodes, optional, enables progress reporting), acceptance:[criteria] (implement nodes required), baseline:true (verify nodes only, optional — captures pre-change suite evidence before any implement node runs), maxAttempts?, allowShell?}',
+          'Gates: exactly one plan node; review depends on plan; implement depends on review (change) or on the plan node (light — critic-free, at most one implement node); verify depends on implement; a baseline verify node depends on review (or plan in light graphs), never on implement, and every implement node must depend on it when one is declared; plan-only intents contain no implement/verify nodes.',
+          'Artifact names are runner-assigned: outputs must be findings (explore/analyze), plan (plan), review (review), change:<own id> (implement), verification:<own id> (verify) or baseline:<own id> (baseline verify nodes) — or omitted; inputs may only reference those names, with an optional @version.',
         ].join(' '));
       }
       try {
@@ -93,7 +93,9 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         // (acceptance text, dispatch prompts) quotes real paths, not tokens.
         const lanes = [...graph.nodes.values()].filter((spec) => spec.kind === 'implement')
           .map((spec) => ({ id: spec.id, writeScope: spec.writeScope ?? [], deliverables: spec.deliverables ?? [] }));
-        return reply({ ok: true, planVersion: result.version, mode: result.mode, runToken: runToken(located.state.runId), order: graph.order, lanes, next: args.intent === 'plan-only' ? 'await plan critique; no implementation will be admitted' : 'await plan critique before implementation' });
+        const next = args.intent === 'plan-only' ? 'await plan critique; no implementation will be admitted'
+          : args.intent === 'light' ? 'dispatch the implement node directly (critic-free light lane); verification evidence gates still apply' : 'await plan critique before implementation';
+        return reply({ ok: true, planVersion: result.version, mode: result.mode, runToken: runToken(located.state.runId), order: graph.order, lanes, next });
       } catch (error) {
         return rejected('PAYLOAD_INVALID', error.message);
       }
@@ -158,10 +160,10 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
   });
 
   const graph_submit_verification = tool({
-    description: 'Verifier submits evidence-bound verification. PASS requires at least one command with exitCode 0 and binds to the current change versions; FAIL returns work to the implementer (capped); UNVERIFIED blocks the run honestly. artifacts are existing evidence file paths (logs, output files, screenshots); probed records adversarial scenarios exercised with their observed results; skipped records scenarios ruled out with a one-line reason. When the verified implement nodes declared deliverables, PASS additionally requires at least one artifact.',
+    description: 'Verifier submits evidence-bound verification. PASS requires at least one command with exitCode 0 (nonzero commands are tolerated only when they match a declared baseline entry — same command and exit code) and binds to the current change versions; BASELINE records pre-change suite evidence on baseline verify nodes; FAIL returns work to the implementer (capped); UNVERIFIED blocks the run honestly. artifacts are existing evidence file paths (logs, output files, screenshots); probed records adversarial scenarios exercised with their observed results; skipped records scenarios ruled out with a one-line reason. When the verified implement nodes declared deliverables, PASS additionally requires at least one artifact.',
     args: {
       nodeId: z.string().min(1).max(128),
-      verdict: z.enum(['PASS', 'FAIL', 'UNVERIFIED']),
+      verdict: z.enum(['PASS', 'FAIL', 'UNVERIFIED', 'BASELINE']),
       commands: z.array(z.object({ command: z.string().min(1).max(2000), exitCode: z.number().int() })).max(32).default([]),
       artifacts: z.array(z.string().min(1).max(512)).max(32).default([]),
       probed: z.array(z.string().max(2000)).max(16).default([]),
@@ -189,7 +191,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       const result = runner.submitVerification(located.state, { ...args, snapshot, now: NOW() });
       if (!result.ok) {
         const hints = {
-          INSUFFICIENT_EVIDENCE: 'cite the actual commands and their exit codes',
+          INSUFFICIENT_EVIDENCE: 'cite the actual commands and their exit codes; nonzero commands are only tolerated on PASS when they match a declared baseline entry (same command and exit code)',
           ARTIFACT_REQUIRED: 'cite at least one existing artifact path (log, output file, screenshot) produced by the verified work',
         };
         return rejected(result.code, result.detail, hints[result.code] ?? null);
