@@ -1,6 +1,6 @@
 # opencode-loop
 
-`0.3.0-alpha.12` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
+`0.3.0-alpha.13` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory and a lesson knowledge base for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
 
 ## How the gate works
 
@@ -98,14 +98,35 @@ By default, the first user request is retained in run state and terminal summari
 
 Global promotion never copies a project entry. It accepts only a project `insight` and requires separately supplied, project-neutral title/body/tags plus native permission `ask`. Run summaries, raw requests, project paths, run IDs and file lists are never written to the global journal.
 
+## Lesson knowledge base
+
+Lessons are the distilled record of *unexpected behavior and repeated mistakes*. They live in a store that is physically separate from the journal (`<stateDirectory>/lessons/`) but reuses the same storage code, sanitization, write-once semantics, hybrid search and trust rules: **non-authoritative historical context that can never satisfy a gate and must be revalidated against the current worktree**.
+
+| Kind | Scope | Origin |
+| --- | --- | --- |
+| `lesson-observation` | project | Mechanical projection at run terminal — explorer `learnings`, FAIL/UNVERIFIED verification summaries (with failing commands) and recorded violations, each bounded (≤8 per source, ≤1,000 chars, redacted) |
+| `lesson` | project | Orchestrator curation via `graph_lesson_record` after a terminal run — category (`pitfall`/`surprise`/`repeated-mistake`), generalized rule, trigger context, optional links to observations |
+| `promoted-lesson` | global | Explicit promotion of separately supplied project-neutral content (native `ask`; identity metadata and path-like tokens from the source are leak-scanned) |
+
+Repeated-mistake detection is append-only: observations are keyed by a fingerprint of their normalized text (whitespace-collapsed, lowercased), and reads consolidate identical fingerprints into occurrence counts with first/last-seen and source run IDs — no entry is ever mutated. This is exact-normalized matching, not semantic clustering: the same mistake phrased differently stays separate, and search results say so.
+
+Explorer, planner and implementer dispatch prompts receive a bounded `[RUNNER] Known project lessons` block (top `lessons.injectMax`, embedding-free mechanical ranking: write-scope path overlap, keyword and tag overlap, occurrence count, recency) with an explicit revalidation mandate. Injection is fail-open — a lesson-store failure never blocks or delays a dispatch. Implementer and verifier keep zero journal/lesson *tools*; they only receive runner-injected context.
+
+| Lesson tool | Allowed roles | Behavior |
+| --- | --- | --- |
+| `graph_lesson_search` | orchestrator, explorer, planner, plan critic | Bounded project/global search plus consolidated observation groups with occurrence counts |
+| `graph_lesson_read` | orchestrator, explorer, planner, plan critic | Read one entry by scope and stable ID |
+| `graph_lesson_record` | root orchestrator only | Write a curated lesson linked to the current terminal run |
+| `graph_lesson_promote` | root orchestrator only, native `ask` | Write separately supplied project-neutral content to global scope |
+
 ## Project-local installation
 
-Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.12.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
+Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.13.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
 
 From the project where you want to use the plugin, install that local tarball:
 
 ```powershell
-npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.12.tgz
+npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.13.tgz
 node --input-type=module -e "import {pathToFileURL} from 'node:url'; import path from 'node:path'; console.log(pathToFileURL(path.resolve('node_modules/opencode-loop/src/index.mjs')).href)"
 ```
 
@@ -178,6 +199,8 @@ The default plugin function accepts `(context, options)`. Supported options are 
 | `journal.includeUserRequest` | `true` | Boolean; retain the first user request when true, or opt out before capture when false |
 | `journal.semanticSearch` | `true` | Boolean; local hybrid semantic/text search when true, text fallback when false |
 | `journal.maxUserRequestChars` | `8000` | Integer 1–32000; maximum retained first-request characters |
+| `lessons.enabled` | `true` | Boolean; disables lesson projection/backfill/search/record/promotion and dispatch injection when false; registered lesson tools reject with `LESSON_DISABLED` |
+| `lessons.injectMax` | `4` | Integer 0–8; maximum lessons injected into explorer/planner/implementer dispatch prompts (0 disables injection only) |
 
 Unknown keys, callbacks and invalid values fail initialization, including when disabled. Options are copied at initialization. The package entry exports only the default plugin function; internal modules are not supported public APIs.
 
@@ -193,6 +216,7 @@ What remains explicitly **not** claimed:
 - Verifier `bash` remains a native `ask`; the runner never answers prompts on the user's behalf except to DENY rule violations.
 - Real-model workflow acceptance (does the graph reduce errors versus the advisory loop at fixed budget) is separate evidence; `graph_status` keeps `enforcementAttested: false` until a locked-host scripted integration passes.
 - Journal redaction is best-effort, storage is plaintext, and historical entries can be stale; journal output is never current gate evidence.
+- Lesson fingerprints are exact-normalized-text matches; differently phrased duplicates do not consolidate. Dispatch-time lesson ranking is mechanical (paths, keywords, tags, occurrences, recency) and never loads the embedding model; relevance quality beyond those signals is the caller's job via `graph_lesson_search`.
 - The internal effect boundary (`effect-boundary.mjs`) remains a tested but unwired design sketch; its replay protection is still single-instance.
 
 Parallel implementers are gated at **admission time** (dispatch capacity over reserved + RUNNING nodes), unlike creation-time worker pools in team-style plugins; the gate sees the run's live DAG state, and per-node side-effect ledgers, file claims and scope enforcement are already per-writer. Scope denials are hard blocks: the `tool.execute.before` hook throws `RUNNER_DENIED(...)` with actionable guidance (the host's permission flow may auto-allow, so the throw is the only unbypassable deny), and a denied call that executes anyway strictly fails the attempt (`EXECUTED_DESPITE_DENY`, same class as out-of-scope claims) — tainted work can never reach SUCCEEDED. A per-member git-worktree isolation option (stronger than scope globs, at the cost of merge-back) is a possible future TaskSpec field. Attempt ceilings are per-node structured-submission budgets — much coarser than conversation-turn budgets — and exhaustion now pauses for a user reset decision rather than terminating, which is the intended pressure valve instead of larger budgets. Mid-flight progress is likewise mechanical, not signalled: every child mutation already serializes through the per-run dispatch queue, `graph_inspect` surfaces per-node ledger activity and deliverable completion (with a read-only existence check so bash-created artifacts like venv binaries count honestly), and finer-grained reporting is expressed by decomposing work into smaller nodes with declared `deliverables`, not by a self-reported status channel.

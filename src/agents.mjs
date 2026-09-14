@@ -30,10 +30,14 @@ function createPermission(name) {
   if (JOURNAL_READ_AGENTS.has(name)) {
     permission.graph_journal_search = 'allow';
     permission.graph_journal_read = 'allow';
+    permission.graph_lesson_search = 'allow';
+    permission.graph_lesson_read = 'allow';
   }
   if (name === 'graph-orchestrator') {
     permission.graph_journal_write_insight = 'allow';
     permission.graph_journal_promote = 'ask';
+    permission.graph_lesson_record = 'allow';
+    permission.graph_lesson_promote = 'ask';
     permission.graph_run_decide = 'ask';
   }
   if (name === 'graph-implementer') {

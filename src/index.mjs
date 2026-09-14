@@ -10,6 +10,8 @@ import { createJournalSearch } from './journal-search.mjs';
 import { createJournalStore } from './journal-store.mjs';
 import { createJournalService, createJournaledRunStore } from './journal.mjs';
 import { createJournalTools } from './journal-tools.mjs';
+import { createLessonService, LESSON_KINDS } from './lessons.mjs';
+import { createLessonTools } from './lesson-tools.mjs';
 
 export default async function GraphPlugin(context, options = {}) {
   const settings = parseOptions(options);
@@ -18,9 +20,15 @@ export default async function GraphPlugin(context, options = {}) {
 
   const baseStore = createRunStore({ worktree, stateDirectory: settings.stateDirectory });
   const journalStore = createJournalStore({ worktree, stateDirectory: settings.stateDirectory });
+  const lessonStore = createJournalStore({ worktree, stateDirectory: settings.stateDirectory, subdirectory: 'lessons', kinds: LESSON_KINDS });
   const embeddingProvider = createEmbeddingProvider();
   const journalSearch = createJournalSearch({
     store: journalStore,
+    embeddingProvider,
+    semanticSearch: settings.journal.semanticSearch,
+  });
+  const lessonSearch = createJournalSearch({
+    store: lessonStore,
     embeddingProvider,
     semanticSearch: settings.journal.semanticSearch,
   });
@@ -31,10 +39,18 @@ export default async function GraphPlugin(context, options = {}) {
     enabled: settings.journal.enabled,
     worktree,
   });
-  const store = createJournaledRunStore(baseStore, journalService);
+  const lessonService = createLessonService({
+    runStore: baseStore,
+    lessonStore,
+    lessonSearch,
+    journalStore,
+    enabled: settings.lessons.enabled,
+    worktree,
+  });
+  const store = createJournaledRunStore(baseStore, journalService, lessonService);
   const runner = createRunner({ maxAttempts: settings.maxAttempts, maxPlanRevisions: settings.maxPlanRevisions, implementerParallel: settings.maxImplementerParallel });
   const bindings = new Map();
-  const enforcement = createEnforcement({ settings: { worktree, journal: settings.journal }, store, runner, bindings, client: context.client });
+  const enforcement = createEnforcement({ settings: { worktree, journal: settings.journal, lessons: settings.lessons }, store, runner, bindings, client: context.client, lessons: lessonService });
   const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches });
   const journalTools = createJournalTools({
     journalService,
@@ -43,10 +59,17 @@ export default async function GraphPlugin(context, options = {}) {
     dispatches: enforcement.dispatches,
     enabled: settings.journal.enabled,
   });
+  const lessonTools = createLessonTools({
+    lessonService,
+    store,
+    bindings,
+    dispatches: enforcement.dispatches,
+    enabled: settings.lessons.enabled,
+  });
 
   return {
     async config(config) { registerAgents(config, settings); },
-    tool: { graph_status: createStatusTool(settings, journalService), ...tools, ...journalTools },
+    tool: { graph_status: createStatusTool(settings, journalService, lessonService), ...tools, ...journalTools, ...lessonTools },
     'chat.message': enforcement.onChatMessage,
     'tool.execute.before': enforcement.onToolBefore,
     'tool.execute.after': enforcement.onToolAfter,
