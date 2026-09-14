@@ -602,13 +602,20 @@ export function createJournalService({ runStore, journalStore, journalSearch, en
   return Object.freeze({ projectRun, backfill, search, read, writeInsight, promote, status });
 }
 
-export function createJournaledRunStore(runStore, journalService) {
+export function createJournaledRunStore(runStore, journalService, lessonService = null) {
   async function saveRun(state) {
     const saved = await runStore.saveRun(state);
     try {
       await journalService.projectRun(saved);
     } catch {
       // Projection is advisory and cannot change authoritative runner persistence.
+    }
+    if (lessonService !== null) {
+      try {
+        await lessonService.projectLessons(saved);
+      } catch {
+        // Lesson projection is equally advisory: failures never block a run save.
+      }
     }
     return saved;
   }
