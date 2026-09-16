@@ -1452,8 +1452,9 @@ test('evidence fields flow end to end: learnings reach the planner, risks reach 
   await childIdle(h, 'child-explore');
 
   const planning = await dispatch(h, 'graph-planner');
-  assert.match(planning.args.prompt, /Explorer learnings from findings@1/);
-  assert.match(planning.args.prompt, /token refresh is rate-limited per session/);
+  // Header is version-agnostic since learnings are individually tagged.
+  assert.match(planning.args.prompt, /Explorer learnings \(incorporate these/);
+  assert.match(planning.args.prompt, /- \(findings@1\) token refresh is rate-limited per session/);
   await bindChild(h, 'child-planner', 'graph-planner');
   const deliverableSpecs = SPECS.map((entry) => (entry.id === 'impl-1' ? { ...entry, deliverables: ['src/a.ts'] } : entry));
   const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs: deliverableSpecs }, ctx(h, 'child-planner', 'graph-planner')));
@@ -1547,6 +1548,139 @@ test('reset carry-over includes explorer learnings', async (t) => {
   const planning = await dispatch(h, 'graph-planner');
   assert.match(planning.args.prompt, /learnings/);
   assert.match(planning.args.prompt, /rotate tokens before refresh-window expiry/);
+});
+
+test('findings submissions retain bounded multi-version history', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-findings-log-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  const first = JSON.parse(await h.tools.graph_submit_findings.execute(
+    { summary: 'auth flow located', evidence: Array.from({ length: 10 }, (_unused, index) => `ev-${index + 1}`), learnings: ['cache poison risk'] },
+    ctx(h, 'child-explore', 'graph-explorer'),
+  ));
+  assert.equal(first.ok, true, JSON.stringify(first));
+  const second = JSON.parse(await h.tools.graph_submit_findings.execute(
+    { summary: 'token rotation mapped', evidence: ['src/token.ts:4'], learnings: ['token rotation window'] },
+    ctx(h, 'child-explore', 'graph-explorer'),
+  ));
+  assert.equal(second.ok, true, JSON.stringify(second));
+
+  // The latest slot stays authoritative; history keeps each version's own
+  // summary/learnings and bounds evidence at 8 entries.
+  const state = h.store.getRun('root');
+  assert.equal(state.artifacts.findings.version, 2);
+  assert.ok(Array.isArray(state.findingsLog));
+  assert.deepEqual(state.findingsLog.map((entry) => entry.version), [1, 2]);
+  assert.equal(state.findingsLog[0].summary, 'auth flow located');
+  assert.deepEqual(state.findingsLog[0].learnings, ['cache poison risk']);
+  assert.equal(state.findingsLog[1].summary, 'token rotation mapped');
+  assert.deepEqual(state.findingsLog[1].learnings, ['token rotation window']);
+  assert.deepEqual(state.findingsLog[0].evidence, Array.from({ length: 8 }, (_unused, index) => `ev-${index + 1}`));
+  await childIdle(h, 'child-explore');
+});
+
+test('findings history is FIFO-capped at 8 retained versions', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-findings-cap-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  for (let round = 1; round <= 10; round += 1) {
+    const outcome = JSON.parse(await h.tools.graph_submit_findings.execute(
+      { summary: `sweep ${round}`, evidence: [], learnings: [] },
+      ctx(h, 'child-explore', 'graph-explorer'),
+    ));
+    assert.equal(outcome.ok, true, JSON.stringify(outcome));
+  }
+  const state = h.store.getRun('root');
+  assert.equal(state.findingsLog.length, 8);
+  assert.deepEqual(state.findingsLog.map((entry) => entry.version), [3, 4, 5, 6, 7, 8, 9, 10]);
+  await childIdle(h, 'child-explore');
+});
+
+test('planner dispatch aggregates learnings across recent findings versions', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-learnings-agg-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  await h.tools.graph_submit_findings.execute(
+    { summary: 'auth flow located', evidence: [], learnings: ['cache poison risk'] },
+    ctx(h, 'child-explore', 'graph-explorer'),
+  );
+  await h.tools.graph_submit_findings.execute(
+    { summary: 'token rotation mapped', evidence: [], learnings: ['token rotation window'] },
+    ctx(h, 'child-explore', 'graph-explorer'),
+  );
+  await childIdle(h, 'child-explore');
+
+  const planning = await dispatch(h, 'graph-planner');
+  assert.match(planning.args.prompt, /Explorer learnings \(incorporate these/);
+  assert.ok(planning.args.prompt.includes('- (findings@2) token rotation window'));
+  assert.ok(planning.args.prompt.includes('- (findings@1) cache poison risk'));
+  // Newest version first so the freshest learnings survive the line cap.
+  assert.ok(
+    planning.args.prompt.indexOf('- (findings@2) token rotation window')
+      < planning.args.prompt.indexOf('- (findings@1) cache poison risk'),
+    planning.args.prompt,
+  );
+});
+
+test('legacy runs without findings history fall back to the latest artifact', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-learnings-legacy-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  await h.tools.graph_submit_findings.execute(
+    { summary: 'auth flow located', evidence: [], learnings: ['token refresh is rate-limited per session'] },
+    ctx(h, 'child-explore', 'graph-explorer'),
+  );
+  await childIdle(h, 'child-explore');
+
+  // Simulate a pre-retention run file: history is absent, artifact remains.
+  delete h.store.getRun('root').findingsLog;
+  const planning = await dispatch(h, 'graph-planner');
+  assert.match(planning.args.prompt, /- \(findings@1\) token refresh is rate-limited per session/);
+});
+
+test('learnings aggregation caps at 16 lines, newest version first', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-learnings-linecap-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'child-explore', 'graph-explorer');
+  await h.tools.graph_submit_findings.execute(
+    { summary: 'first sweep', evidence: [], learnings: Array.from({ length: 10 }, (_unused, index) => `old-${index + 1}`) },
+    ctx(h, 'child-explore', 'graph-explorer'),
+  );
+  await h.tools.graph_submit_findings.execute(
+    { summary: 'second sweep', evidence: [], learnings: Array.from({ length: 10 }, (_unused, index) => `new-${index + 1}`) },
+    ctx(h, 'child-explore', 'graph-explorer'),
+  );
+  await childIdle(h, 'child-explore');
+
+  const planning = await dispatch(h, 'graph-planner');
+  const lines = planning.args.prompt.split('\n').filter((line) => /^- \(findings@\d+\)/.test(line));
+  assert.equal(lines.length, 16);
+  assert.equal(lines.filter((line) => line.startsWith('- (findings@2)')).length, 10);
+  // The remaining budget drains the older version from its first learning.
+  assert.deepEqual(
+    lines.filter((line) => line.startsWith('- (findings@1)')),
+    Array.from({ length: 6 }, (_unused, index) => `- (findings@1) old-${index + 1}`),
+  );
 });
 
 test('light path: small fix runs plan → implement → verify without a critic', async (t) => {

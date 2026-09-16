@@ -70,14 +70,24 @@ function carryOverPrompt(state) {
   ].filter(Boolean).join('\n');
 }
 
-// Durable explorer lessons travel with the findings artifact: the planner
-// (and a successor run via carry-over) incorporates them instead of
-// re-deriving the same pitfalls from zero.
+// Learnings from the most recent findings versions travel into planner
+// dispatch prompts: parallel explorers each contribute, newest first, and
+// legacy runs without retained history fall back to the latest artifact.
 function learningsPrompt(state) {
-  const artifact = state.artifacts.findings;
-  const learnings = Array.isArray(artifact?.payload?.learnings) ? artifact.payload.learnings : [];
-  if (!learnings.length) return null;
-  return `[RUNNER] Explorer learnings from findings@${artifact.version} (incorporate these; re-validate against current state before relying on them):\n${learnings.slice(0, 16).map((item) => `- ${String(item)}`).join('\n')}`;
+  const history = Array.isArray(state.findingsLog) ? state.findingsLog.slice(-3).reverse() : [];
+  const sources = history.length ? history
+    : (Array.isArray(state.artifacts.findings?.payload?.learnings) && state.artifacts.findings.payload.learnings.length
+      ? [{ version: state.artifacts.findings.version, learnings: state.artifacts.findings.payload.learnings }] : []);
+  const lines = [];
+  for (const source of sources) {
+    for (const item of Array.isArray(source.learnings) ? source.learnings : []) {
+      if (lines.length >= 16) break;
+      lines.push(`- (findings@${source.version}) ${String(item)}`);
+    }
+    if (lines.length >= 16) break;
+  }
+  if (!lines.length) return null;
+  return `[RUNNER] Explorer learnings (incorporate these; re-validate against current state before relying on them):\n${lines.join('\n')}`;
 }
 
 const NODE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
