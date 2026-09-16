@@ -785,6 +785,15 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         return { name, kind: artifact.kind, version: artifact.version, status: artifact.status, basedOn: artifact.basedOn, ...(counts ? { counts } : {}) };
       }),
       violations: state.violations.slice(-20), sideEffectCount: state.sideEffects.length, mermaid,
+      // Retained findings versions stay observable: parallel explorers each
+      // contribute a version, and inspection surfaces them without dumping
+      // payloads (summary digest + learnings count only).
+      findingsHistory: (Array.isArray(state.findingsLog) ? state.findingsLog : []).slice(-8).map((entry) => ({
+        version: entry?.version ?? null,
+        nodeId: typeof entry?.nodeId === 'string' ? entry.nodeId : null,
+        learnings: Array.isArray(entry?.learnings) ? entry.learnings.length : 0,
+        summary: typeof entry?.summary === 'string' && entry.summary.length ? entry.summary.split('\n', 1)[0].slice(0, 200) : null,
+      })),
     };
   }
 

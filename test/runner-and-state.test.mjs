@@ -576,6 +576,38 @@ test('inspect surfaces learning counts on findings artifacts', () => {
   assert.deepEqual(counts, { learnings: 2 });
 });
 
+test('inspect lists retained findings history as digests, oldest to newest', () => {
+  const state = freshRun();
+  state.findingsLog.push(
+    { version: 1, nodeId: 'explore-1', summary: 'first line of a multi-line summary\nsecond line never leaks', evidence: ['e1'], learnings: [] },
+    { version: 2, nodeId: 'explore-1', summary: 'token rotation mapped', evidence: [], learnings: ['a', 'b'] },
+    { version: 3, nodeId: 'explore-2', summary: 'cache layers located', evidence: [], learnings: [] },
+  );
+  assert.deepEqual(runner.inspect(state).findingsHistory, [
+    { version: 1, nodeId: 'explore-1', learnings: 0, summary: 'first line of a multi-line summary' },
+    { version: 2, nodeId: 'explore-1', learnings: 2, summary: 'token rotation mapped' },
+    { version: 3, nodeId: 'explore-2', learnings: 0, summary: 'cache layers located' },
+  ]);
+
+  // Over-long first lines are truncated to a 200-char digest.
+  const longLine = 'x'.repeat(250);
+  state.findingsLog[0].summary = longLine;
+  const truncated = runner.inspect(state).findingsHistory[0].summary;
+  assert.equal(truncated.length, 200);
+  assert.equal(truncated, longLine.slice(0, 200));
+
+  // Inspection mirrors the stored 8-entry bound: only the newest 8 surface.
+  const capped = freshRun();
+  for (let version = 1; version <= 10; version++) capped.findingsLog.push({ version, nodeId: 'explore-1', summary: `s${version}`, evidence: [], learnings: [] });
+  const history = runner.inspect(capped).findingsHistory;
+  assert.equal(history.length, 8);
+  assert.deepEqual(history.map((entry) => entry.version), [3, 4, 5, 6, 7, 8, 9, 10]);
+
+  // Legacy states predating findingsLog inspect as an empty history.
+  delete state.findingsLog;
+  assert.deepEqual(runner.inspect(state).findingsHistory, []);
+});
+
 function lightGraph() {
   return validateTaskGraph([
     spec('plan-1', 'plan', 'graph-planner', {}),
