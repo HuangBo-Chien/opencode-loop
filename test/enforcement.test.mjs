@@ -16,9 +16,9 @@ const SPECS = [
   { id: 'verify-1', kind: 'verify', agent: 'graph-verifier', dependsOn: ['impl-1'], inputs: [], outputs: [], acceptance: ['verify'] },
 ];
 
-function harness(worktree) {
+function harness(worktree, { readerParallel } = {}) {
   const store = createRunStore({ worktree, stateDirectory: '.opencode-loop' });
-  const runner = createRunner({ maxAttempts: 3, maxPlanRevisions: 2 });
+  const runner = createRunner({ maxAttempts: 3, maxPlanRevisions: 2, readerParallel });
   const bindings = new Map();
   const journal = { enabled: true, includeUserRequest: true, semanticSearch: true, maxUserRequestChars: 8000 };
   const enforcement = createEnforcement({ settings: { worktree, journal }, store, runner, bindings });
@@ -1002,6 +1002,63 @@ test('critic approvedParallel downgrade mechanically serializes writers', async 
   assert.match(second.args.prompt, /RUNNER_REJECTED/);
   assert.match(second.args.prompt, /WRITER_CAPACITY/);
   assert.match(second.args.prompt, /1\/1/);
+});
+
+test('parallel explorers: free dispatches run concurrently under the reader gate and both findings versions survive', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-parallel-explorers-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir, { readerParallel: 2 });
+  await startRun(h);
+
+  // Free exploration phase, no plan yet: two same-turn explorer dispatches
+  // with distinct callIDs are both admitted against the shared reader gate.
+  const first = await dispatch(h, 'graph-explorer');
+  const second = await dispatch(h, 'graph-explorer');
+  assert.ok(!first.args.prompt.includes('RUNNER_REJECTED'), first.args.prompt);
+  assert.ok(!second.args.prompt.includes('RUNNER_REJECTED'), second.args.prompt);
+  await bindChild(h, 'child-x1', 'graph-explorer');
+  await bindChild(h, 'child-x2', 'graph-explorer');
+  assert.equal(h.bindings.get('child-x1').active, true);
+  assert.equal(h.bindings.get('child-x2').active, true);
+  const inFlight = h.enforcement.dispatches.inspect('root').filter((entry) => entry.agent === 'graph-explorer');
+  assert.deepEqual(inFlight.map((entry) => entry.sessionId), ['child-x1', 'child-x2']);
+  assert.deepEqual(inFlight.map((entry) => entry.bound), [true, true]);
+
+  // While both explorers are in flight a third dispatch fills 2/2 capacity.
+  const third = await dispatch(h, 'graph-explorer');
+  assert.match(third.args.prompt, /RUNNER_REJECTED/);
+  assert.match(third.args.prompt, /READER_CAPACITY/);
+  assert.match(third.args.prompt, /2\/2/);
+
+  // Each parallel explorer registers its own findings version while bound.
+  const v1 = JSON.parse(await h.tools.graph_submit_findings.execute(
+    { summary: 'auth module map', evidence: ['src/auth.ts:1'], learnings: ['auth cache poisoning risk'] },
+    ctx(h, 'child-x1', 'graph-explorer'),
+  ));
+  assert.equal(v1.ok, true, JSON.stringify(v1));
+  assert.equal(v1.artifact, 'findings@1');
+  const v2 = JSON.parse(await h.tools.graph_submit_findings.execute(
+    { summary: 'token lifecycle map', evidence: ['src/token.ts:1'], learnings: ['token rotation window drift'] },
+    ctx(h, 'child-x2', 'graph-explorer'),
+  ));
+  assert.equal(v2.ok, true, JSON.stringify(v2));
+  assert.equal(v2.artifact, 'findings@2');
+  assert.deepEqual(h.store.getRun('root').findingsLog.map((entry) => entry.version), [1, 2]);
+
+  // Finishing the first explorer frees its reader slot for a fourth dispatch.
+  await childIdle(h, 'child-x1');
+  const fourth = await dispatch(h, 'graph-explorer');
+  assert.ok(!fourth.args.prompt.includes('RUNNER_REJECTED'), fourth.args.prompt);
+
+  // The free planner prompt aggregates learnings from BOTH explorers' versions.
+  const planning = await dispatch(h, 'graph-planner');
+  assert.ok(planning.args.prompt.includes('- (findings@1) auth cache poisoning risk'), planning.args.prompt);
+  assert.ok(planning.args.prompt.includes('- (findings@2) token rotation window drift'), planning.args.prompt);
+
+  // The denied third call is the only gate-blocked dispatch on the run.
+  const gateBlocked = h.store.getRun('root').violations.filter((entry) => entry.kind === 'gate-blocked-dispatch');
+  assert.equal(gateBlocked.length, 1);
+  assert.match(gateBlocked[0].detail, /READER_CAPACITY/);
 });
 
 test('crash on the final attempt: refund plus cross-restart task_id continuation avoids reset', async (t) => {
