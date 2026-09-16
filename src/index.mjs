@@ -48,7 +48,7 @@ export default async function GraphPlugin(context, options = {}) {
     worktree,
   });
   const store = createJournaledRunStore(baseStore, journalService, lessonService);
-  const runner = createRunner({ maxAttempts: settings.maxAttempts, maxPlanRevisions: settings.maxPlanRevisions, implementerParallel: settings.maxImplementerParallel });
+  const runner = createRunner({ maxAttempts: settings.maxAttempts, maxPlanRevisions: settings.maxPlanRevisions, implementerParallel: settings.maxImplementerParallel, readerParallel: settings.maxParallel });
   const bindings = new Map();
   const enforcement = createEnforcement({ settings: { worktree, journal: settings.journal, lessons: settings.lessons }, store, runner, bindings, client: context.client, lessons: lessonService });
   const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches });
