@@ -81,6 +81,10 @@ test('registers exactly seven runner-gated agents, preserving native definitions
     'graph_journal_read',
     'graph_journal_search',
     'graph_journal_write_insight',
+    'graph_lesson_promote',
+    'graph_lesson_read',
+    'graph_lesson_record',
+    'graph_lesson_search',
     'graph_run_decide',
     'graph_run_new',
     'graph_run_resume',
@@ -91,6 +95,22 @@ test('registers exactly seven runner-gated agents, preserving native definitions
     'graph_submit_review',
     'graph_submit_verification',
   ]);
+});
+
+test('lesson tools stay registered in disabled mode and reject safely', async () => {
+  const { default: plugin } = await load();
+  const hooks = await plugin({}, { lessons: { enabled: false } });
+  const calls = [
+    ['graph_lesson_search', {}],
+    ['graph_lesson_read', { scope: 'project', id: 'a'.repeat(64) }],
+    ['graph_lesson_record', { title: 'Title', body: 'Body', category: 'pitfall', tags: [], observationIds: [] }],
+    ['graph_lesson_promote', { lessonId: 'a'.repeat(64), title: 'Title', body: 'Body', tags: [] }],
+  ];
+  for (const [name, args] of calls) {
+    assert.equal(typeof hooks.tool[name]?.execute, 'function');
+    const result = JSON.parse(await hooks.tool[name].execute(args, { sessionID: 'unbound', agent: 'graph-implementer' }));
+    assert.deepEqual(result, { ok: false, code: 'LESSON_DISABLED', detail: 'Lesson knowledge base is disabled' });
+  }
 });
 
 test('journal tools stay registered in disabled mode and reject safely', async () => {
@@ -308,7 +328,7 @@ test('status is read-only, truthful, stable and does not expose host secrets or 
   const hooks = await plugin({ directory: 'C:/private/project', secret: 'host-secret' });
   const output = await hooks.tool.graph_status.execute({}, new Proxy({}, { get() { throw new Error('host effects forbidden'); } }));
   const status = JSON.parse(output);
-  assert.equal(status.version, '0.3.0-alpha.12');
+  assert.equal(status.version, '0.3.0-alpha.13');
   assert.equal(status.enforcementScope, 'GRAPH_MANAGED_SESSIONS');
   assert.equal(status.enforcementAttested, false);
   assert.equal(status.runtimeAvailable, true);

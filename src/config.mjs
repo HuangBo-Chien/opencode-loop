@@ -36,6 +36,7 @@ export function parseOptions(input = {}) {
     maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 2,
     stateDirectory: '.opencode-loop', maxPlanRevisions: undefined, enforcement: 'hooks',
     journal: { enabled: true, includeUserRequest: true, semanticSearch: true, maxUserRequestChars: 8000 },
+    lessons: { enabled: true, injectMax: 4 },
   };
   for (const key of Reflect.ownKeys(input)) {
     if (typeof key !== 'string' || !Object.hasOwn(defaults, key)) throw new TypeError(`Unknown plugin option: ${String(key)}`);
@@ -79,5 +80,17 @@ export function parseOptions(input = {}) {
   if (!Number.isInteger(journal.maxUserRequestChars) || journal.maxUserRequestChars < 1 || journal.maxUserRequestChars > 32000) {
     throw new TypeError('journal.maxUserRequestChars must be an integer from 1 to 32000');
   }
-  return Object.freeze({ ...options, models: Object.freeze(models), journal: Object.freeze(journal) });
+  record(options.lessons, 'lessons');
+  const lessons = { ...defaults.lessons };
+  for (const name of Reflect.ownKeys(options.lessons)) {
+    if (typeof name !== 'string' || !Object.hasOwn(lessons, name)) throw new TypeError(`Unknown lessons option: ${String(name)}`);
+    const descriptor = Object.getOwnPropertyDescriptor(options.lessons, name);
+    if (!Object.hasOwn(descriptor, 'value')) throw new TypeError('Lessons options must contain values, not getters');
+    lessons[name] = descriptor.value;
+  }
+  if (typeof lessons.enabled !== 'boolean') throw new TypeError('lessons.enabled must be a boolean');
+  if (!Number.isInteger(lessons.injectMax) || lessons.injectMax < 0 || lessons.injectMax > 8) {
+    throw new TypeError('lessons.injectMax must be an integer from 0 to 8');
+  }
+  return Object.freeze({ ...options, models: Object.freeze(models), journal: Object.freeze(journal), lessons: Object.freeze(lessons) });
 }

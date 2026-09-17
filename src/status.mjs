@@ -77,7 +77,28 @@ function journalStatus(options, runtime, unavailable) {
   });
 }
 
-export function createStatusTool(options, journalService) {
+function lessonsStatus(options, runtime, unavailable) {
+  const enabled = options.lessons.enabled;
+  return Object.freeze({
+    enabled,
+    injectMax: options.lessons.injectMax,
+    projectAvailable: unavailable ? false : runtime?.projectAvailable === true,
+    projected: count(runtime?.projected),
+    backfilled: count(runtime?.backfilled),
+    failures: count(runtime?.failures),
+    lastError: unavailable ? 'Lesson status unavailable' : runtime?.lastError ?? null,
+    store: Object.freeze({
+      project: Object.freeze({ entries: count(runtime?.store?.project?.entries), corrupt: count(runtime?.store?.project?.corrupt) }),
+      global: Object.freeze({ entries: count(runtime?.store?.global?.entries), corrupt: count(runtime?.store?.global?.corrupt) }),
+    }),
+    storage: Object.freeze({
+      project: `${options.stateDirectory}/lessons`,
+      global: '~/.config/opencode/opencode-loop/lessons',
+    }),
+  });
+}
+
+export function createStatusTool(options, journalService, lessonService = null) {
   return tool({
     description: 'Report plugin capabilities and enforcement scope. Does not start, inspect, or mutate graph runs (use graph_inspect / graph_run_resume).',
     args: {},
@@ -89,6 +110,16 @@ export function createStatusTool(options, journalService) {
         if (runtime === null || typeof runtime !== 'object' || Array.isArray(runtime)) throw new TypeError('Invalid journal status');
       } catch {
         unavailable = true;
+      }
+      let lessonRuntime = null;
+      let lessonUnavailable = lessonService === null;
+      if (lessonService !== null) {
+        try {
+          lessonRuntime = await lessonService.status();
+          if (lessonRuntime === null || typeof lessonRuntime !== 'object' || Array.isArray(lessonRuntime)) throw new TypeError('Invalid lesson status');
+        } catch {
+          lessonUnavailable = true;
+        }
       }
       return JSON.stringify({
         package: 'opencode-loop', version,
@@ -107,6 +138,7 @@ export function createStatusTool(options, journalService) {
         },
         stateDirectory: options.stateDirectory,
         journal: journalStatus(options, runtime, unavailable),
+        lessons: lessonsStatus(options, lessonRuntime, lessonUnavailable),
       });
     },
   });

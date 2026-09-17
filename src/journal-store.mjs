@@ -15,10 +15,38 @@ export const JOURNAL_SEARCH_MAX_BYTES = 2 * 1024 * 1024;
 const ID_PATTERN = /^[a-f0-9]{64}$/;
 const ENTRY_KEYS = Object.freeze(['body', 'createdAt', 'id', 'kind', 'metadata', 'schemaVersion', 'scope', 'sourceIds', 'tags', 'title']);
 const EMBEDDING_KEYS = Object.freeze(['digest', 'dimensions', 'schemaVersion', 'space', 'spaceDigest', 'vector']);
-const KINDS = Object.freeze({
+const DEFAULT_KINDS = Object.freeze({
   project: new Set(['run-summary', 'insight']),
   global: new Set(['promoted-insight']),
 });
+const SUBDIRECTORY_PATTERN = /^(?!\.+$)[A-Za-z0-9.][A-Za-z0-9._-]{0,63}$/;
+
+// A store instance may restrict the entry kinds it accepts (e.g. the lesson
+// knowledge base allows only lesson kinds) and choose the storage subdirectory
+// next to the run-state directory, so separate knowledge stores never share
+// files while reusing every storage safety rule unchanged.
+function normalizeKinds(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('Journal kinds must map scopes to kind lists');
+  const normalized = {};
+  for (const scope of ['project', 'global']) {
+    const list = value[scope];
+    if (!Array.isArray(list) && !(list instanceof Set)) throw new TypeError('Journal kinds must map scopes to kind lists');
+    const set = new Set([...list]);
+    if (!set.size) throw new TypeError('Journal kind lists must not be empty');
+    for (const kind of set) {
+      if (typeof kind !== 'string' || !kind.length || kind.length > 64) throw new TypeError('Journal kinds must be bounded strings');
+    }
+    normalized[scope] = set;
+  }
+  return Object.freeze({ project: normalized.project, global: normalized.global });
+}
+
+function validateSubdirectory(value) {
+  if (typeof value !== 'string' || !SUBDIRECTORY_PATTERN.test(value) || value === '.' || value === '..' || value.includes('/') || value.includes('\\') || isAbsolute(value)) {
+    throw new TypeError('subdirectory must be a safe single path segment');
+  }
+  return value;
+}
 const MAX_BODY_CHARS = 1_000_000;
 const MAX_ENTRY_BYTES = 4_200_000;
 const MAX_EMBEDDING_BYTES = 262_144;
@@ -80,7 +108,7 @@ function stringArray(value, name) {
   for (const item of value) boundedString(item, `${name} item`, 256);
 }
 
-function validateEntry(input, expectedScope) {
+function validateEntry(input, expectedScope, kindsByScope = DEFAULT_KINDS) {
   const scope = validateScope(expectedScope);
   const value = cleanJson(input, { maxBytes: MAX_ENTRY_BYTES, maxValues: 10_000, maxDepth: 32 });
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('Journal entry must be a plain JSON object');
@@ -88,7 +116,7 @@ function validateEntry(input, expectedScope) {
   if (value.schemaVersion !== JOURNAL_SCHEMA_VERSION) throw new TypeError('Journal entry schema version mismatch');
   validateId(value.id);
   if (value.scope !== scope) throw new TypeError(`Journal entry scope must be ${scope}`);
-  if (!KINDS[scope].has(value.kind)) throw new TypeError(`Journal kind ${value.kind} is not permitted in ${scope} scope`);
+  if (!kindsByScope[scope].has(value.kind)) throw new TypeError(`Journal kind ${value.kind} is not permitted in ${scope} scope`);
   boundedString(value.title, 'Journal title', 512);
   boundedString(value.createdAt, 'Journal createdAt', 128);
   boundedString(value.body, 'Journal body', MAX_BODY_CHARS);
@@ -177,20 +205,22 @@ function sameFileIdentity(expected, current) {
   return !identityAvailable || !inodeIsMeaningful || (expected.dev === current.dev && expected.ino === current.ino);
 }
 
-export function createJournalStore({ worktree, stateDirectory = '.opencode-loop', globalDirectory } = {}) {
+export function createJournalStore({ worktree, stateDirectory = '.opencode-loop', globalDirectory, subdirectory = 'journal', kinds } = {}) {
   if (worktree !== undefined && worktree !== null && (typeof worktree !== 'string' || !worktree.length)) throw new TypeError('worktree must be a nonempty string when provided');
   if (typeof stateDirectory !== 'string' || !stateDirectory.length || stateDirectory.includes('\\') || isAbsolute(stateDirectory)
     || stateDirectory.split('/').some((part) => part === '' || part === '.' || part === '..')) {
     throw new TypeError('stateDirectory must be a safe relative path');
   }
+  validateSubdirectory(subdirectory);
+  const kindsByScope = kinds === undefined ? DEFAULT_KINDS : normalizeKinds(kinds);
   if (globalDirectory !== undefined && (typeof globalDirectory !== 'string' || !globalDirectory.length)) throw new TypeError('globalDirectory must be a nonempty string when provided');
 
   const resolvedWorktree = typeof worktree === 'string' ? resolve(worktree) : null;
-  const projectDirectory = resolvedWorktree === null ? null : join(resolvedWorktree, stateDirectory, 'journal', 'entries');
-  const projectIndexDirectory = resolvedWorktree === null ? null : join(resolvedWorktree, stateDirectory, 'journal', 'index');
-  const projectDirectoryParts = [...stateDirectory.split('/'), 'journal', 'entries'];
-  const projectIndexDirectoryParts = [...stateDirectory.split('/'), 'journal', 'index'];
-  const resolvedGlobalDirectory = resolve(globalDirectory ?? join(homedir(), '.config', 'opencode', 'opencode-loop', 'journal', 'entries'));
+  const projectDirectory = resolvedWorktree === null ? null : join(resolvedWorktree, stateDirectory, subdirectory, 'entries');
+  const projectIndexDirectory = resolvedWorktree === null ? null : join(resolvedWorktree, stateDirectory, subdirectory, 'index');
+  const projectDirectoryParts = [...stateDirectory.split('/'), subdirectory, 'entries'];
+  const projectIndexDirectoryParts = [...stateDirectory.split('/'), subdirectory, 'index'];
+  const resolvedGlobalDirectory = resolve(globalDirectory ?? join(homedir(), '.config', 'opencode', 'opencode-loop', subdirectory, 'entries'));
   const resolvedGlobalIndexDirectory = join(dirname(resolvedGlobalDirectory), 'index');
   if (projectDirectory !== null) {
     const configuredProjectRoots = [projectDirectory, projectIndexDirectory];
@@ -486,11 +516,10 @@ export function createJournalStore({ worktree, stateDirectory = '.opencode-loop'
     if (frontmatter === null || typeof frontmatter !== 'object' || Array.isArray(frontmatter) || Object.hasOwn(frontmatter, 'body')) {
       throw new Error(`Journal entry ${id} has invalid frontmatter`);
     }
-    const parsed = validateEntry({ ...frontmatter, body: raw.slice(delimiter + 5) }, scope);
+    const parsed = validateEntry({ ...frontmatter, body: raw.slice(delimiter + 5) }, scope, kindsByScope);
     if (parsed.id !== id) throw new Error(`Journal entry ${id} does not match its path`);
     return parsed;
   }
-
   async function readEntryFile(scope, id, target, canonicalRoot, knownInfo, maxBytes = MAX_ENTRY_BYTES) {
     let info = knownInfo;
     if (info === undefined) {
@@ -529,7 +558,7 @@ export function createJournalStore({ worktree, stateDirectory = '.opencode-loop'
   }
 
   async function write(scope, input) {
-    const entry = validateEntry(input, scope);
+    const entry = validateEntry(input, scope, kindsByScope);
     const { base, canonicalRoot } = await prepare(scope, true);
     const target = entryPath(base, entry.id);
     const content = serializeEntry(entry);

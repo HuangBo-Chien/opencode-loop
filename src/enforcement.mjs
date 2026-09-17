@@ -8,12 +8,13 @@ import { captureRequest } from './journal-text.mjs';
 import { matchScopePath, normalizeScopePath } from './task-spec.mjs';
 import { firstOutOfScopeShellWrite } from './shell-scope.mjs';
 import { createDispatchBindings } from './dispatch-bindings.mjs';
+import { formatLessonsBlock } from './lessons.mjs';
 
 const READ_ONLY_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-multimodal']);
 // Tools that never mutate run state or the workspace stay available to graph
 // children even when their dispatch binding is gone (rejected dispatch, idle
 // session, terminated run). Write paths keep failing closed.
-const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'list', 'graph_status', 'graph_inspect', 'graph_journal_search', 'graph_journal_read']);
+const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'list', 'graph_status', 'graph_inspect', 'graph_journal_search', 'graph_journal_read', 'graph_lesson_search', 'graph_lesson_read']);
 const NOW = () => new Date().toISOString();
 
 function rejectionPrompt(decision) {
@@ -92,8 +93,27 @@ function parseNodeIdHint(args) {
   return match ? match[1] : null;
 }
 
-export function createEnforcement({ settings, store, runner, bindings, client, dispatches = createDispatchBindings({ store, runner, bindings, client }) }) {
+export function createEnforcement({ settings, store, runner, bindings, client, dispatches = createDispatchBindings({ store, runner, bindings, client }), lessons = null }) {
   const deniedCalls = new Map();
+
+  // Known project lessons ride into explorer/planner/implementer dispatches.
+  // The hot path stays embedding-free (ranking is mechanical: path overlap,
+  // tags, occurrence counts, recency) and every failure is fail-open — a
+  // lesson-store problem must never block or even delay a dispatch.
+  async function dispatchLessonsBlock(paths, promptExcerpt) {
+    if (lessons === null) return null;
+    if (settings.lessons?.enabled === false || !(settings.lessons?.injectMax > 0)) return null;
+    try {
+      const relevant = await lessons.relevantLessons({
+        text: typeof promptExcerpt === 'string' ? promptExcerpt.slice(0, 500) : '',
+        paths: Array.isArray(paths) ? paths : [],
+        limit: settings.lessons.injectMax,
+      });
+      return formatLessonsBlock(relevant);
+    } catch {
+      return null;
+    }
+  }
 
   function toWorkspaceRelative(target) {
     if (typeof target !== 'string' || !target.length) return null;
@@ -252,6 +272,10 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
           const learnings = learningsPrompt(state);
           if (learnings) authoritative.push(learnings);
         }
+        if (spec && (spec.kind === 'implement' || spec.kind === 'plan')) {
+          const block = await dispatchLessonsBlock(spec.writeScope ?? [], args.prompt);
+          if (block) authoritative.push(block);
+        }
         prompt = `[RUNNER] Assigned nodeId: ${decision.nodeId}. Submit only this node.${authoritative.length ? `\n${authoritative.join('\n')}` : ''}\n${prompt}`;
         if (decision.reconcile) prompt = `${reconcilePrompt(state, decision.nodeId)}\n\n${prompt}`;
         const guidance = revisionPrompt(decision);
@@ -263,6 +287,8 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
           const learnings = learningsPrompt(state);
           if (learnings) prompt = `${learnings}\n\n${prompt}`;
         }
+        const block = await dispatchLessonsBlock([], args.prompt);
+        if (block) prompt = `${block}\n\n${prompt}`;
       }
       output.args = { ...args, prompt };
       return;
