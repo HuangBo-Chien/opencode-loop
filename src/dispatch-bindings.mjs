@@ -1,6 +1,7 @@
 // Native task correlation. Session creation order is not dispatch order.
 // Only host task metadata, keyed by parent session + callID, can bind work.
 import { randomUUID } from 'node:crypto';
+import { resolveNodeIdHint, TARGET_REQUIRED_AGENTS } from './dispatch-target.mjs';
 
 const NOW = () => new Date().toISOString();
 const key = (root, call) => JSON.stringify([root, call]);
@@ -12,8 +13,6 @@ const CONTINUABLE_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-pla
 // Read-only consultation roles whose free (unbound) dispatches share one
 // capacity budget with node-bound explore/analyze work.
 const READ_CONSULT_AGENTS = new Set(['graph-explorer', 'graph-multimodal']);
-const TARGET_REQUIRED_AGENTS = new Set(['graph-implementer', 'graph-verifier']);
-
 export function createDispatchBindings({ store, runner, bindings, client }) {
   const records = new Map();
   const parents = new Map();
@@ -43,6 +42,13 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
   async function admit(rootSessionId, callID, args, desiredNodeId = null) {
     const root = bindings.get(rootSessionId);
     if (!root?.root) return denied('NOT_GRAPH_SESSION', 'task dispatch requires the root orchestrator');
+    const agent = args?.subagent_type;
+    const targetDecision = resolveNodeIdHint(args, desiredNodeId, { strict: TARGET_REQUIRED_AGENTS.has(agent) });
+    if (!targetDecision.allowed) return targetDecision;
+    const target = targetDecision.nodeId;
+    if (target === null && TARGET_REQUIRED_AGENTS.has(agent)) {
+      return denied('NODE_ID_REQUIRED', `${agent} requires an explicit nodeId for every dispatch, including task_id continuations and single-node graphs; put [nodeId:target-node] alone on the first prompt line`);
+    }
     return exclusive(root.runId, async () => {
       const state = store.getRun(root.runId);
       if (!state) return denied('RUN_GONE', 'owning run is unavailable');
@@ -51,16 +57,6 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       if (typeof callID !== 'string' || !callID.length || callID.length > 256 || used.includes(recordKey)) return denied('DUPLICATE_DISPATCH', 'a unique host callID is required, including after recovery');
       if (used.length >= 4096) return denied('DISPATCH_LIMIT', 'run dispatch history reached its bounded limit');
       if ([...records.values()].filter((r) => r.runId === root.runId).length >= 128) return denied('DISPATCH_LIMIT', 'too many outstanding task calls');
-      const agent = args.subagent_type;
-      // Enforce at the reservation boundary too: neither direct callers nor
-      // task_id continuations may silently choose a different work package.
-      if (desiredNodeId !== null && (typeof desiredNodeId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(desiredNodeId))) {
-        return denied('INVALID_NODE_ID', 'dispatch target must be a valid node identifier');
-      }
-      const target = desiredNodeId;
-      if (target === null && TARGET_REQUIRED_AGENTS.has(agent)) {
-        return denied('NODE_ID_REQUIRED', `${agent} requires an explicit nodeId for every dispatch, including task_id continuations and single-node graphs; put [nodeId:target-node] alone on the first prompt line`);
-      }
       // A free-role continuation keeps the session identity: round-1
       // planners, explorers and multimodal sessions are free-bound (no node
       // identity to resume), but their conversation can still pick up the

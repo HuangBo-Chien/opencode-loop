@@ -50,10 +50,40 @@ for (const agent of ['graph-implementer', 'graph-verifier']) {
       assert.equal(result.code, code);
       assert.equal(result.allowed, false);
       assert.deepEqual(h.enforcement.dispatches.inspect('root'), []);
+      assert.equal(Object.hasOwn(h.state, 'dispatchCallIds'), false);
     }
     assert.deepEqual(h.state.dispatchCallIds ?? [], []);
   });
 }
+
+test('strict target: direct admission validates every target source before reserving', async () => {
+  for (const args of [
+    { nodeId: 'a' },
+    { prompt: '[nodeId:a]\nImplement A' },
+  ]) {
+    const h = await harness();
+    const before = structuredClone(h.state);
+    const result = await h.enforcement.dispatches.admit(
+      'root',
+      'conflict',
+      { subagent_type: 'graph-implementer', ...args },
+      'b',
+    );
+    assert.equal(result.code, 'CONFLICTING_NODE_ID');
+    assert.equal(result.allowed, false);
+    assert.deepEqual(h.state, before);
+    assert.deepEqual(h.enforcement.dispatches.inspect('root'), []);
+  }
+
+  const h = await harness();
+  const result = await h.enforcement.dispatches.admit(
+    'root',
+    'argument-only',
+    { subagent_type: 'graph-implementer', nodeId: 'a' },
+  );
+  assert.equal(result.allowed, true, JSON.stringify(result));
+  assert.equal(result.nodeId, 'a');
+});
 
 const invalidTargets = [
   ['inline marker', '[nodeId:b] Implement B', {}, 'INVALID_NODE_ID'],

@@ -1069,6 +1069,18 @@ test('parallel explorers: free dispatches run concurrently under the reader gate
   assert.match(gateBlocked[0].detail, /READER_CAPACITY/);
 });
 
+for (const agent of ['graph-explorer', 'graph-multimodal']) {
+  test(`${agent} free dispatch ignores marker-like prose`, async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), `loop-free-marker-${agent}-`));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const h = harness(dir);
+    await startRun(h);
+
+    const result = await dispatch(h, agent, { prompt: 'Inspect the [nodeId: syntax in the parser documentation' });
+    assert.ok(!result.args.prompt.includes('RUNNER_REJECTED'), result.args.prompt);
+  });
+}
+
 test('crash on the final attempt: refund plus cross-restart task_id continuation avoids reset', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'loop-crash-final-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
