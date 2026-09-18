@@ -1,5 +1,6 @@
 import { tool } from '@opencode-ai/plugin/tool';
 import { JOURNAL_STAGE_ERRORS, safeJournalStage } from './journal-errors.mjs';
+import { MAX_AUTHORED_BODY_INPUT_CHARS } from './journal-text.mjs';
 
 const z = tool.schema;
 const READ_ROLES = new Set(['graph-orchestrator', 'graph-explorer', 'graph-planner', 'graph-plan-critic']);
@@ -102,7 +103,7 @@ export function createJournalTools({ journalService, store, bindings, dispatches
     description: 'Write a sanitized project insight linked to the current terminal run summary.',
     args: {
       title: z.string().min(1).max(512),
-      body: z.string().min(1).max(32_000),
+      body: z.string().min(1).max(MAX_AUTHORED_BODY_INPUT_CHARS),
       tags: tags(),
     },
     async execute(args, context) {
@@ -119,7 +120,7 @@ export function createJournalTools({ journalService, store, bindings, dispatches
     args: {
       insightId: z.string().regex(ID),
       title: z.string().min(1).max(512),
-      body: z.string().min(1).max(32_000),
+      body: z.string().min(1).max(MAX_AUTHORED_BODY_INPUT_CHARS),
       tags: tags(),
     },
     async execute(args, context) {

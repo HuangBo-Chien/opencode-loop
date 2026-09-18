@@ -6,6 +6,7 @@
 
 import { tool } from '@opencode-ai/plugin/tool';
 import { safeJournalStage } from './journal-errors.mjs';
+import { MAX_AUTHORED_BODY_INPUT_CHARS } from './journal-text.mjs';
 
 const z = tool.schema;
 const READ_ROLES = new Set(['graph-orchestrator', 'graph-explorer', 'graph-planner', 'graph-plan-critic']);
@@ -106,7 +107,7 @@ export function createLessonTools({ lessonService, store, bindings, dispatches =
     description: 'Record a curated lesson on the current terminal run: an unexpected behavior or repeated mistake worth avoiding, with category, rule and trigger context. Mechanical observations are already projected automatically; use this to distill and refine them.',
     args: {
       title: z.string().min(1).max(512),
-      body: z.string().min(1).max(32_000),
+      body: z.string().min(1).max(MAX_AUTHORED_BODY_INPUT_CHARS),
       category: z.enum(['pitfall', 'surprise', 'repeated-mistake']),
       tags: tags(),
       observationIds: z.array(z.string().regex(ID)).max(8).default([]),
@@ -125,7 +126,7 @@ export function createLessonTools({ lessonService, store, bindings, dispatches =
     args: {
       lessonId: z.string().regex(ID),
       title: z.string().min(1).max(512),
-      body: z.string().min(1).max(32_000),
+      body: z.string().min(1).max(MAX_AUTHORED_BODY_INPUT_CHARS),
       tags: tags(),
     },
     async execute(args, context) {

@@ -4,7 +4,6 @@ import {
   cosineSimilarity,
   createEmbeddingProvider,
   embeddingSpaceDigest,
-  meanNormalizedVector,
   validateEmbeddingSpace,
 } from './embeddings.mjs';
 import {
@@ -144,20 +143,6 @@ function matchesMetadata(entry, filters) {
 
 function indexText(entry) {
   return `${entry.title}\n\n${entry.body}`;
-}
-
-function indexChunks(text, space) {
-  const { maxChunkChars, maxChunks, maxIndexedChars } = space;
-  if (text.length <= maxIndexedChars) {
-    const chunks = [];
-    for (let start = 0; start < text.length; start += maxChunkChars) chunks.push(text.slice(start, start + maxChunkChars));
-    return chunks;
-  }
-  const finalStart = text.length - maxChunkChars;
-  return Array.from({ length: maxChunks }, (_, index) => {
-    const start = index === maxChunks - 1 ? finalStart : Math.floor((finalStart * index) / (maxChunks - 1));
-    return text.slice(start, start + maxChunkChars);
-  });
 }
 
 function textDigest(text) {
@@ -343,9 +328,7 @@ export function createJournalSearch({ store, embeddingProvider, semanticSearch =
           catch { throw journalStageError('JOURNAL_INDEX_READ_FAILED'); }
           const reusable = reusableVector(sidecar, spaceDigest, digest, queryVector.length);
           if (reusable !== null) return reusable;
-          const chunkVectors = [];
-          for (const chunk of indexChunks(text, space)) chunkVectors.push(validatedVector(await embed(chunk)));
-          const vector = meanNormalizedVector(chunkVectors);
+          const vector = validatedVector(await embed(text));
           if (vector.length !== queryVector.length) throw new TypeError('Query and journal embedding dimensions must match');
           try { await store.writeEmbedding(entry.scope, entry.id, {
             schemaVersion: JOURNAL_EMBEDDING_SCHEMA_VERSION,

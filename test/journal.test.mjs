@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import GraphPlugin from '../src/index.mjs';
 import { createJournalService, createJournaledRunStore } from '../src/journal.mjs';
 import { createJournalStore, stableJournalId } from '../src/journal-store.mjs';
+import { MAX_INDEXED_TEXT_CHARS } from '../src/journal-text.mjs';
 import { createRunStore, newRun } from '../src/run-state.mjs';
 
 const CREATED_AT = '2026-09-10T10:00:00.000Z';
@@ -228,7 +229,7 @@ test('SUCCEEDED projection writes bounded sanitized metadata and Markdown eviden
   assert.match(entry.body, /Follow up token=\[REDACTED\]/);
   assert.match(entry.body, /node --test token=\[REDACTED\][\s\S]*exit 0/i);
   assert.match(entry.body, /scope-warning[\s\S]*Reviewed token=\[REDACTED\]/);
-  assert.ok(entry.body.length <= 32_000);
+  assert.ok(`${entry.title}\n\n${entry.body}`.length <= MAX_INDEXED_TEXT_CHARS);
   assert.ok(entry.metadata.request.text.length <= 8000);
 
   const serialized = JSON.stringify(entry);
@@ -285,7 +286,15 @@ test('FAILED projection records unavailable request, failure reason, and violati
 
 test('projection bounds aggregate metadata for large valid run evidence', async (t) => {
   const { worktree, store, service } = await serviceWithRealStore(t);
-  const state = terminalRun({ runId: 'run-bounded' });
+  const state = terminalRun({
+    runId: 'run-bounded',
+    request: {
+      text: 'r'.repeat(8000),
+      truncated: false,
+      redactions: 0,
+      capturedAt: CREATED_AT,
+    },
+  });
   state.artifacts = {};
   for (let artifactIndex = 0; artifactIndex < 16; artifactIndex += 1) {
     const changeName = `change:impl-${artifactIndex}`;
@@ -333,10 +342,86 @@ test('projection bounds aggregate metadata for large valid run evidence', async 
   const entry = await store.read('project', summaryId(worktree, state.runId));
   assert.ok(entry, 'large bounded evidence should still project');
   assert.ok(Buffer.byteLength(JSON.stringify(entry.metadata), 'utf8') <= 262_144);
-  assert.ok(entry.body.length <= 32_000);
+  assert.equal(`${entry.title}\n\n${entry.body}`.length, MAX_INDEXED_TEXT_CHARS);
+  assert.equal(entry.metadata.request.truncated, false);
+  assert.ok(entry.body.endsWith('\n\n[truncated]'), 'aggregate truncation marker must fit inside the indexed-text boundary');
   assert.ok(entry.metadata.changes.length > 0 && entry.metadata.changes.length < 16);
   assert.ok(entry.metadata.verifications.length > 0 && entry.metadata.verifications.length < 16);
   assert.ok(entry.metadata.violations.length > 0 && entry.metadata.violations.length < 32);
+});
+
+test('run-summary truncation keeps astral evidence and its marker well-formed', async (t) => {
+  const { worktree, globalDirectory } = await roots(t, 'loop-journal-astral-summary-');
+  const runStore = createRunStore({ worktree });
+  const realStore = createJournalStore({ worktree, globalDirectory });
+  let submittedEntry = null;
+  const store = {
+    ...realStore,
+    async write(scope, entry) {
+      if (entry.kind === 'run-summary') submittedEntry = entry;
+      return realStore.write(scope, entry);
+    },
+  };
+  const service = createJournalService({
+    runStore,
+    journalStore: store,
+    journalSearch: journalSearch(),
+    worktree,
+  });
+  const requestPrefix = 'Astral summary\n';
+  const state = terminalRun({
+    runId: 'run-astral-boundary',
+    request: {
+      text: `${requestPrefix}${'r'.repeat(8000 - requestPrefix.length)}`,
+      truncated: false,
+      redactions: 0,
+      capturedAt: CREATED_AT,
+    },
+  });
+  state.artifacts = {
+    'change:astral': {
+      kind: 'change',
+      nodeId: 'impl-astral',
+      version: 1,
+      status: 'valid',
+      payload: {
+        filesTouched: Array.from({ length: 4 }, (_, index) => `src/${index}-${'😀'.repeat(300)}.mjs`),
+        summary: '😀'.repeat(1000),
+        unresolved: Array.from({ length: 4 }, () => '😀'.repeat(1000)),
+      },
+    },
+  };
+
+  const first = await service.projectRun(state);
+  const written = await realStore.read('project', summaryId(worktree, state.runId));
+  const second = await service.projectRun(structuredClone(state));
+  const reread = await realStore.read('project', summaryId(worktree, state.runId));
+
+  assert.equal(first.created, true);
+  assert.equal(second.created, false);
+  assert.ok(submittedEntry);
+  assert.equal(submittedEntry.title.isWellFormed(), true);
+  assert.equal(submittedEntry.body.isWellFormed(), true);
+  assert.equal(written.title.isWellFormed(), true);
+  assert.equal(written.body.isWellFormed(), true);
+  assert.ok(written.body.endsWith('\n\n[truncated]'));
+  assert.ok(`${written.title}\n\n${written.body}`.length <= MAX_INDEXED_TEXT_CHARS);
+  assert.deepEqual(written, submittedEntry);
+  assert.deepEqual(reread, written);
+});
+
+test('run-summary projection filters an ill-formed optional field without losing the run', async (t) => {
+  const { worktree, store, service } = await serviceWithRealStore(t);
+  const state = terminalRun({ runId: 'run-ill-formed-optional' });
+  state.artifacts['change:impl-1'].payload.summary = 'bad\uD800';
+
+  const result = await service.projectRun(state);
+  const entry = await store.read('project', summaryId(worktree, state.runId));
+
+  assert.equal(result.created, true);
+  assert.ok(entry);
+  assert.equal(entry.metadata.changes[0].summary, null);
+  assert.equal(entry.body.isWellFormed(), true);
 });
 
 test('projection does not inspect malformed list items beyond its cap', async (t) => {

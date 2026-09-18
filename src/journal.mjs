@@ -1,12 +1,16 @@
 import { resolve } from 'node:path';
 import { JOURNAL_SCHEMA_VERSION, stableJournalId } from './journal-store.mjs';
-import { sanitizeJournalText } from './journal-text.mjs';
+import {
+  codePointSafePrefix,
+  MAX_INDEXED_TEXT_CHARS,
+  sanitizeIndexedEntryText,
+  sanitizeJournalText,
+  sanitizeJournalTextForLegacyReplay,
+} from './journal-text.mjs';
 import { safeJournalStage } from './journal-errors.mjs';
 
 const TERMINAL_STATUSES = new Set(['SUCCEEDED', 'FAILED', 'ABORTED']);
 const MAX_REQUEST_CHARS = 8000;
-const MAX_BODY_CHARS = 32_000;
-const MAX_TITLE_CHARS = 512;
 const MAX_TEXT_CHARS = 1000;
 const MAX_IDENTIFIER_CHARS = 128;
 const MAX_TAGS = 16;
@@ -20,7 +24,7 @@ const MAX_PENDING_BACKFILL_RUNS = 64;
 const MAX_BACKFILL_OFFSET = 1_000_000;
 
 function sanitizedText(value, limit = MAX_TEXT_CHARS) {
-  if (typeof value !== 'string') return null;
+  if (typeof value !== 'string' || !value.isWellFormed()) return null;
   const result = sanitizeJournalText(value, limit);
   return result.text.length ? result : null;
 }
@@ -28,6 +32,13 @@ function sanitizedText(value, limit = MAX_TEXT_CHARS) {
 function oneLine(value, limit = MAX_IDENTIFIER_CHARS) {
   const sanitized = sanitizedText(value, limit);
   if (sanitized === null) return null;
+  const text = sanitized.text.replace(/\s+/g, ' ').trim();
+  return text.length ? text.slice(0, limit) : null;
+}
+
+function oneLineForLegacyReplay(value, limit = MAX_IDENTIFIER_CHARS) {
+  if (typeof value !== 'string') return null;
+  const sanitized = sanitizeJournalTextForLegacyReplay(value, limit);
   const text = sanitized.text.replace(/\s+/g, ' ').trim();
   return text.length ? text.slice(0, limit) : null;
 }
@@ -169,11 +180,12 @@ function violationSummaries(state) {
   return violations;
 }
 
-function boundedBody(lines) {
-  const sanitized = sanitizeJournalText(lines.join('\n'), MAX_BODY_CHARS);
+function boundedBody(lines, title) {
+  const bodyLimit = MAX_INDEXED_TEXT_CHARS - title.length - 2;
+  const sanitized = sanitizeJournalText(lines.join('\n'), bodyLimit);
   if (!sanitized.truncated) return sanitized.text;
   const marker = '\n\n[truncated]';
-  return `${sanitized.text.slice(0, MAX_BODY_CHARS - marker.length)}${marker}`;
+  return `${codePointSafePrefix(sanitized.text, bodyLimit - marker.length)}${marker}`;
 }
 
 function journalError(code) {
@@ -183,22 +195,48 @@ function journalError(code) {
 }
 
 function sanitizedEntryContent({ title, body, tags = [] } = {}) {
-  const sanitizedTitle = oneLine(title, MAX_TITLE_CHARS);
-  const sanitizedBody = sanitizedText(body, MAX_BODY_CHARS)?.text ?? null;
-  if (sanitizedTitle === null || sanitizedBody === null) throw new TypeError('Journal title and body must be nonempty strings');
+  const text = sanitizeIndexedEntryText({ title, body });
+  if (text === null) throw new TypeError('Journal title and body must be nonempty strings');
   if (!Array.isArray(tags)) throw new TypeError('Journal tags must be an array');
   const sanitizedTags = [];
+  const legacyTags = [];
   for (let index = 0; index < tags.length && index < MAX_TAGS; index += 1) {
     const tag = oneLine(tags[index], MAX_TAG_CHARS);
     if (tag === null) throw new TypeError('Journal tags must contain nonempty strings');
     if (!sanitizedTags.includes(tag)) sanitizedTags.push(tag);
+    const legacyTag = oneLineForLegacyReplay(tags[index], MAX_TAG_CHARS);
+    if (legacyTag === null) throw new TypeError('Journal tags must contain nonempty strings');
+    if (!legacyTags.includes(legacyTag)) legacyTags.push(legacyTag);
   }
-  return { title: sanitizedTitle, body: sanitizedBody, tags: sanitizedTags };
+  return { ...text, tags: sanitizedTags, legacyTags };
 }
 
 function stableContentId(kind, entry) {
   const { id: _id, ...content } = entry;
   return stableJournalId(kind, content);
+}
+
+function persistedEntryForLegacyReplay(entry) {
+  return { ...entry, body: entry.body.toWellFormed() };
+}
+
+async function legacyReplay(store, scope, kind, expected) {
+  const existing = await store.read(scope, expected.id);
+  if (existing === null || existing.id !== expected.id) return null;
+  const existingHash = stableContentId(kind, existing);
+  const persistedHash = stableContentId(kind, persistedEntryForLegacyReplay(expected));
+  if (existingHash !== expected.id && existingHash !== persistedHash) return null;
+  return { created: false, entry: existing };
+}
+
+function legacyEntry(kind, partial, content) {
+  const legacy = {
+    ...partial,
+    title: content.legacyTitle,
+    tags: content.legacyTags,
+    body: content.legacyBody,
+  };
+  return { ...legacy, id: stableContentId(kind, legacy) };
 }
 
 function renderBody(summary) {
@@ -252,7 +290,7 @@ function renderBody(summary) {
   for (const violation of summary.metadata.violations) {
     lines.push(`- ${violation.kind} | node ${violation.nodeId ?? '[unavailable]'} | ${violation.detail} | ${violation.at ?? '[unavailable]'}`);
   }
-  return boundedBody(lines);
+  return boundedBody(lines, summary.title);
 }
 
 function createRunSummary(state, projectKey) {
@@ -447,10 +485,6 @@ export function createJournalService({ runStore, journalStore, journalSearch, en
     if (runId === null) throw new TypeError('Project insight requires a run id');
     const content = sanitizedEntryContent(input);
     const sourceId = stableJournalId('run-summary', projectKey, runId);
-    const projection = await projectRun(state);
-    if (projection.failed || projection.id !== sourceId) {
-      throw journalError(projectAvailable ? 'JOURNAL_ERROR' : 'JOURNAL_PROJECT_UNAVAILABLE');
-    }
     const createdAt = oneLine(state?.updatedAt ?? state?.createdAt, MAX_IDENTIFIER_CHARS);
     if (createdAt === null) throw new TypeError('Project insight requires a timestamp');
     const metadata = { projectKey, runId, status };
@@ -466,6 +500,20 @@ export function createJournalService({ runStore, journalStore, journalSearch, en
       body: content.body,
     };
     const entry = { ...partial, id: stableContentId('insight', partial) };
+    if (content.withinRawInputLimits) {
+      const legacy = legacyEntry('insight', partial, content);
+      if (!content.withinLimit || legacy.id !== entry.id) {
+        const replay = await legacyReplay(journalStore, 'project', 'insight', legacy);
+        if (replay !== null) return replay;
+      }
+    }
+    if (!content.withinLimit) {
+      throw new TypeError(`Journal indexed text must not exceed ${MAX_INDEXED_TEXT_CHARS} characters`);
+    }
+    const projection = await projectRun(state);
+    if (projection.failed || projection.id !== sourceId) {
+      throw journalError(projectAvailable ? 'JOURNAL_ERROR' : 'JOURNAL_PROJECT_UNAVAILABLE');
+    }
     try {
       const result = await journalStore.write('project', entry);
       projectAvailable = true;
@@ -523,6 +571,16 @@ export function createJournalService({ runStore, journalStore, journalSearch, en
       body: content.body,
     };
     const entry = { ...partial, id: stableContentId('promoted-insight', partial) };
+    if (content.withinRawInputLimits) {
+      const legacy = legacyEntry('promoted-insight', partial, content);
+      if (!content.withinLimit || legacy.id !== entry.id) {
+        const replay = await legacyReplay(journalStore, 'global', 'promoted-insight', legacy);
+        if (replay !== null) return replay;
+      }
+    }
+    if (!content.withinLimit) {
+      throw new TypeError(`Journal indexed text must not exceed ${MAX_INDEXED_TEXT_CHARS} characters`);
+    }
     try {
       return await journalStore.write('global', entry);
     } catch (error) {

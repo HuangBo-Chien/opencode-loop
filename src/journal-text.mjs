@@ -1,4 +1,8 @@
+export const MAX_INDEXED_TEXT_CHARS = 12_000;
+export const MAX_AUTHORED_BODY_INPUT_CHARS = 32_000;
+
 const RAW_TEXT_LOOKAHEAD = 4096;
+const MAX_INDEXED_TITLE_CHARS = 512;
 const MAX_REQUEST_PARTS = 256;
 const MAX_ASSIGNMENT_KEY_CHARS = 128;
 const MAX_TYPESCRIPT_TYPE_CHARS = 512;
@@ -20,6 +24,15 @@ const TYPESCRIPT_PRIMITIVES = new Set([
 const SECRET_METADATA_SUFFIXES = new Set([
   'count', 'enabled', 'hint', 'label', 'length', 'name', 'policy', 'required', 'ttl', 'type',
 ]);
+
+export function codePointSafePrefix(input, limit) {
+  if (input.length <= limit) return input;
+  let end = limit;
+  const previous = input.charCodeAt(end - 1);
+  const next = input.charCodeAt(end);
+  if (previous >= 0xD800 && previous <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) end -= 1;
+  return input.slice(0, end);
+}
 
 function keyWords(key) {
   return key
@@ -248,7 +261,11 @@ function redactSecretAssignments(line) {
   return { text: `${output}${line.slice(cursor)}`, redactions };
 }
 
-function sanitizeBoundedJournalText(input, limit, rawTruncated) {
+function unsafePrefix(input, limit) {
+  return input.slice(0, limit);
+}
+
+function sanitizeBoundedJournalText(input, limit, rawTruncated, prefix = codePointSafePrefix) {
   const jwtTailCrossesRawBoundary = rawTruncated && /[.A-Za-z0-9_-]$/.test(input);
   const prefixedTokenTailCrossesRawBoundary = rawTruncated && /[A-Za-z0-9_-]$/.test(input);
   let text = input.replace(/\r\n/g, '\n').trim();
@@ -282,22 +299,56 @@ function sanitizeBoundedJournalText(input, limit, rawTruncated) {
   }
 
   const truncated = rawTruncated || text.length > limit;
-  return { text: truncated ? text.slice(0, limit) : text, truncated, redactions };
+  return { text: truncated ? prefix(text, limit) : text, truncated, redactions };
+}
+
+// Reproduce pre-safe-slicing content only to locate existing entries. New
+// writes must always use sanitizeJournalText instead.
+export function sanitizeJournalTextForLegacyReplay(input, limit) {
+  if (typeof input !== 'string') throw new TypeError('Journal text must be a string');
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_AUTHORED_BODY_INPUT_CHARS) throw new TypeError(`Journal text limit must be an integer from 1 to ${MAX_AUTHORED_BODY_INPUT_CHARS}`);
+  const rawCap = limit + RAW_TEXT_LOOKAHEAD;
+  const rawTruncated = input.length > rawCap;
+  return sanitizeBoundedJournalText(unsafePrefix(input, rawCap), limit, rawTruncated, unsafePrefix);
 }
 
 export function sanitizeJournalText(input, limit) {
   if (typeof input !== 'string') throw new TypeError('Journal text must be a string');
-  if (!Number.isInteger(limit) || limit < 1 || limit > 32000) throw new TypeError('Journal text limit must be an integer from 1 to 32000');
+  if (!input.isWellFormed()) throw new TypeError('Journal text must be well-formed Unicode');
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_AUTHORED_BODY_INPUT_CHARS) throw new TypeError(`Journal text limit must be an integer from 1 to ${MAX_AUTHORED_BODY_INPUT_CHARS}`);
 
   const rawCap = limit + RAW_TEXT_LOOKAHEAD;
   const rawTruncated = input.length > rawCap;
-  return sanitizeBoundedJournalText(input.slice(0, rawCap), limit, rawTruncated);
+  return sanitizeBoundedJournalText(codePointSafePrefix(input, rawCap), limit, rawTruncated);
+}
+
+export function sanitizeIndexedEntryText({ title, body } = {}) {
+  if (typeof title !== 'string' || typeof body !== 'string') return null;
+  const withinRawInputLimits = title.length <= MAX_INDEXED_TITLE_CHARS
+    && body.length <= MAX_AUTHORED_BODY_INPUT_CHARS;
+  const sanitizedTitle = sanitizeJournalText(title, MAX_INDEXED_TITLE_CHARS).text.replace(/\s+/g, ' ').trim();
+  const sanitizedBody = sanitizeJournalText(body, MAX_AUTHORED_BODY_INPUT_CHARS);
+  if (!sanitizedTitle.length || !sanitizedBody.text.length) return null;
+  const withinLimit = withinRawInputLimits
+    && !sanitizedBody.truncated
+    && sanitizedTitle.length + 2 + sanitizedBody.text.length <= MAX_INDEXED_TEXT_CHARS;
+  const content = {
+    title: sanitizedTitle,
+    body: sanitizedBody.text,
+    withinLimit,
+    withinRawInputLimits,
+  };
+  return {
+    ...content,
+    legacyTitle: sanitizeJournalTextForLegacyReplay(title, MAX_INDEXED_TITLE_CHARS).text.replace(/\s+/g, ' ').trim(),
+    legacyBody: sanitizeJournalTextForLegacyReplay(body, MAX_AUTHORED_BODY_INPUT_CHARS).text,
+  };
 }
 
 export function captureRequest(parts, journalOptions) {
   if (journalOptions?.enabled !== true || journalOptions.includeUserRequest !== true || !Array.isArray(parts)) return null;
   const limit = journalOptions.maxUserRequestChars;
-  if (!Number.isInteger(limit) || limit < 1 || limit > 32000) throw new TypeError('Journal text limit must be an integer from 1 to 32000');
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_AUTHORED_BODY_INPUT_CHARS) throw new TypeError(`Journal text limit must be an integer from 1 to ${MAX_AUTHORED_BODY_INPUT_CHARS}`);
   const rawCap = limit + RAW_TEXT_LOOKAHEAD;
   const text = [];
   let rawLength = 0;
@@ -322,7 +373,7 @@ export function captureRequest(parts, journalOptions) {
       rawTailTruncated = true;
       break;
     }
-    const bounded = partText.slice(0, available);
+    const bounded = codePointSafePrefix(partText, available);
     inspectedLength += bounded.length;
     const omittedFromPart = partText.length > bounded.length;
     if (!bounded.trim().length) {
