@@ -14,7 +14,7 @@ const READ_ONLY_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-plan-
 // Tools that never mutate run state or the workspace stay available to graph
 // children even when their dispatch binding is gone (rejected dispatch, idle
 // session, terminated run). Write paths keep failing closed.
-const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'list', 'graph_status', 'graph_inspect', 'graph_journal_search', 'graph_journal_read', 'graph_lesson_search', 'graph_lesson_read']);
+const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'list', 'skill', 'graph_status', 'graph_inspect', 'graph_journal_search', 'graph_journal_read', 'graph_lesson_search', 'graph_lesson_read']);
 const NOW = () => new Date().toISOString();
 
 function rejectionPrompt(decision) {

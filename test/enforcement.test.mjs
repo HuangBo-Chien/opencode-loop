@@ -450,6 +450,9 @@ test('crash window: side effects lead to RECOVERY_REQUIRED; resume preserves att
   // Refunded crash (0) + one fresh reconcile attempt = 1: the crash cost nothing.
   assert.equal(after.nodes['impl-1'].attempt, 1);
   await assert.rejects(h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-impl', callID: 'late' }, { args: { filePath: join(dir, 'src', 'a.ts') } }), /BINDING_UNAVAILABLE/);
+  // The same binding-less session may still invoke read-only tools: skill
+  // must not fail closed while edit keeps rejecting above.
+  await assert.doesNotReject(h.enforcement.onToolBefore({ tool: 'skill', sessionID: 'child-impl', callID: 'late-skill' }, { args: {} }));
   await mkdir(join(dir, 'src'), { recursive: true });
   await writeFile(join(dir, 'src', 'a.ts'), 'reconciled');
   const delivered = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/a.ts'], summary: 'reconciled' }, ctx(h, 'recovered-impl', 'graph-implementer')));
@@ -696,6 +699,7 @@ test('terminal runs keep read-only tools alive for children and graph_run_new st
   const fromChild = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'late-child', 'graph-explorer')));
   assert.equal(fromChild.status, 'SUCCEEDED');
   assert.doesNotThrow(() => h.enforcement.internals.READ_ONLY_TOOLS.has('read'), undefined);
+  assert.equal(h.enforcement.internals.READ_ONLY_TOOLS.has('skill'), true);
 
   // A new run can be started in the same session once the old one is terminal.
   const tooEarlyHarness = h;

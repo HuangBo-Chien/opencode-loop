@@ -22,7 +22,7 @@ test('native permissions restrict writes, delegation and submit tools by role', 
     const p = agent.permission;
     assert.equal(p['*'], 'deny');
     assert.deepEqual(p.read, { '*': 'allow', '*.env': 'deny', '*.env.*': 'deny' });
-    for (const tool of ['glob', 'grep', 'list', 'graph_status', 'graph_inspect']) assert.equal(p[tool], 'allow');
+    for (const tool of ['glob', 'grep', 'list', 'graph_status', 'graph_inspect', 'skill']) assert.equal(p[tool], 'allow');
     assert.equal(p.external_directory, 'ask');
     assert.equal(p.doom_loop, 'ask');
     assert.equal(p.edit ?? p['*'], name === 'graph-implementer' ? 'ask' : 'deny');

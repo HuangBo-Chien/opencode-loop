@@ -16,7 +16,7 @@ function createPermission(name) {
   const permission = {
     '*': 'deny',
     read: { '*': 'allow', '*.env': 'deny', '*.env.*': 'deny' },
-    glob: 'allow', grep: 'allow', list: 'allow', graph_status: 'allow', graph_inspect: 'allow',
+    glob: 'allow', grep: 'allow', list: 'allow', graph_status: 'allow', graph_inspect: 'allow', skill: 'allow',
     external_directory: 'ask', doom_loop: 'ask',
   };
   if (name === 'graph-orchestrator') {
