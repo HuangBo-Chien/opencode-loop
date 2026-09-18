@@ -62,6 +62,8 @@ test('orchestrator prompt states gated handoffs, runner rejections, recovery and
   assert.match(p, /maxAttempts=2/);
   assert.match(p, /maxPlanRevisions=2/);
   assert.match(p, /maxParallel=5/);
+  assert.match(p, /READER_CAPACITY/);
+  assert.match(p, /同一回合/);
   assert.match(p, /maxImplementerParallel=3/);
   assert.match(p, /寫入節點也可平行/);
   assert.match(p, /WRITER_CAPACITY/);

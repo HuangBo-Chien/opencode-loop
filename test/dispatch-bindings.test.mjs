@@ -4,9 +4,9 @@ import { createRunStore } from '../src/run-state.mjs';
 import { createRunner } from '../src/runner.mjs';
 import { createDispatchBindings } from '../src/dispatch-bindings.mjs';
 
-async function harness(client) {
+async function harness(client, { readerParallel } = {}) {
   const store = createRunStore();
-  const runner = createRunner({ maxAttempts: 3, maxPlanRevisions: 3 });
+  const runner = createRunner({ maxAttempts: 3, maxPlanRevisions: 3, readerParallel });
   const state = await store.createRun({ runId: 'root', rootSessionId: 'root', now: 'now' });
   state.nodes.impl = { spec: { id: 'impl', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['work/**'] }, state: 'PENDING', attempt: 0 };
   const bindings = new Map([['root', { runId: 'root', root: true, agent: 'graph-orchestrator' }]]);
@@ -397,4 +397,63 @@ test('round-1 free-role sessions continue their next task through task_id', asyn
   });
   assert.equal(idle.bindings.get('e1').active, true);
   assert.equal(idle.bindings.get('e1').nodeId, null);
+});
+
+test('free read-only dispatches fill a shared reader capacity that a terminal call frees', async () => {
+  const h = await harness(null, { readerParallel: 2 });
+  const first = await h.admit('a', 'graph-explorer');
+  assert.equal(first.allowed, true, JSON.stringify(first));
+  assert.equal(first.free, true);
+  const second = await h.admit('b', 'graph-explorer');
+  assert.equal(second.allowed, true, JSON.stringify(second));
+  assert.equal(second.free, true);
+  const third = await h.admit('c', 'graph-explorer');
+  assert.equal(third.code, 'READER_CAPACITY');
+  assert.match(third.detail, /2\/2/);
+  // A terminal host task call releases its slot even though the dispatch
+  // never bound (no host metadata event ever arrived for it).
+  await h.dispatches.onPart(h.part('a', undefined, 'graph-explorer', 'error'));
+  const next = await h.admit('d', 'graph-explorer');
+  assert.equal(next.allowed, true, JSON.stringify(next));
+  assert.equal(next.free, true);
+});
+
+test('explorer and multimodal free dispatches draw from one shared reader budget', async () => {
+  const h = await harness(null, { readerParallel: 2 });
+  assert.equal((await h.admit('a', 'graph-explorer')).allowed, true);
+  assert.equal((await h.admit('b', 'graph-multimodal')).allowed, true);
+  const third = await h.admit('c', 'graph-explorer');
+  assert.equal(third.code, 'READER_CAPACITY');
+  assert.match(third.detail, /2\/2/);
+});
+
+test('unbound reader reservations occupy the budget before host metadata arrives', async () => {
+  const h = await harness(null, { readerParallel: 2 });
+  await h.admit('a', 'graph-explorer');
+  await h.admit('b', 'graph-explorer');
+  assert.deepEqual(h.dispatches.inspect('root').map((r) => r.bound), [false, false]);
+  const third = await h.admit('c', 'graph-explorer');
+  assert.equal(third.code, 'READER_CAPACITY');
+  assert.match(third.detail, /2\/2/);
+});
+
+test('an active reader continuation never blocks on its own in-flight work', async () => {
+  const h = await harness(null, { readerParallel: 1 });
+  assert.equal((await h.admit('a', 'graph-explorer')).allowed, true);
+  await h.dispatches.onSession({ id: 'child', parentID: 'root' });
+  await h.dispatches.onPart(h.part('a', 'child', 'graph-explorer'));
+  const continuation = await h.admit('b', 'graph-explorer', 'child');
+  assert.equal(continuation.allowed, true, JSON.stringify(continuation));
+  assert.equal(continuation.continuation, true);
+});
+
+test('a free reader continuation by identity counts as new work against the budget', async () => {
+  const h = await harness(null, { readerParallel: 1 });
+  // A finished free explorer left an inactive binding; a fresh explorer
+  // dispatch already occupies the single shared budget slot.
+  h.bindings.set('e1', { runId: 'root', root: false, agent: 'graph-explorer', nodeId: null, sessionId: 'e1', dispatchId: 'd1', active: false });
+  assert.equal((await h.admit('a', 'graph-explorer')).allowed, true);
+  const continuation = await h.admit('cx', 'graph-explorer', 'e1');
+  assert.equal(continuation.code, 'READER_CAPACITY');
+  assert.match(continuation.detail, /1\/1/);
 });

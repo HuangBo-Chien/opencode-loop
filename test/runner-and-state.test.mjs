@@ -576,6 +576,38 @@ test('inspect surfaces learning counts on findings artifacts', () => {
   assert.deepEqual(counts, { learnings: 2 });
 });
 
+test('inspect lists retained findings history as digests, oldest to newest', () => {
+  const state = freshRun();
+  state.findingsLog.push(
+    { version: 1, nodeId: 'explore-1', summary: 'first line of a multi-line summary\nsecond line never leaks', evidence: ['e1'], learnings: [] },
+    { version: 2, nodeId: 'explore-1', summary: 'token rotation mapped', evidence: [], learnings: ['a', 'b'] },
+    { version: 3, nodeId: 'explore-2', summary: 'cache layers located', evidence: [], learnings: [] },
+  );
+  assert.deepEqual(runner.inspect(state).findingsHistory, [
+    { version: 1, nodeId: 'explore-1', learnings: 0, summary: 'first line of a multi-line summary' },
+    { version: 2, nodeId: 'explore-1', learnings: 2, summary: 'token rotation mapped' },
+    { version: 3, nodeId: 'explore-2', learnings: 0, summary: 'cache layers located' },
+  ]);
+
+  // Over-long first lines are truncated to a 200-char digest.
+  const longLine = 'x'.repeat(250);
+  state.findingsLog[0].summary = longLine;
+  const truncated = runner.inspect(state).findingsHistory[0].summary;
+  assert.equal(truncated.length, 200);
+  assert.equal(truncated, longLine.slice(0, 200));
+
+  // Inspection mirrors the stored 8-entry bound: only the newest 8 surface.
+  const capped = freshRun();
+  for (let version = 1; version <= 10; version++) capped.findingsLog.push({ version, nodeId: 'explore-1', summary: `s${version}`, evidence: [], learnings: [] });
+  const history = runner.inspect(capped).findingsHistory;
+  assert.equal(history.length, 8);
+  assert.deepEqual(history.map((entry) => entry.version), [3, 4, 5, 6, 7, 8, 9, 10]);
+
+  // Legacy states predating findingsLog inspect as an empty history.
+  delete state.findingsLog;
+  assert.deepEqual(runner.inspect(state).findingsHistory, []);
+});
+
 function lightGraph() {
   return validateTaskGraph([
     spec('plan-1', 'plan', 'graph-planner', {}),
@@ -865,6 +897,66 @@ test('writer capacity: disjoint implement nodes run in parallel up to the cap', 
   // Verifiers keep one-in-flight semantics regardless of writer capacity.
   const verifierBusy = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
   assert.equal(verifierBusy.code, 'NO_READY_NODE'); // impl deps not SUCCEEDED yet
+});
+
+test('reader capacity: explore/analyze tasks share a bounded parallel gate', async () => {
+  const local = createRunner({ maxAttempts: 3, maxPlanRevisions: 2, implementerParallel: 2, readerParallel: 2 });
+  const graph = validateTaskGraph([
+    spec('explore-1', 'explore', 'graph-explorer'),
+    spec('explore-2', 'explore', 'graph-explorer'),
+    spec('analyze-1', 'analyze', 'graph-multimodal'),
+    spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1', 'explore-2'] }),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'] }),
+    spec('impl-1', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['src/a.ts'] }),
+    spec('verify-1', 'verify', 'graph-verifier', { dependsOn: ['impl-1'] }),
+  ]);
+  assert.equal(graph.ok, true, JSON.stringify(graph.errors));
+  // submitPlan auto-succeeds documentary explore/analyze/plan nodes, so
+  // RUNNING readers are staged directly (real flows never produce them).
+  const state = newRun({ runId: 'r-readers', rootSessionId: 'r-readers', now: NOW });
+  const submission = local.submitPlan(state, { intent: 'change', nodes: graph.nodes, now: NOW });
+  assert.equal(submission.ok, true, JSON.stringify(submission));
+  assert.equal(local.readerCapacity(state), 2);
+
+  state.nodes['explore-1'].state = 'RUNNING';
+  state.nodes['explore-2'].state = 'RUNNING';
+  const denied = local.admitDispatch(state, { agent: 'graph-explorer', now: NOW });
+  assert.equal(denied.allowed, false);
+  assert.equal(denied.code, 'READER_CAPACITY');
+  assert.match(denied.detail, /2\/2/);
+
+  // The reader budget is shared across explorer and multimodal work: even a
+  // dispatch targeting a real analyze node is denied while both slots run.
+  const deniedAnalyze = local.admitDispatch(state, { agent: 'graph-multimodal', now: NOW, nodeId: 'analyze-1' });
+  assert.equal(deniedAnalyze.allowed, false);
+  assert.equal(deniedAnalyze.code, 'READER_CAPACITY');
+
+  // Below the cap an explorer dispatch is still admitted (here it falls
+  // through to free consultation: documentary explore nodes are SUCCEEDED).
+  state.nodes['explore-2'].state = 'SUCCEEDED';
+  const admitted = local.admitDispatch(state, { agent: 'graph-explorer', now: NOW });
+  assert.equal(admitted.allowed, true);
+
+  // A runner configured for a single reader keeps one-in-flight semantics.
+  const soloRunner = createRunner({ maxAttempts: 3, maxPlanRevisions: 2, readerParallel: 1 });
+  const solo = newRun({ runId: 'r-readers-solo', rootSessionId: 'r-readers-solo', now: NOW });
+  soloRunner.submitPlan(solo, { intent: 'change', nodes: graph.nodes, now: NOW });
+  solo.nodes['explore-1'].state = 'RUNNING';
+  assert.equal(soloRunner.readerCapacity(solo), 1);
+  const soloDenied = soloRunner.admitDispatch(solo, { agent: 'graph-explorer', now: NOW });
+  assert.equal(soloDenied.allowed, false);
+  assert.equal(soloDenied.code, 'READER_CAPACITY');
+  assert.match(soloDenied.detail, /1\/1/);
+
+  // Verifiers keep one-in-flight semantics regardless of reader capacity.
+  state.nodes['verify-1'].state = 'RUNNING';
+  const verifierBusy = local.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  assert.equal(verifierBusy.allowed, false);
+  assert.equal(verifierBusy.code, 'ALREADY_RUNNING');
+
+  // readerParallel is validated exactly like implementerParallel.
+  assert.throws(() => createRunner({ maxAttempts: 1, maxPlanRevisions: 1, implementerParallel: 1, readerParallel: 0 }), /readerParallel/);
+  assert.throws(() => createRunner({ maxAttempts: 1, maxPlanRevisions: 1, implementerParallel: 1, readerParallel: 17 }), /readerParallel/);
 });
 
 test('resume: crash windows classify conservatively and keep counters', async () => {

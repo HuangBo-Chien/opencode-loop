@@ -9,6 +9,9 @@ const denied = (code, detail) => ({ allowed: false, code, detail });
 // submissions never require a node binding, so reusing the conversation is
 // low-risk). Write-role continuations still require state-verified identity.
 const CONTINUABLE_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-multimodal']);
+// Read-only consultation roles whose free (unbound) dispatches share one
+// capacity budget with node-bound explore/analyze work.
+const READ_CONSULT_AGENTS = new Set(['graph-explorer', 'graph-multimodal']);
 
 export function createDispatchBindings({ store, runner, bindings, client }) {
   const records = new Map();
@@ -89,7 +92,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
             const decision = runner.admitDispatch(state, { agent, now: NOW(), nodeId: previous.nodeId });
             if (!decision.allowed) {
               await store.saveRun(state);
-              const passthrough = decision.code === 'RECOVERY_REQUIRED' || decision.code === 'AWAITING_DECISION' || decision.code === 'WRITER_CAPACITY';
+              const passthrough = decision.code === 'RECOVERY_REQUIRED' || decision.code === 'AWAITING_DECISION' || decision.code === 'WRITER_CAPACITY' || decision.code === 'READER_CAPACITY';
               return denied(passthrough ? decision.code : 'FRESH_SESSION_REQUIRED',
                 `${previous.nodeId} cannot be continued in this session: ${decision.detail}`);
             }
@@ -108,6 +111,18 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
         }
         if (sameRole && !previous.nodeId) continuationSession = args.task_id;
         if (!continuationSession) return denied('FRESH_SESSION_REQUIRED', 'task_id may only continue an active attempt, resume the unfinished node this session last worked on, or continue a session of the same role in this run; other nodes and foreign sessions need a fresh session');
+      }
+      // Free consultations never appear as nodes, so the runner-side reader
+      // gate cannot see them: this layer counts them directly and holds them
+      // to the same shared ceiling as RUNNING explore/analyze nodes. Only new
+      // work reaches here — active-attempt continuations returned above.
+      if (READ_CONSULT_AGENTS.has(agent)) {
+        const capacity = runner.readerCapacity(state);
+        const freeInFlight = [...records.values()].filter((r) => r.runId === root.runId && READ_CONSULT_AGENTS.has(r.agent) && !r.terminal && !r.nodeId).length;
+        const nodeInFlight = Object.values(state.nodes).filter((node) => (node.spec.kind === 'explore' || node.spec.kind === 'analyze') && node.state === 'RUNNING').length;
+        if (freeInFlight + nodeInFlight >= capacity) {
+          return denied('READER_CAPACITY', `${freeInFlight + nodeInFlight}/${capacity} read-only exploration/analysis tasks are in flight; wait for one to finish before dispatching another`);
+        }
       }
       // Reservations are node-level: a fresh dispatch may not target a node
       // that another in-flight reservation already holds. Implementer

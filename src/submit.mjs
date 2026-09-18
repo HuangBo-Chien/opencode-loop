@@ -224,6 +224,12 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
           basedOn: [], payload: cleanJson({ summary: args.summary, evidence: args.evidence ?? [], learnings: args.learnings ?? [] }),
           status: 'valid', createdAt: NOW(),
         };
+        // Bounded multi-version retention: parallel explorers each register a
+        // version; the latest slot stays authoritative for existing consumers
+        // while recent history survives for aggregation and inspection.
+        const log = located.state.findingsLog ??= [];
+        log.push({ version, nodeId: located.binding.nodeId ?? 'free', summary: args.summary, evidence: (args.evidence ?? []).slice(0, 8), learnings: args.learnings ?? [] });
+        if (log.length > 8) log.splice(0, log.length - 8);
         await store.saveRun(located.state);
         return reply({ ok: true, artifact: `findings@${version}` });
       } catch (error) {
@@ -380,16 +386,31 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       const carriedFindings = priorReview && ['REVISE', 'FAIL'].includes(priorReview.payload?.verdict) && Array.isArray(priorReview.payload?.findings)
         ? priorReview.payload.findings.slice(0, 8).map((finding) => String(finding).slice(0, 500))
         : [];
+      // Invariant: parallel explorers each append a findings version, so the
+      // carry-over aggregates the most recent retained versions instead of
+      // only the latest artifact — summaries join oldest→newest so the digest
+      // reads chronologically, and the freshest learnings win the 8-item cap
+      // (newest version first, mirroring learningsPrompt in enforcement.mjs).
+      // Legacy runs without retained history fall back to the latest artifact.
+      const recentFindings = Array.isArray(state.findingsLog) ? state.findingsLog.slice(-3) : [];
+      const digest = recentFindings.length
+        ? recentFindings.map((entry) => String(entry.summary ?? '').slice(0, 300)).join(' | ')
+        : (typeof state.artifacts.findings?.payload?.summary === 'string'
+          ? state.artifacts.findings.payload.summary.slice(0, 400) : null);
+      const carriedLearnings = recentFindings.length
+        ? recentFindings.slice().reverse()
+          .flatMap((entry) => (Array.isArray(entry.learnings) ? entry.learnings : []))
+          .slice(0, 8).map((item) => String(item).slice(0, 500))
+        : (Array.isArray(state.artifacts.findings?.payload?.learnings)
+          ? state.artifacts.findings.payload.learnings.slice(0, 8).map((item) => String(item).slice(0, 500))
+          : []);
       created.carryOver = {
         predecessorRunId: state.runId,
         reason: args.reason.slice(0, 2000),
         at: NOW(),
         reviewFindings: carriedFindings,
-        findingsDigest: typeof state.artifacts.findings?.payload?.summary === 'string'
-          ? state.artifacts.findings.payload.summary.slice(0, 400) : null,
-        learnings: Array.isArray(state.artifacts.findings?.payload?.learnings)
-          ? state.artifacts.findings.payload.learnings.slice(0, 8).map((item) => String(item).slice(0, 500))
-          : [],
+        findingsDigest: digest,
+        learnings: carriedLearnings,
       };
       await store.saveRun(created);
       runner.archiveForReset(state, { reason: args.reason, successorRunId: runId, now: NOW() });

@@ -51,6 +51,7 @@ export function newRun({ runId, rootSessionId, now, request = null, requestCaptu
     revisionCounters: { 'plan-review': 0, 'implement-verify': 0 },
     nodes: {},
     artifacts: {},
+    findingsLog: [],
     sideEffects: [],
     violations: [],
   };

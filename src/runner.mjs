@@ -134,10 +134,11 @@ function completeIfDone(state, now) {
   return false;
 }
 
-export function createRunner({ maxAttempts, maxPlanRevisions, implementerParallel = 2 }) {
+export function createRunner({ maxAttempts, maxPlanRevisions, implementerParallel = 2, readerParallel = 4 }) {
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1) throw new TypeError('maxAttempts must be a positive integer');
   if (!Number.isInteger(maxPlanRevisions) || maxPlanRevisions < 1) throw new TypeError('maxPlanRevisions must be a positive integer');
   if (!Number.isInteger(implementerParallel) || implementerParallel < 1 || implementerParallel > 4) throw new TypeError('implementerParallel must be an integer from 1 to 4');
+  if (!Number.isInteger(readerParallel) || readerParallel < 1 || readerParallel > 16) throw new TypeError('readerParallel must be an integer from 1 to 16');
 
   // Effective writer capacity: the configured ceiling, narrowed by the
   // critic's approvedParallel when the current valid review provides one.
@@ -146,6 +147,14 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     const approved = review && review.status === 'valid' && Number.isInteger(review.payload?.approvedParallel) && review.payload.approvedParallel >= 1
       ? review.payload.approvedParallel : null;
     return Math.max(1, Math.min(implementerParallel, approved ?? implementerParallel));
+  }
+
+  // Effective reader capacity: the configured ceiling for concurrent
+  // read-only exploration/analysis work. Node-bound reader dispatches are
+  // gated here; free consultations will be gated at the dispatch-binding
+  // layer against this same ceiling.
+  function readerCapacity(state) {
+    return readerParallel;
   }
 
   // Bounded revision/repair context derived from artifacts so dispatches
@@ -224,15 +233,23 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     }
 
     const mine = Object.values(state.nodes).filter((node) => node.spec.agent === agent);
-    // Implementers run under a bounded-capacity gate: several write nodes with
-    // pairwise-disjoint writeScopes may be RUNNING at once, up to
-    // min(implementerParallel, critic-approvedParallel). Every other role
-    // keeps one-in-flight semantics.
+    // Implementers run under a bounded-capacity writer gate: several write
+    // nodes with pairwise-disjoint writeScopes may be RUNNING at once, up to
+    // min(implementerParallel, critic-approvedParallel). Explorers and
+    // multimodal analysts share a bounded reader gate: up to readerParallel
+    // explore/analyze nodes may be RUNNING at once. Every other role keeps
+    // one-in-flight semantics.
     if (agent === 'graph-implementer') {
       const running = Object.values(state.nodes).filter((node) => node.spec.kind === 'implement' && node.state === 'RUNNING').length;
       const capacity = implementerCapacity(state);
       if (running >= capacity) {
         return { allowed: false, code: 'WRITER_CAPACITY', detail: `${running}/${capacity} implement nodes are in flight; wait for one to finish before dispatching another` };
+      }
+    } else if (agent === 'graph-explorer' || agent === 'graph-multimodal') {
+      const running = Object.values(state.nodes).filter((node) => (node.spec.kind === 'explore' || node.spec.kind === 'analyze') && node.state === 'RUNNING').length;
+      const capacity = readerCapacity(state);
+      if (running >= capacity) {
+        return { allowed: false, code: 'READER_CAPACITY', detail: `${running}/${capacity} read-only exploration/analysis tasks are in flight; wait for one to finish before dispatching another` };
       }
     } else if (mine.some((node) => node.state === 'RUNNING')) {
       return { allowed: false, code: 'ALREADY_RUNNING', detail: `a ${agent} task for this run is still in flight` };
@@ -768,12 +785,21 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         return { name, kind: artifact.kind, version: artifact.version, status: artifact.status, basedOn: artifact.basedOn, ...(counts ? { counts } : {}) };
       }),
       violations: state.violations.slice(-20), sideEffectCount: state.sideEffects.length, mermaid,
+      // Retained findings versions stay observable: parallel explorers each
+      // contribute a version, and inspection surfaces them without dumping
+      // payloads (summary digest + learnings count only).
+      findingsHistory: (Array.isArray(state.findingsLog) ? state.findingsLog : []).slice(-8).map((entry) => ({
+        version: entry?.version ?? null,
+        nodeId: typeof entry?.nodeId === 'string' ? entry.nodeId : null,
+        learnings: Array.isArray(entry?.learnings) ? entry.learnings.length : 0,
+        summary: typeof entry?.summary === 'string' && entry.summary.length ? entry.summary.split('\n', 1)[0].slice(0, 200) : null,
+      })),
     };
   }
 
   return Object.freeze({
     admitDispatch, beginNode, attachSession, submitPlan, submitReview, checkChange, submitChange, submitVerification,
     recordSideEffect, recordViolation, captureRequest, completeRequestCapture, markIncomplete, resumeRun, reconcileNode, revalidateArtifacts, inspect,
-    abortRun, archiveForReset, implementerCapacity, taintAttempt,
+    abortRun, archiveForReset, implementerCapacity, readerCapacity, taintAttempt,
   });
 }
