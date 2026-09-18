@@ -53,7 +53,10 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       const state = store.getRun(root.runId);
       if (!state) return denied('RUN_GONE', 'owning run is unavailable');
       const recordKey = key(rootSessionId, callID);
-      const used = state.dispatchCallIds ??= [];
+      const used = state.dispatchCallIds ?? [];
+      const recordDispatch = () => {
+        (state.dispatchCallIds ??= used).push(recordKey);
+      };
       if (typeof callID !== 'string' || !callID.length || callID.length > 256 || used.includes(recordKey)) return denied('DUPLICATE_DISPATCH', 'a unique host callID is required, including after recovery');
       if (used.length >= 4096) return denied('DISPATCH_LIMIT', 'run dispatch history reached its bounded limit');
       if ([...records.values()].filter((r) => r.runId === root.runId).length >= 128) return denied('DISPATCH_LIMIT', 'too many outstanding task calls');
@@ -85,7 +88,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
             nodeId: previous.nodeId, dispatchId: previous.dispatchId, sessionId: args.task_id,
             bound: true, continuation: true, acknowledged: false, idleSeen: false, terminal: false,
             planVersion: state.artifacts.plan?.version ?? 0 });
-          used.push(recordKey);
+          recordDispatch();
           try { await store.saveRun(state); }
           catch { records.delete(recordKey); return denied('DISPATCH_PERSISTENCE_FAILED', 'could not save dispatch reservation; inspect storage and use a fresh call'); }
           return { allowed: true, nodeId: previous.nodeId, continuation: true };
@@ -110,7 +113,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
               bound: false, continuation: true, resumed: true, acknowledged: false, idleSeen: false, terminal: false,
               planVersion: state.artifacts.plan?.version ?? 0 });
             bindings.delete(args.task_id); // the inactive entry is superseded by the resumed binding
-            used.push(recordKey);
+            recordDispatch();
             try { await store.saveRun(state); }
             catch { records.delete(recordKey); return denied('DISPATCH_PERSISTENCE_FAILED', 'could not save dispatch reservation; inspect storage and use a fresh call'); }
             return { allowed: true, nodeId: previous.nodeId, continuation: true, resumed: true,
@@ -155,7 +158,9 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
         if (decision.code === 'NO_READY_NODE' && agent === 'graph-implementer' && reserved.size > 0) {
           return denied('DISPATCH_PENDING', `implement nodes are reserved and awaiting host session binding: ${[...reserved].join(', ')}`);
         }
-        await store.saveRun(state);
+        // A missing targeted node is a pure lookup failure. Do not persist an
+        // empty dispatch history or a changed timestamp for a rejected call.
+        if (decision.code !== 'NODE_NOT_FOUND') await store.saveRun(state);
         return decision;
       }
       records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent, nodeId: decision.nodeId,
@@ -163,7 +168,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
         resumed: continuationSession !== null, acknowledged: false, idleSeen: false, terminal: false, targeted: target !== null,
         planVersion: state.artifacts.plan?.version ?? 0 });
       if (continuationSession) bindings.delete(continuationSession); // the stale free binding must not block the fresh one
-      used.push(recordKey);
+      recordDispatch();
       try { await store.saveRun(state); }
       catch { records.delete(recordKey); return denied('DISPATCH_PERSISTENCE_FAILED', 'could not save dispatch reservation; inspect storage and use a fresh call'); }
       return continuationSession ? { ...decision, continuation: true } : decision;

@@ -85,6 +85,21 @@ test('strict target: direct admission validates every target source before reser
   assert.equal(result.nodeId, 'a');
 });
 
+test('strict target: a valid but nonexistent target does not create dispatch history', async () => {
+  const h = await harness();
+  const before = structuredClone(h.state);
+  const result = await h.enforcement.dispatches.admit(
+    'root',
+    'missing-target',
+    { subagent_type: 'graph-implementer' },
+    'missing',
+  );
+  assert.equal(result.code, 'NODE_NOT_FOUND');
+  assert.equal(result.allowed, false);
+  assert.deepEqual(h.state, before);
+  assert.deepEqual(h.enforcement.dispatches.inspect('root'), []);
+});
+
 const invalidTargets = [
   ['inline marker', '[nodeId:b] Implement B', {}, 'INVALID_NODE_ID'],
   ['empty marker', '[nodeId:]\nImplement B', {}, 'INVALID_NODE_ID'],
