@@ -1,6 +1,6 @@
 # opencode-loop
 
-`0.3.0-alpha.13` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory and a lesson knowledge base for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
+`0.3.0-alpha.14` is a seven-agent **runner-gated** graph workflow with local cross-run journal memory and a lesson knowledge base for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
 
 ## How the gate works
 
@@ -122,12 +122,12 @@ Explorer, planner and implementer dispatch prompts receive a bounded `[RUNNER] K
 
 ## Project-local installation
 
-Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.13.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
+Use Node.js 22 or newer. From this package directory run `npm install --ignore-scripts`, `npm test`, then `npm pack --ignore-scripts`. This produces `opencode-loop-0.3.0-alpha.14.tgz`; these commands do not publish or install globally. After installing changed plugin code, quit and restart OpenCode; running instances retain the previously loaded plugin.
 
 From the project where you want to use the plugin, install that local tarball:
 
 ```powershell
-npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.13.tgz
+npm install --ignore-scripts --save-dev C:\path\to\opencode-loop-0.3.0-alpha.14.tgz
 node --input-type=module -e "import {pathToFileURL} from 'node:url'; import path from 'node:path'; console.log(pathToFileURL(path.resolve('node_modules/opencode-loop/src/index.mjs')).href)"
 ```
 
@@ -168,7 +168,9 @@ Consider adding the state directory to `.gitignore`. Start OpenCode in that proj
 | `graph-verifier` | subagent | Evidence-bound verification | `graph_submit_verification` | `bash` ask; no edit |
 | `graph-multimodal` | subagent | Analyze supported visual inputs honestly | `graph_submit_findings` | `webfetch`, `websearch` ask |
 
-All graph agents may call `graph_status` and `graph_inspect`; unknown tools (including arbitrary MCP tools) default to deny, and `read` explicitly denies `*.env`/`*.env.*`. Native agent definitions and the default agent remain intact unless `setDefaultAgent` is true. Any existing definition with one of the seven reserved names causes an atomic collision error.
+All graph agents may call `graph_status` and `graph_inspect`; every role also receives `skill: 'allow'` through the shared permission baseline, and `skill` is classified as a read-only tool (it stays available to child sessions whose dispatch binding is gone, while write tools keep failing closed). Unknown tools (including arbitrary MCP tools) default to deny, and `read` explicitly denies `*.env`/`*.env.*`. Native agent definitions and the default agent remain intact unless `setDefaultAgent` is true. Any existing definition with one of the seven reserved names causes an atomic collision error.
+
+Classifying `skill` as side-effect-free is an assumption based on OpenCode host 1.18.x behavior (the pinned SDK is `@opencode-ai/plugin@1.18.25`). If a newer host ever makes the `skill` tool mutate run state or the workspace, revisit both its `READ_ONLY_TOOLS` membership and the blanket `allow`.
 
 Journal access is intentionally narrower. Prefer native `ask` when a journal operation, especially global promotion, needs user approval.
 
