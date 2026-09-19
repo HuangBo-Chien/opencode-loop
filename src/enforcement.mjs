@@ -8,6 +8,7 @@ import { captureRequest } from './journal-text.mjs';
 import { matchScopePath, normalizeScopePath } from './task-spec.mjs';
 import { firstOutOfScopeShellWrite } from './shell-scope.mjs';
 import { createDispatchBindings } from './dispatch-bindings.mjs';
+import { parseNodeIdHint, TARGET_REQUIRED_AGENTS } from './dispatch-target.mjs';
 import { formatLessonsBlock } from './lessons.mjs';
 
 const READ_ONLY_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-multimodal']);
@@ -88,19 +89,6 @@ function learningsPrompt(state) {
   }
   if (!lines.length) return null;
   return `[RUNNER] Explorer learnings (incorporate these; re-validate against current state before relying on them):\n${lines.join('\n')}`;
-}
-
-const NODE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-
-// Coordinator steering: an explicit `nodeId` task argument wins; otherwise a
-// single `[nodeId: implement-setup]` marker on the first prompt line names the
-// intended node. Without a hint the runner picks a ready node itself.
-function parseNodeIdHint(args) {
-  if (typeof args?.nodeId === 'string' && NODE_ID_PATTERN.test(args.nodeId)) return args.nodeId;
-  const prompt = typeof args?.prompt === 'string' ? args.prompt : '';
-  const firstLine = prompt.split('\n', 1)[0] ?? '';
-  const match = firstLine.match(/^\s*\[nodeId:\s*([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\]\s*$/);
-  return match ? match[1] : null;
 }
 
 export function createEnforcement({ settings, store, runner, bindings, client, dispatches = createDispatchBindings({ store, runner, bindings, client }), lessons = null }) {
@@ -253,7 +241,8 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       if (!state) return;
       const args = output.args ?? {};
       const subagentType = typeof args.subagent_type === 'string' ? args.subagent_type : null;
-       const decision = await dispatches.admit(sessionID, callID, args, parseNodeIdHint(args));
+      const target = parseNodeIdHint(args, { strict: TARGET_REQUIRED_AGENTS.has(subagentType) });
+      const decision = target.allowed ? await dispatches.admit(sessionID, callID, args, target.nodeId) : target;
       if (!decision.allowed) {
         await dispatches.exclusive(binding.runId, async () => {
           runner.recordViolation(state, { nodeId: null, kind: 'gate-blocked-dispatch', detail: `${subagentType}: ${decision.code} — ${decision.detail}`, now: NOW() });

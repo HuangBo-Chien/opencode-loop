@@ -121,3 +121,16 @@ test('roles provide distinct evidence contracts, submit duties and capability li
   assert.equal(createAgentPrompt('graph-orchestrator', { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 2, maxPlanRevisions: 3 }), definitions['graph-orchestrator'].prompt);
   assert.throws(() => createAgentPrompt('unknown', { maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 2, maxPlanRevisions: 3 }), /unknown/i);
 });
+
+test('dispatch prompts require explicit writer targets and stop on task conflicts', async () => {
+  const definitions = await agents();
+  const coordinator = definitions['graph-orchestrator'].prompt;
+  assert.match(coordinator, /implementer\/verifier.*每次.*task_id.*必須.*獨占/);
+  for (const code of ['NODE_ID_REQUIRED', 'INVALID_NODE_ID', 'CONFLICTING_NODE_ID', 'TASK_NODE_MISMATCH']) {
+    assert.ok(coordinator.includes(code), code);
+  }
+  assert.doesNotMatch(coordinator, /未標記時 runner 自行挑選 Ready 節點/);
+  for (const role of ['graph-implementer', 'graph-verifier']) {
+    assert.match(definitions[role].prompt, /任務正文.*衝突.*停止.*回報/);
+  }
+});

@@ -34,16 +34,18 @@ async function dispatch(h, agent, options = {}) {
   const output = { args: { description: `dispatch ${agent}`, prompt, subagent_type: agent, ...rest } };
   const callID = `call-${agent}-${Math.random().toString(36).slice(2)}`;
   await h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID }, output);
-  if (!output.args.prompt.includes('RUNNER_REJECTED')) h.calls.push({ agent, callID });
-  return output;
+  if (!output.args.prompt.includes('RUNNER_REJECTED')) h.calls.push({ agent, callID, args: output.args });
+  return { ...output, callID };
 }
-async function bindChild(h, sessionId, agent) {
-  await h.enforcement.onEvent({ event: { type: 'session.created', properties: { info: { id: sessionId, parentID: 'root' } } } });
-  const index = h.calls.findIndex((call) => call.agent === agent);
+async function bindChild(h, sessionId, agent, callID) {
+  const candidates = h.calls.filter((call) => call.agent === agent && (callID === undefined || call.callID === callID));
+  assert.equal(candidates.length, 1, 'ambiguous same-role dispatches must bind by explicit callID');
+  const index = h.calls.indexOf(candidates[0]);
   const [call] = h.calls.splice(index, 1);
+  await h.enforcement.onEvent({ event: { type: 'session.created', properties: { info: { id: sessionId, parentID: 'root' } } } });
   await h.enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part: {
     type: 'tool', tool: 'task', sessionID: 'root', callID: call.callID,
-    state: { status: 'running', input: { subagent_type: agent }, metadata: { parentSessionId: 'root', sessionId } },
+    state: { status: 'running', input: call.args, metadata: { parentSessionId: 'root', sessionId } },
   } } } });
   assert.equal(h.bindings.get(sessionId)?.agent, agent, `child ${sessionId} should bind to ${agent}`);
 }
@@ -299,7 +301,7 @@ test('full gated flow: plan → FAIL pauses for decision; abort closes the run; 
   assert.equal(paused.status, 'AWAITING_USER_DECISION');
   assert.equal(paused.pendingDecision.cause, 'plan-rejected-by-critic');
 
-  const blocked = await dispatch(h, 'graph-implementer');
+  const blocked = await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   assert.match(blocked.args.prompt, /RUNNER_REJECTED/);
   assert.match(blocked.args.prompt, /AWAITING_DECISION/);
   assert.match(blocked.args.prompt, /graph_run_decide/);
@@ -330,9 +332,9 @@ test('implementer cannot be dispatched before review PASS; verifier evidence gat
   const h = harness(dir);
   await startRun(h);
 
-  const early = await dispatch(h, 'graph-implementer');
+  const early = await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   assert.match(early.args.prompt, /RUNNER_REJECTED/);
-  assert.match(early.args.prompt, /NO_READY_NODE/);
+  assert.match(early.args.prompt, /NODE_NOT_FOUND/);
 
   await dispatch(h, 'graph-planner');
   await bindChild(h, 'child-planner', 'graph-planner');
@@ -342,7 +344,7 @@ test('implementer cannot be dispatched before review PASS; verifier evidence gat
   const pass = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic')));
   assert.equal(pass.ok, true);
 
-  const impl = await dispatch(h, 'graph-implementer');
+  const impl = await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   assert.ok(!impl.args.prompt.includes('RUNNER_REJECTED'));
   await bindChild(h, 'child-impl', 'graph-implementer');
   assert.equal(h.bindings.get('child-impl').nodeId, 'impl-1');
@@ -359,14 +361,14 @@ test('implementer cannot be dispatched before review PASS; verifier evidence gat
   const change = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/a.ts'], summary: 'fixed auth errors' }, ctx(h, 'child-impl', 'graph-implementer')));
   assert.equal(change.ok, true, JSON.stringify(change));
 
-  await dispatch(h, 'graph-verifier');
+  await dispatch(h, 'graph-verifier', { nodeId: 'verify-1' });
   await bindChild(h, 'child-verify', 'graph-verifier');
   const weak = JSON.parse(await h.tools.graph_submit_verification.execute({ nodeId: 'verify-1', verdict: 'PASS', commands: [] }, ctx(h, 'child-verify', 'graph-verifier')));
   assert.equal(weak.ok, false);
   assert.equal(weak.code, 'INSUFFICIENT_EVIDENCE');
   await childIdle(h, 'child-verify');
 
-  const repaired = await dispatch(h, 'graph-verifier');
+  const repaired = await dispatch(h, 'graph-verifier', { nodeId: 'verify-1' });
   assert.ok(!repaired.args.prompt.includes('RUNNER_REJECTED'));
   await bindChild(h, 'child-verify2', 'graph-verifier');
   const pass2 = JSON.parse(await h.tools.graph_submit_verification.execute(
@@ -388,7 +390,7 @@ test('out-of-scope edit and implementer bash are denied at the permission prompt
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
-  await dispatch(h, 'graph-implementer');
+  await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
 
   await assert.rejects(
@@ -421,7 +423,7 @@ test('crash window: side effects lead to RECOVERY_REQUIRED; resume preserves att
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
-  await dispatch(h, 'graph-implementer');
+  await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
   await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-impl', callID: 'e1', args: { filePath: join(dir, 'src', 'a.ts') } }, { title: 'edit', output: 'ok' });
   assert.equal(h.store.getRun('root').nodes['impl-1'].attempt, 1);
@@ -440,7 +442,7 @@ test('crash window: side effects lead to RECOVERY_REQUIRED; resume preserves att
   assert.deepEqual(resume.report.recoveryRequired, ['impl-1']);
   assert.equal(h.store.getRun('root').nodes['impl-1'].attempt, 0);
 
-  const before = await dispatch(h, 'graph-implementer');
+  const before = await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   assert.match(before.args.prompt, /副作用/);
   assert.match(before.args.prompt, /src\/a.ts/);
   assert.equal(h.store.getRun('root').nodes['impl-1'].attempt, 0);
@@ -457,7 +459,7 @@ test('crash window: side effects lead to RECOVERY_REQUIRED; resume preserves att
   await writeFile(join(dir, 'src', 'a.ts'), 'reconciled');
   const delivered = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/a.ts'], summary: 'reconciled' }, ctx(h, 'recovered-impl', 'graph-implementer')));
   assert.equal(delivered.ok, true, JSON.stringify(delivered));
-  await dispatch(h, 'graph-verifier');
+  await dispatch(h, 'graph-verifier', { nodeId: 'verify-1' });
   await bindChild(h, 'recovered-verify', 'graph-verifier');
   const verified = JSON.parse(await h.tools.graph_submit_verification.execute({ nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'fixture verification', exitCode: 0 }] }, ctx(h, 'recovered-verify', 'graph-verifier')));
   assert.equal(verified.ok, true);
@@ -480,7 +482,7 @@ test('session idle without submission marks INCOMPLETE and burns attempts; roles
   assert.equal(forged.ok, false);
   assert.equal(forged.code, 'WRONG_ROLE');
 
-  await dispatch(h, 'graph-implementer');
+  await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
   const stranger = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/a.ts'], summary: 'other session' }, { ...ctx(h, 'child-impl', 'graph-implementer'), sessionID: 'child-impl-other' }));
   assert.equal(stranger.ok, false);
@@ -546,11 +548,10 @@ test('coordinator nodeId steering binds the requested node, not the sorted one',
   const h = harness(dir);
   await setupSteerableRun(h);
 
-  // Without steering the runner sorts to impl-a; the marker selects impl-b.
+  // Unmarked writer dispatches are rejected; the marker selects impl-b.
   const plain = await dispatch(h, 'graph-implementer');
-  assert.match(plain.args.prompt, /Assigned nodeId: impl-a/);
-  await bindChild(h, 'child-a', 'graph-implementer');
-  await childIdle(h, 'child-a');
+  assert.match(plain.args.prompt, /NODE_ID_REQUIRED/);
+  assert.equal(h.store.getRun('root').nodes['impl-a'].attempt, 0);
 
   const steered = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-b]\nwrite the b package' });
   assert.ok(!steered.args.prompt.includes('RUNNER_REJECTED'));
@@ -682,7 +683,7 @@ test('terminal runs keep read-only tools alive for children and graph_run_new st
   const changeB = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-b', filesTouched: ['pkg-b/b.ts'], summary: 'b' }, ctx(h, 'child-b', 'graph-implementer')));
   assert.equal(changeB.ok, true, JSON.stringify(changeB));
   await childIdle(h, 'child-b');
-  await dispatch(h, 'graph-verifier');
+  await dispatch(h, 'graph-verifier', { nodeId: 'verify-1' });
   await bindChild(h, 'child-verify', 'graph-verifier');
   const verdict = JSON.parse(await h.tools.graph_submit_verification.execute(
     { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }] },
@@ -934,12 +935,15 @@ test('parallel writers: two [nodeId:] implementers run concurrently and complete
   const h = harness(dir);
   await setupSteerableRun(h);
 
-  const first = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-a]\nwork a' });
-  const second = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-b]\nwork b' });
+  // B is admitted first, but A's host events arrive first. Pair by callID.
+  const [second, first] = await Promise.all([
+    dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-b]\nwork b' }),
+    dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-a]\nwork a' }),
+  ]);
   assert.ok(!first.args.prompt.includes('RUNNER_REJECTED'));
   assert.ok(!second.args.prompt.includes('RUNNER_REJECTED'));
-  await bindChild(h, 'child-a', 'graph-implementer');
-  await bindChild(h, 'child-b', 'graph-implementer');
+  await bindChild(h, 'child-a', 'graph-implementer', first.callID);
+  await bindChild(h, 'child-b', 'graph-implementer', second.callID);
 
   // Both writers are RUNNING at the same time with disjoint scopes.
   const state = h.store.getRun('root');
@@ -973,7 +977,7 @@ test('parallel writers: two [nodeId:] implementers run concurrently and complete
   await childIdle(h, 'child-a');
   await childIdle(h, 'child-b');
 
-  await dispatch(h, 'graph-verifier');
+  await dispatch(h, 'graph-verifier', { nodeId: 'verify-1' });
   await bindChild(h, 'child-verify', 'graph-verifier');
   const verdict = JSON.parse(await h.tools.graph_submit_verification.execute(
     { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }] },
@@ -1020,8 +1024,8 @@ test('parallel explorers: free dispatches run concurrently under the reader gate
   const second = await dispatch(h, 'graph-explorer');
   assert.ok(!first.args.prompt.includes('RUNNER_REJECTED'), first.args.prompt);
   assert.ok(!second.args.prompt.includes('RUNNER_REJECTED'), second.args.prompt);
-  await bindChild(h, 'child-x1', 'graph-explorer');
-  await bindChild(h, 'child-x2', 'graph-explorer');
+  await bindChild(h, 'child-x1', 'graph-explorer', first.callID);
+  await bindChild(h, 'child-x2', 'graph-explorer', second.callID);
   assert.equal(h.bindings.get('child-x1').active, true);
   assert.equal(h.bindings.get('child-x2').active, true);
   const inFlight = h.enforcement.dispatches.inspect('root').filter((entry) => entry.agent === 'graph-explorer');
@@ -1065,6 +1069,18 @@ test('parallel explorers: free dispatches run concurrently under the reader gate
   assert.match(gateBlocked[0].detail, /READER_CAPACITY/);
 });
 
+for (const agent of ['graph-explorer', 'graph-multimodal']) {
+  test(`${agent} free dispatch ignores marker-like prose`, async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), `loop-free-marker-${agent}-`));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const h = harness(dir);
+    await startRun(h);
+
+    const result = await dispatch(h, agent, { prompt: 'Inspect the [nodeId: syntax in the parser documentation' });
+    assert.ok(!result.args.prompt.includes('RUNNER_REJECTED'), result.args.prompt);
+  });
+}
+
 test('crash on the final attempt: refund plus cross-restart task_id continuation avoids reset', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'loop-crash-final-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -1076,7 +1092,7 @@ test('crash on the final attempt: refund plus cross-restart task_id continuation
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
-  await dispatch(h, 'graph-implementer');
+  await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
   await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-impl', callID: 'e1', args: { filePath: join(dir, 'src', 'a.ts') } }, { title: 'edit', output: 'ok' });
   // The crash happened on the node's third and final attempt.
@@ -1098,7 +1114,13 @@ test('crash on the final attempt: refund plus cross-restart task_id continuation
 
   // task_id continuation picks the interrupted session back up across the
   // restart; its side-effect ledger travels with the dispatch.
-  const continuation = await dispatch(h, 'graph-implementer', { prompt: 'continue where you stopped', task_id: 'child-impl' });
+  const conflict = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:other-impl]\nwork elsewhere', task_id: 'child-impl' });
+  assert.match(conflict.args.prompt, /TASK_NODE_MISMATCH/);
+  assert.equal(Object.hasOwn(conflict.args, 'task_id'), false);
+  assert.equal(restarted.nodes['impl-1'].state, 'PENDING');
+  assert.equal(restarted.nodes['impl-1'].attempt, 2);
+  assert.deepEqual(h.enforcement.dispatches.inspect('root'), []);
+  const continuation = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-1]\ncontinue where you stopped', task_id: 'child-impl' });
   assert.ok(!continuation.args.prompt.includes('RUNNER_REJECTED'), continuation.args.prompt);
   assert.match(continuation.args.prompt, /Assigned nodeId: impl-1/);
   assert.match(continuation.args.prompt, /副作用/);
@@ -1112,7 +1134,7 @@ test('crash on the final attempt: refund plus cross-restart task_id continuation
   await writeFile(join(dir, 'src', 'a.ts'), 'recovered');
   const change = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/a.ts'], summary: 'recovered after crash' }, ctx(h, 'child-impl', 'graph-implementer')));
   assert.equal(change.ok, true, JSON.stringify(change));
-  await dispatch(h, 'graph-verifier');
+  await dispatch(h, 'graph-verifier', { nodeId: 'verify-1' });
   await bindChild(h, 'child-verify', 'graph-verifier');
   const verdict = JSON.parse(await h.tools.graph_submit_verification.execute(
     { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }] },
@@ -1233,14 +1255,14 @@ test('repair dispatches carry the verifier failure evidence', async (t) => {
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
-  await dispatch(h, 'graph-implementer');
+  await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
   await mkdir(join(dir, 'src'), { recursive: true });
   await writeFile(join(dir, 'src', 'a.ts'), 'first try');
   const change = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/a.ts'], summary: 'first try' }, ctx(h, 'child-impl', 'graph-implementer')));
   assert.equal(change.ok, true, JSON.stringify(change));
   await childIdle(h, 'child-impl');
-  await dispatch(h, 'graph-verifier');
+  await dispatch(h, 'graph-verifier', { nodeId: 'verify-1' });
   await bindChild(h, 'child-verify', 'graph-verifier');
   const failed = JSON.parse(await h.tools.graph_submit_verification.execute(
     { nodeId: 'verify-1', verdict: 'FAIL', commands: [{ command: 'npm test', exitCode: 1 }], summary: 'regression in auth errors' },
@@ -1249,7 +1271,7 @@ test('repair dispatches carry the verifier failure evidence', async (t) => {
   assert.equal(failed.effect, 'repair');
   await childIdle(h, 'child-verify');
 
-  const repair = await dispatch(h, 'graph-implementer');
+  const repair = await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   assert.match(repair.args.prompt, /修復要求/);
   assert.match(repair.args.prompt, /regression in auth errors/);
   assert.match(repair.args.prompt, /npm test \(exit 1\)/);
@@ -1324,7 +1346,7 @@ test('declared deliverables surface as mechanical progress through graph_inspect
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
-  await dispatch(h, 'graph-implementer');
+  await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
 
   // One of two deliverables exists so far: inspect reports 1/2 mechanically.
@@ -1366,7 +1388,7 @@ test('{{run}} tokens expand before validation and reach the bound implementer', 
   await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
 
   // The dispatch ack carries the runner-expanded authoritative scope.
-  const out = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-1] build lane' });
+  const out = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-1]\nbuild lane' });
   assert.match(out.args.prompt, /\[RUNNER\] writeScope: lanes\/root\/\*\*\. Write only inside these literal paths\./);
   assert.match(out.args.prompt, /\[RUNNER\] deliverables: lanes\/root\/out\.txt\./);
   await bindChild(h, 'child-impl', 'graph-implementer');
@@ -1408,7 +1430,7 @@ test('a denied bash that executes anyway taints the attempt (strict failure)', a
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
-  await dispatch(h, 'graph-implementer');
+  await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
 
   // SPECS' impl node has no allowShell: the before-hook hard-blocks...
@@ -1438,7 +1460,7 @@ test('blocked-bash loop closes through unresolved report and plan revision', asy
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
-  await dispatch(h, 'graph-implementer');
+  await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
 
   await assert.rejects(
@@ -1485,7 +1507,7 @@ test('graph_inspect counts on-disk deliverables the ledger never saw', async (t)
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
-  await dispatch(h, 'graph-implementer');
+  await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
 
   // The venv python was created by bash: it is on disk but absent from the
@@ -1526,7 +1548,7 @@ test('evidence fields flow end to end: learnings reach the planner, risks reach 
   const pass = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic')));
   assert.equal(pass.ok, true);
 
-  await dispatch(h, 'graph-implementer');
+  await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
   await mkdir(join(dir, 'src'), { recursive: true });
   await writeFile(join(dir, 'src', 'a.ts'), 'fixed auth errors');
@@ -1538,7 +1560,7 @@ test('evidence fields flow end to end: learnings reach the planner, risks reach 
   assert.equal(change.ok, true, JSON.stringify(change));
   await childIdle(h, 'child-impl');
 
-  const verifying = await dispatch(h, 'graph-verifier');
+  const verifying = await dispatch(h, 'graph-verifier', { nodeId: 'verify-1' });
   assert.match(verifying.args.prompt, /implementer-reported risks/);
   assert.match(verifying.args.prompt, /empty input still falls through/);
   await bindChild(h, 'child-verify', 'graph-verifier');
@@ -1893,7 +1915,7 @@ test('light path: small fix runs plan → implement → verify without a critic'
   assert.equal(plan.mode, 'light');
   assert.match(plan.next, /critic-free/);
 
-  const impl = await dispatch(h, 'graph-implementer');
+  const impl = await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   assert.ok(!impl.args.prompt.includes('RUNNER_REJECTED'));
   assert.match(impl.args.prompt, /Assigned nodeId: impl-1/);
   await bindChild(h, 'child-impl', 'graph-implementer');
@@ -1903,7 +1925,7 @@ test('light path: small fix runs plan → implement → verify without a critic'
   assert.equal(change.ok, true, JSON.stringify(change));
   await childIdle(h, 'child-impl');
 
-  await dispatch(h, 'graph-verifier');
+  await dispatch(h, 'graph-verifier', { nodeId: 'verify-1' });
   await bindChild(h, 'child-verify', 'graph-verifier');
   const pass = JSON.parse(await h.tools.graph_submit_verification.execute(
     { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: "grep -q fixed README.md", exitCode: 0 }] },
@@ -1937,11 +1959,11 @@ test('baseline flow end to end: pre-change red suite does not block an honest PA
   assert.equal(review.ok, true, JSON.stringify(review));
 
   // The implementer must wait for the baseline: only the baseline verifier is admissible now.
-  const earlyImpl = await dispatch(h, 'graph-implementer');
+  const earlyImpl = await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   assert.match(earlyImpl.args.prompt, /RUNNER_REJECTED/);
   assert.match(earlyImpl.args.prompt, /base-1/);
 
-  await dispatch(h, 'graph-verifier');
+  await dispatch(h, 'graph-verifier', { nodeId: 'base-1' });
   await bindChild(h, 'child-base', 'graph-verifier');
   assert.equal(h.bindings.get('child-base').nodeId, 'base-1');
   const baseline = JSON.parse(await h.tools.graph_submit_verification.execute(
@@ -1951,7 +1973,7 @@ test('baseline flow end to end: pre-change red suite does not block an honest PA
   assert.equal(baseline.ok, true, JSON.stringify(baseline));
   await childIdle(h, 'child-base');
 
-  await dispatch(h, 'graph-implementer');
+  await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
   await mkdir(join(dir, 'src'), { recursive: true });
   await writeFile(join(dir, 'src', 'a.ts'), 'fixed auth errors');
@@ -1960,7 +1982,7 @@ test('baseline flow end to end: pre-change red suite does not block an honest PA
   assert.equal(change.ok, true, JSON.stringify(change));
   await childIdle(h, 'child-impl');
 
-  await dispatch(h, 'graph-verifier');
+  await dispatch(h, 'graph-verifier', { nodeId: 'verify-1' });
   await bindChild(h, 'child-verify', 'graph-verifier');
   // npm test still fails exactly as it did before the change (baseline match) + a green command.
   const pass = JSON.parse(await h.tools.graph_submit_verification.execute(
