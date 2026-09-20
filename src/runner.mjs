@@ -135,7 +135,7 @@ function trackRejection(state, node, code, detail, now) {
     node.state = 'PENDING';
     node.finishedAt = now;
     pauseForDecision(state, 'runner-rejection', detail, now);
-    return { ok: false, code: 'REJECTION_LOOP', detail: `two consecutive identical ${code} rejections: ${detail}` };
+    return { ok: false, code: 'REJECTION_LOOP', detail: `${node.rejectionStreak.count} consecutive identical ${code} rejections: ${detail}` };
   }
   return { ok: false, code, detail };
 }
@@ -628,7 +628,11 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       for (const ref of refs) {
         const resolution = artifactRef(state, ref);
         if (resolution.missing) {
-          return trackRejection(state, node, 'STALE_CHANGE', `${resolution.missing} — if this ref was derived from dependsOn rather than authored in the submission, no payload change can fix it; report the rejection instead of resubmitting`, now);
+          // The streak identity is the raw missing-reason (guidance prose is
+          // presentation only), so rewording the clause can never silently
+          // reset a persisted streak.
+          const rejection = trackRejection(state, node, 'STALE_CHANGE', resolution.missing, now);
+          return { ...rejection, detail: `${rejection.detail} — if this ref was derived from dependsOn rather than authored in the submission, no payload change can fix it; report the rejection instead of resubmitting` };
         }
       }
       const name = `verification:${nodeId}`;

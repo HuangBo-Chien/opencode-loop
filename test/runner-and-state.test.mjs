@@ -974,7 +974,7 @@ test('two consecutive identical verification rejections pause the run for a user
   const second = runner.submitVerification(state, ghost);
   assert.equal(second.ok, false);
   assert.equal(second.code, 'REJECTION_LOOP');
-  assert.match(second.detail, /two consecutive identical STALE_CHANGE rejections: artifact change:ghost@1 does not exist/);
+  assert.match(second.detail, /2 consecutive identical STALE_CHANGE rejections: artifact change:ghost@1 does not exist/);
   assert.equal(state.nodes['verify-1'].state, 'PENDING');
   assert.equal(state.nodes['verify-1'].rejectionStreak.count, 2);
   assert.equal(state.nodes['verify-1'].finishedAt, NOW);
@@ -996,10 +996,13 @@ test('a different rejection detail restarts the streak instead of firing early',
   assert.equal(detailX.code, 'STALE_CHANGE');
   const detailY = runner.submitVerification(state, submission('change:ghost@2'));
   assert.equal(detailY.code, 'STALE_CHANGE');
+  assert.match(detailY.detail, /^artifact change:ghost@2 does not exist — /);
   // One rejection of each detail: no identical pair yet, so no pause.
   assert.equal(state.nodes['verify-1'].state, 'RUNNING');
   assert.equal(state.status, 'RUNNING');
-  assert.equal(state.nodes['verify-1'].rejectionStreak.detail, 'artifact change:ghost@2 does not exist — if this ref was derived from dependsOn rather than authored in the submission, no payload change can fix it; report the rejection instead of resubmitting');
+  // The streak keys on the raw missing-reason, not the guidance-augmented
+  // detail, so rewording the guidance cannot reset a persisted streak.
+  assert.equal(state.nodes['verify-1'].rejectionStreak.detail, 'artifact change:ghost@2 does not exist');
 
   const repeatY = runner.submitVerification(state, submission('change:ghost@2'));
   assert.equal(repeatY.code, 'REJECTION_LOOP');
@@ -1055,6 +1058,7 @@ test('the rejection streak persists with the run document and across re-dispatch
   runner.beginNode(reloaded, 'verify-1', { now: NOW, sessionId: 'sess-verify-2' });
   const repeat = runner.submitVerification(reloaded, ghost);
   assert.equal(repeat.code, 'REJECTION_LOOP');
+  assert.match(repeat.detail, /3 consecutive identical STALE_CHANGE rejections/);
   assert.equal(reloaded.nodes['verify-1'].rejectionStreak.count, 3);
 });
 

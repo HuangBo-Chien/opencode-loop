@@ -1600,6 +1600,47 @@ test('evidence fields flow end to end: learnings reach the planner, risks reach 
   assert.deepEqual(findingsEntry.counts, { learnings: 1 });
 });
 
+test('rejection-loop pauses persist through the verification submit tool', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-rejection-loop-persist-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'child-planner', 'graph-planner');
+  await h.tools.graph_submit_plan.execute({ intent: 'change', specs: SPECS }, ctx(h, 'child-planner', 'graph-planner'));
+  await dispatch(h, 'graph-plan-critic');
+  await bindChild(h, 'child-critic', 'graph-plan-critic');
+  await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
+  await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
+  await bindChild(h, 'child-impl', 'graph-implementer');
+  await mkdir(join(dir, 'src'), { recursive: true });
+  await writeFile(join(dir, 'src', 'a.ts'), 'fixed auth errors');
+  await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-impl', callID: 'e1', args: { filePath: join(dir, 'src', 'a.ts') } }, { title: 'edit', output: 'ok' });
+  const change = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: ['src/a.ts'], summary: 'fixed auth errors' }, ctx(h, 'child-impl', 'graph-implementer')));
+  assert.equal(change.ok, true, JSON.stringify(change));
+  await childIdle(h, 'child-impl');
+
+  await dispatch(h, 'graph-verifier', { nodeId: 'verify-1' });
+  await bindChild(h, 'child-verify', 'graph-verifier');
+  const weak = JSON.parse(await h.tools.graph_submit_verification.execute({ nodeId: 'verify-1', verdict: 'PASS', commands: [] }, ctx(h, 'child-verify', 'graph-verifier')));
+  assert.equal(weak.ok, false);
+  assert.equal(weak.code, 'INSUFFICIENT_EVIDENCE');
+  const loop = JSON.parse(await h.tools.graph_submit_verification.execute({ nodeId: 'verify-1', verdict: 'PASS', commands: [] }, ctx(h, 'child-verify', 'graph-verifier')));
+  assert.equal(loop.ok, false);
+  assert.equal(loop.code, 'REJECTION_LOOP');
+  assert.match(loop.hint, /paused for a user decision/);
+
+  // The pause must already be on disk when the tool replies: a crash right
+  // after the rejection cannot resurrect a RUNNING node and lose the
+  // pendingDecision record.
+  const persisted = JSON.parse(await readFile(join(dir, '.opencode-loop', 'runs', 'root.json'), 'utf8'));
+  assert.equal(persisted.status, 'AWAITING_USER_DECISION');
+  assert.equal(persisted.pendingDecision.cause, 'runner-rejection');
+  assert.equal(persisted.nodes['verify-1'].state, 'PENDING');
+  assert.equal(persisted.nodes['verify-1'].rejectionStreak.count, 2);
+});
+
 test('reset carry-over includes explorer learnings', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'loop-carryover-learnings-'));
   t.after(() => rm(dir, { recursive: true, force: true }));

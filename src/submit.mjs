@@ -193,7 +193,12 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         const hints = {
           INSUFFICIENT_EVIDENCE: 'cite the actual commands and their exit codes; nonzero commands are only tolerated on PASS when they match a declared baseline entry (same command and exit code)',
           ARTIFACT_REQUIRED: 'cite at least one existing artifact path (log, output file, screenshot) produced by the verified work',
+          REJECTION_LOOP: 'stop resubmitting; the run is paused for a user decision — report the rejection and evidence back',
         };
+        // Rejections mutate run state too (rejection streaks; the loop breaker
+        // pauses the run), so persist before replying — a crash must not
+        // resurrect a RUNNING node from disk and lose the pause.
+        await store.saveRun(located.state);
         return rejected(result.code, result.detail, hints[result.code] ?? null);
       }
       await store.saveRun(located.state);
