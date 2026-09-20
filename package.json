@@ -1,12 +1,19 @@
 {
   "name": "opencode-loop",
-  "version": "0.3.0-alpha.14",
+  "version": "0.3.0-alpha.16",
   "description": "OpenCode seven-agent runner-gated graph workflow plugin",
   "type": "module",
   "exports": "./src/index.mjs",
-  "files": ["src", "README.md"],
-  "scripts": { "test": "node --test test/*.test.mjs" },
-  "engines": { "node": ">=22" },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
   "dependencies": {
     "@huggingface/transformers": "3.8.1",
     "@opencode-ai/plugin": "1.18.25"
