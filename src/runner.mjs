@@ -238,6 +238,9 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       const pending = state.pendingDecision;
       return { allowed: false, code: 'AWAITING_DECISION', detail: pending ? `run is awaiting a user decision (${pending.cause}: ${pending.detail}); report to the user and use graph_run_decide to reset or abort` : 'run is awaiting a user decision; use graph_run_decide to reset or abort' };
     }
+    // No code path sets BLOCKED anymore; this branch and blockedReason stay
+    // for legacy persisted runs, which graph_run_decide can still terminate
+    // (abort/reset do not gate on status).
     if (state.status === 'BLOCKED') {
       return { allowed: false, code: 'RUN_BLOCKED', detail: state.blockedReason ? `${state.blockedReason.kind}: ${state.blockedReason.detail}` : 'run is blocked' };
     }
