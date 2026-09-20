@@ -555,6 +555,106 @@ test('PASS over deliverable-backed implement nodes requires an artifact and stor
   assert.deepEqual(counts, { artifacts: 1, probed: 1, skipped: 1 });
 });
 
+test('verify-kind dependencies bind PASS to upstream verification artifacts', () => {
+  const specs = [
+    spec('explore-1', 'explore', 'graph-explorer', { outputs: ['findings'] }),
+    spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'], outputs: ['plan'] }),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'], outputs: ['review'] }),
+    spec('impl-1', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['src/a.ts'], outputs: ['change:impl-1'] }),
+    spec('verify-offline', 'verify', 'graph-verifier', { dependsOn: ['impl-1'], outputs: ['verification:verify-offline'] }),
+    spec('verify-live', 'verify', 'graph-verifier', { dependsOn: ['impl-1', 'verify-offline'], inputs: ['change:impl-1', 'verification:verify-offline'], outputs: ['verification:verify-live'] }),
+  ];
+  const state = freshRun(validateTaskGraph(specs));
+  dispatchCriticAndPass(state);
+  dispatchImplementerAndSucceed(state);
+
+  const offlineAdmit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  assert.equal(offlineAdmit.allowed, true, JSON.stringify(offlineAdmit));
+  assert.equal(offlineAdmit.nodeId, 'verify-offline');
+  runner.beginNode(state, 'verify-offline', { now: NOW, sessionId: 'sess-verify-offline' });
+  const offline = runner.submitVerification(state, { nodeId: 'verify-offline', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], snapshot: { 'src/a.ts': 'hash-post' }, now: NOW });
+  assert.equal(offline.ok, true, JSON.stringify(offline));
+
+  const liveAdmit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW, nodeId: 'verify-live' });
+  assert.equal(liveAdmit.allowed, true, JSON.stringify(liveAdmit));
+  runner.beginNode(state, 'verify-live', { now: NOW, sessionId: 'sess-verify-live' });
+  const live = runner.submitVerification(state, { nodeId: 'verify-live', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], snapshot: { 'src/a.ts': 'hash-post' }, now: NOW });
+  assert.equal(live.ok, true, JSON.stringify(live));
+  assert.equal(state.artifacts['verification:verify-live'].status, 'valid');
+  assert.deepEqual(state.artifacts['verification:verify-live'].basedOn, ['change:impl-1@1', 'verification:verify-offline@1']);
+});
+
+test('verification FAIL records verify-kind dependency refs in the durable evidence artifact', () => {
+  const specs = [
+    spec('explore-1', 'explore', 'graph-explorer', { outputs: ['findings'] }),
+    spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'], outputs: ['plan'] }),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'], outputs: ['review'] }),
+    spec('impl-1', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['src/a.ts'], outputs: ['change:impl-1'] }),
+    spec('verify-offline', 'verify', 'graph-verifier', { dependsOn: ['impl-1'], outputs: ['verification:verify-offline'] }),
+    spec('verify-live', 'verify', 'graph-verifier', { dependsOn: ['impl-1', 'verify-offline'], inputs: ['change:impl-1', 'verification:verify-offline'], outputs: ['verification:verify-live'] }),
+  ];
+  const state = freshRun(validateTaskGraph(specs));
+  dispatchCriticAndPass(state);
+  dispatchImplementerAndSucceed(state);
+  const offlineAdmit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  assert.equal(offlineAdmit.allowed, true, JSON.stringify(offlineAdmit));
+  runner.beginNode(state, 'verify-offline', { now: NOW, sessionId: 'sess-verify-offline' });
+  const offline = runner.submitVerification(state, { nodeId: 'verify-offline', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], snapshot: { 'src/a.ts': 'hash-post' }, now: NOW });
+  assert.equal(offline.ok, true, JSON.stringify(offline));
+
+  const liveAdmit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW, nodeId: 'verify-live' });
+  assert.equal(liveAdmit.allowed, true, JSON.stringify(liveAdmit));
+  runner.beginNode(state, 'verify-live', { now: NOW, sessionId: 'sess-verify-live' });
+  const live = runner.submitVerification(state, { nodeId: 'verify-live', verdict: 'FAIL', commands: [{ command: 'npm test', exitCode: 1 }], summary: 'regression on live path', snapshot: { 'src/a.ts': 'hash-post' }, now: NOW });
+  assert.equal(live.ok, true, JSON.stringify(live));
+  // Conservative invalidation: verify-offline's evidence is based on the now
+  // superseded change:impl-1@1, so its verification goes STALE and the repair
+  // loop re-runs it; only implement deps are reset to PENDING directly.
+  assert.equal(state.nodes['verify-offline'].state, 'STALE');
+  const evidence = state.artifacts['verification:verify-live'];
+  assert.equal(evidence.status, 'superseded');
+  assert.deepEqual(evidence.basedOn, ['change:impl-1@1', 'verification:verify-offline@1']);
+});
+
+test('baseline verify dependencies bind PASS to the baseline artifact', () => {
+  const specs = [
+    spec('explore-1', 'explore', 'graph-explorer', { outputs: ['findings'] }),
+    spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'], outputs: ['plan'] }),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'], outputs: ['review'] }),
+    spec('baseline-1', 'verify', 'graph-verifier', { dependsOn: ['review-1'], baseline: true, outputs: ['baseline:baseline-1'] }),
+    spec('impl-1', 'implement', 'graph-implementer', { dependsOn: ['review-1', 'baseline-1'], writeScope: ['src/a.ts'], outputs: ['change:impl-1'] }),
+    spec('verify-offline', 'verify', 'graph-verifier', { dependsOn: ['impl-1'], outputs: ['verification:verify-offline'] }),
+    spec('verify-live', 'verify', 'graph-verifier', { dependsOn: ['impl-1', 'verify-offline', 'baseline-1'], inputs: ['change:impl-1', 'verification:verify-offline', 'baseline:baseline-1'], outputs: ['verification:verify-live'] }),
+  ];
+  const state = freshRun(validateTaskGraph(specs));
+  dispatchCriticAndPass(state);
+
+  // Baseline evidence is captured before any implement node runs: impl-1
+  // depends on baseline-1 and is inadmissible until the capture lands.
+  const baselineAdmit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  assert.equal(baselineAdmit.allowed, true, JSON.stringify(baselineAdmit));
+  assert.equal(baselineAdmit.nodeId, 'baseline-1');
+  runner.beginNode(state, 'baseline-1', { now: NOW, sessionId: 'sess-verify-baseline' });
+  const baseline = runner.submitVerification(state, { nodeId: 'baseline-1', verdict: 'BASELINE', commands: [{ command: 'npm test', exitCode: 1 }], summary: 'suite red before the change', now: NOW });
+  assert.equal(baseline.ok, true, JSON.stringify(baseline));
+
+  dispatchImplementerAndSucceed(state);
+
+  const offlineAdmit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  assert.equal(offlineAdmit.allowed, true, JSON.stringify(offlineAdmit));
+  assert.equal(offlineAdmit.nodeId, 'verify-offline');
+  runner.beginNode(state, 'verify-offline', { now: NOW, sessionId: 'sess-verify-offline' });
+  const offline = runner.submitVerification(state, { nodeId: 'verify-offline', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], snapshot: { 'src/a.ts': 'hash-post' }, now: NOW });
+  assert.equal(offline.ok, true, JSON.stringify(offline));
+
+  const liveAdmit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW, nodeId: 'verify-live' });
+  assert.equal(liveAdmit.allowed, true, JSON.stringify(liveAdmit));
+  runner.beginNode(state, 'verify-live', { now: NOW, sessionId: 'sess-verify-live' });
+  const live = runner.submitVerification(state, { nodeId: 'verify-live', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], snapshot: { 'src/a.ts': 'hash-post' }, now: NOW });
+  assert.equal(live.ok, true, JSON.stringify(live));
+  assert.deepEqual(state.artifacts['verification:verify-live'].basedOn, ['change:impl-1@1', 'verification:verify-offline@1', 'baseline:baseline-1@1']);
+});
+
 test('change submissions store implementer-reported risks and inspect surfaces counts', async () => {
   const state = freshRun();
   await dispatchCriticAndPass(state);

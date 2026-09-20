@@ -51,6 +51,19 @@ function artifactRef(state, ref) {
   return { artifact };
 }
 
+// PASS/FAIL verification binding derives one artifact ref per dependsOn entry,
+// keyed by the dependency's node kind: implement deps mint change:<id>,
+// baseline verify deps mint baseline:<id>, other verify deps mint
+// verification:<id>. Verify nodes never produce change: artifacts, so a
+// verify→verify dependency must bind to the upstream verification instead.
+function depArtifactRef(state, dep) {
+  const depNode = state.nodes[dep];
+  const name = depNode?.spec?.kind === 'verify'
+    ? (depNode.spec.baseline === true ? `baseline:${dep}` : `verification:${dep}`)
+    : `change:${dep}`;
+  return `${name}@${state.artifacts[name]?.version ?? 1}`;
+}
+
 // Version pins on plan/review inputs are unknowable at authoring time: the
 // plan's version is assigned by the very submission that carries the graph,
 // and the gating review's version by the critic's future verdict. A pin
@@ -576,7 +589,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       if (deliverableDeps.length && !artifacts.length) {
         return { ok: false, code: 'ARTIFACT_REQUIRED', detail: `implement nodes with declared deliverables (${deliverableDeps.map((dep) => dep.spec.id).join(', ')}) require at least one artifact path (an existing evidence file) on PASS` };
       }
-      const refs = changeRefs ?? node.spec.dependsOn.map((dep) => `change:${dep}@${state.artifacts[`change:${dep}`]?.version ?? 1}`);
+      const refs = changeRefs ?? node.spec.dependsOn.map((dep) => depArtifactRef(state, dep));
       for (const ref of refs) {
         const resolution = artifactRef(state, ref);
         if (resolution.missing) return { ok: false, code: 'STALE_CHANGE', detail: resolution.missing };
@@ -602,7 +615,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       const previous = state.artifacts[name];
       const version = previous ? previous.version + 1 : 1;
       if (previous && previous.status === 'valid') previous.status = 'superseded';
-      const refs = node.spec.dependsOn.map((dep) => `change:${dep}@${state.artifacts[`change:${dep}`]?.version ?? 1}`);
+      const refs = node.spec.dependsOn.map((dep) => depArtifactRef(state, dep));
       state.artifacts[name] = { kind: 'verification', nodeId, version, basedOn: refs, payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot, status: 'superseded', createdAt: now };
       if (state.revisionCounters['implement-verify'] >= maxAttempts) {
         pauseForDecision(state, 'verification-repair-exhausted', 'verification repair loop exhausted (maxAttempts reached)', now);
