@@ -5,7 +5,8 @@
 // - The task DAG stays acyclic; bounded repair loops re-PENDING nodes and are
 //   counted separately via revisionCounters.
 // - Verdicts: PASS advances, REVISE returns to planner (capped), FAIL
-//   terminates the run, UNVERIFIED pauses for a user decision.
+//   triggers capped repair (or pauses when the repair budget is gone),
+//   UNVERIFIED pauses for a user decision.
 // - Evidence binds to artifact versions; superseded or hash-mismatched
 //   artifacts invalidate downstream results conservatively.
 
