@@ -1165,6 +1165,30 @@ test('revalidation: hash mismatch invalidates stale verification evidence', asyn
   assert.equal(state.nodes['verify-1'].state, 'STALE');
 });
 
+test('revalidation drift preserves accumulated verify attempts, unlike the supersede route', async () => {
+  const state = freshRun();
+  await dispatchCriticAndPass(state);
+  await dispatchImplementerAndSucceed(state, { snapshot: { 'src/a.ts': '1'.repeat(64) } });
+
+  // One abandoned dispatch (begin without a verdict) before the PASS, so the
+  // verify node reaches SUCCEEDED with accumulated attempts.
+  const admit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  assert.equal(admit.allowed, true, JSON.stringify(admit));
+  runner.beginNode(state, admit.nodeId, { now: NOW, sessionId: 'sess-verify' });
+  runner.markIncomplete(state, { nodeId: admit.nodeId, now: NOW });
+  const verified = await dispatchVerifier(state, 'PASS', [{ command: 'npm test', exitCode: 0 }], { 'src/a.ts': '1'.repeat(64) });
+  assert.equal(verified.ok, true, JSON.stringify(verified));
+  assert.equal(state.nodes['verify-1'].attempt, 2);
+
+  const drifted = runner.revalidateArtifacts(state, { currentSnapshot: { 'src/a.ts': 'hash-2' }, now: NOW });
+  assert.deepEqual(drifted.invalidated, ['change:impl-1@1', 'verification:verify-1@1']);
+  assert.equal(state.nodes['verify-1'].state, 'STALE');
+  // Drift invalidation has no revision counter: per-node attempts are the
+  // only bound on repeated drift re-verification, so they survive the STALE
+  // flip (contrast with supersedeChangeAndInvalidate's reset to 0).
+  assert.equal(state.nodes['verify-1'].attempt, 2);
+});
+
 test('plan-only runs admit reviewers but never implementers', () => {
   const state = newRun({ runId: 'r3', rootSessionId: 'r3', now: NOW });
   const graph = validateTaskGraph([

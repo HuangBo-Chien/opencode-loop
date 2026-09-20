@@ -633,6 +633,9 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       // The next dispatch verifies a NEW change version the repair will mint;
       // the loop budget lives on revisionCounters['implement-verify'], so the
       // node's per-attempt budget restarts instead of accumulating retries.
+      // spec.maxAttempts on a verify node bounds begin-without-verdict
+      // attempts only; FAIL repair rounds are capped by the runner-global
+      // revision counter, not the node's attempt budget.
       node.attempt = 0;
       const repairs = node.spec.dependsOn.map((dep) => state.nodes[dep]).filter((dep) => dep && dep.spec.kind === 'implement');
       for (const repair of repairs) {
@@ -732,6 +735,10 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         if (current === undefined || current !== recorded) {
           artifact.status = 'stale';
           const node = state.nodes[artifact.nodeId];
+          // Deliberate asymmetry with supersedeChangeAndInvalidate: drift
+          // invalidation has no revision counter, so per-node attempts are
+          // the only bound on repeated drift re-verification — they must NOT
+          // be reset on this route.
           if (node && node.state === 'SUCCEEDED') node.state = 'STALE';
           invalidated.push(`${name}@${artifact.version}`);
           break;
