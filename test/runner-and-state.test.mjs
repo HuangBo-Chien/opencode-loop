@@ -876,18 +876,23 @@ test('verification FAIL triggers a capped repair loop and supersedes the change'
   assert.equal(state.pendingDecision.cause, 'verification-repair-exhausted');
 });
 
-test('UNVERIFIED blocks the run without faking success', async () => {
+test('UNVERIFIED pauses the run for a user decision without faking success', async () => {
   const state = freshRun();
   await dispatchCriticAndPass(state);
   await dispatchImplementerAndSucceed(state);
   const result = await dispatchVerifier(state, 'UNVERIFIED', []);
-  assert.equal(result.effect, 'blocked');
-  assert.equal(state.status, 'BLOCKED');
-  assert.equal(state.blockedReason.kind, 'info');
+  assert.equal(result.effect, 'await-decision');
+  assert.equal(state.status, 'AWAITING_USER_DECISION');
+  assert.equal(state.pendingDecision.cause, 'verification-unverified');
+  assert.equal(state.blockedReason, null);
+  const evidence = state.artifacts['verification:verify-1'];
+  assert.equal(evidence.status, 'superseded');
+  assert.equal(evidence.payload.verdict, 'UNVERIFIED');
+  assert.equal(state.nodes['verify-1'].state, 'PENDING');
   const denied = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
-  assert.equal(denied.code, 'RUN_BLOCKED');
-  runner.submitPlan(state, { intent: 'change', nodes: changeGraph().nodes, now: NOW });
-  assert.equal(state.status, 'RUNNING');
+  assert.equal(denied.code, 'AWAITING_DECISION');
+  runner.abortRun(state, { reason: 'x', now: NOW });
+  assert.equal(state.status, 'ABORTED');
 });
 
 test('change submission cross-checks the side-effect ledger and writeScope', async () => {

@@ -5,7 +5,7 @@
 // - The task DAG stays acyclic; bounded repair loops re-PENDING nodes and are
 //   counted separately via revisionCounters.
 // - Verdicts: PASS advances, REVISE returns to planner (capped), FAIL
-//   terminates the run, BLOCKED pauses without faking success.
+//   terminates the run, UNVERIFIED pauses for a user decision.
 // - Evidence binds to artifact versions; superseded or hash-mismatched
 //   artifacts invalidate downstream results conservatively.
 
@@ -630,13 +630,20 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       state.updatedAt = now;
       return { ok: true, effect: 'repair', detail: 'verification failed; implementer repair dispatches will carry this evidence' };
     }
+    // UNVERIFIED is honest uncertainty, not a work failure: the run pauses
+    // for an explicit user decision (graph_run_decide) with the verdict and
+    // its evidence preserved as a superseded verification artifact.
     if (verdict === 'UNVERIFIED') {
       node.state = 'PENDING';
       node.finishedAt = now;
-      state.status = 'BLOCKED';
-      state.blockedReason = { kind: 'info', detail: summary || 'verifier could not verify' };
-      state.updatedAt = now;
-      return { ok: true, effect: 'blocked' };
+      const name = `verification:${nodeId}`;
+      const previous = state.artifacts[name];
+      const version = previous ? previous.version + 1 : 1;
+      if (previous && previous.status === 'valid') previous.status = 'superseded';
+      const refs = node.spec.dependsOn.map((dep) => depArtifactRef(state, dep));
+      state.artifacts[name] = { kind: 'verification', nodeId, version, basedOn: refs, payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot, status: 'superseded', createdAt: now };
+      pauseForDecision(state, 'verification-unverified', summary || 'verifier could not verify', now);
+      return { ok: true, effect: 'await-decision', detail: 'verification could not be completed; run paused for a user decision (evidence preserved)' };
     }
     return { ok: false, code: 'INVALID_VERDICT', detail: 'verdict must be PASS, FAIL or UNVERIFIED' };
   }
