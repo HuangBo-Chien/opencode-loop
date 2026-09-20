@@ -542,7 +542,13 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       if (artifact.kind === 'verification' && artifact.basedOn.some((ref) => ref === `${name}@${change?.version ?? 1}`)) {
         artifact.status = 'stale';
         const verifier = state.nodes[artifact.nodeId];
-        if (verifier && verifier.state === 'SUCCEEDED') verifier.state = 'STALE';
+        if (verifier && verifier.state === 'SUCCEEDED') {
+          verifier.state = 'STALE';
+          // Re-verification is new work against a new change version, not a
+          // retry of the invalidated attempt.
+          verifier.attempt = 0;
+          verifier.lastFailure = null;
+        }
       }
     }
     state.updatedAt = now;
@@ -624,6 +630,10 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         pauseForDecision(state, 'verification-repair-exhausted', 'verification repair loop exhausted (maxAttempts reached)', now);
         return { ok: true, effect: 'await-decision', detail: 'verification repair loop exhausted; awaiting user decision' };
       }
+      // The next dispatch verifies a NEW change version the repair will mint;
+      // the loop budget lives on revisionCounters['implement-verify'], so the
+      // node's per-attempt budget restarts instead of accumulating retries.
+      node.attempt = 0;
       const repairs = node.spec.dependsOn.map((dep) => state.nodes[dep]).filter((dep) => dep && dep.spec.kind === 'implement');
       for (const repair of repairs) {
         supersedeChangeAndInvalidate(state, repair.spec.id, now);

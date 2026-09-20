@@ -616,6 +616,54 @@ test('verification FAIL records verify-kind dependency refs in the durable evide
   assert.deepEqual(evidence.basedOn, ['change:impl-1@1', 'verification:verify-offline@1']);
 });
 
+test('invalidating a succeeded verifier resets it as new work against the new change version', async () => {
+  const specs = [
+    spec('explore-1', 'explore', 'graph-explorer', { outputs: ['findings'] }),
+    spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'], outputs: ['plan'] }),
+    spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'], outputs: ['review'] }),
+    spec('impl-1', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['src/a.ts'], outputs: ['change:impl-1'] }),
+    spec('verify-offline', 'verify', 'graph-verifier', { dependsOn: ['impl-1'], outputs: ['verification:verify-offline'] }),
+    spec('verify-live', 'verify', 'graph-verifier', { dependsOn: ['impl-1', 'verify-offline'], inputs: ['change:impl-1', 'verification:verify-offline'], outputs: ['verification:verify-live'] }),
+  ];
+  const state = freshRun(validateTaskGraph(specs));
+  await dispatchCriticAndPass(state);
+  await dispatchImplementerAndSucceed(state);
+
+  const offlineAdmit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  assert.equal(offlineAdmit.allowed, true, JSON.stringify(offlineAdmit));
+  assert.equal(offlineAdmit.nodeId, 'verify-offline');
+  runner.beginNode(state, 'verify-offline', { now: NOW, sessionId: 'sess-verify-offline' });
+  const offline = runner.submitVerification(state, { nodeId: 'verify-offline', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], snapshot: { 'src/a.ts': 'hash-post' }, now: NOW });
+  assert.equal(offline.ok, true, JSON.stringify(offline));
+  assert.equal(state.nodes['verify-offline'].attempt, 1);
+
+  const liveAdmit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW, nodeId: 'verify-live' });
+  assert.equal(liveAdmit.allowed, true, JSON.stringify(liveAdmit));
+  runner.beginNode(state, 'verify-live', { now: NOW, sessionId: 'sess-verify-live' });
+  const live = runner.submitVerification(state, { nodeId: 'verify-live', verdict: 'FAIL', commands: [{ command: 'npm test', exitCode: 1 }], summary: 'regression on live path', snapshot: { 'src/a.ts': 'hash-post' }, now: NOW });
+  assert.equal(live.ok, true, JSON.stringify(live));
+  assert.equal(live.effect, 'repair');
+
+  // The superseded change invalidates verify-offline's PASS as NEW work: the
+  // node goes STALE with a fresh attempt budget and no carried failure.
+  assert.equal(state.nodes['verify-offline'].state, 'STALE');
+  assert.equal(state.nodes['verify-offline'].attempt, 0);
+  assert.equal(state.nodes['verify-offline'].lastFailure, null);
+  assert.equal(state.artifacts['verification:verify-offline'].status, 'stale');
+
+  // Re-dispatch waits for the implementer repair (impl-1 is PENDING), then a
+  // graph-verifier picks the STALE node up again on a fresh attempt.
+  const tooEarly = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW, nodeId: 'verify-offline' });
+  assert.equal(tooEarly.allowed, false);
+  assert.equal(tooEarly.code, 'NODE_NOT_ADMISSIBLE');
+  await dispatchImplementerAndSucceed(state);
+  const reAdmit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW, nodeId: 'verify-offline' });
+  assert.equal(reAdmit.allowed, true, JSON.stringify(reAdmit));
+  assert.equal(reAdmit.nodeId, 'verify-offline');
+  runner.beginNode(state, 'verify-offline', { now: NOW, sessionId: 'sess-verify-offline-2' });
+  assert.equal(state.nodes['verify-offline'].attempt, 1);
+});
+
 test('baseline verify dependencies bind PASS to the baseline artifact', () => {
   const specs = [
     spec('explore-1', 'explore', 'graph-explorer', { outputs: ['findings'] }),
@@ -865,15 +913,22 @@ test('verification FAIL triggers a capped repair loop and supersedes the change'
   assert.equal(first.effect, 'repair');
   assert.equal(state.nodes['impl-1'].state, 'PENDING');
   assert.equal(state.artifacts['change:impl-1'].status, 'superseded');
+  // Each repair round verifies a NEW change version: the node's attempt
+  // budget restarts, and the loop cap is revisionCounters['implement-verify'].
+  assert.equal(state.nodes['verify-1'].attempt, 0);
 
   await dispatchImplementerAndSucceed(state);
   const second = await dispatchVerifier(state, 'FAIL', [{ command: 'npm test', exitCode: 1 }]);
   assert.equal(second.effect, 'repair');
+  // One fresh dispatch consumed and reset again — attempts never accumulate
+  // across repair rounds.
+  assert.equal(state.nodes['verify-1'].attempt, 0);
   await dispatchImplementerAndSucceed(state);
   const third = await dispatchVerifier(state, 'FAIL', [{ command: 'npm test', exitCode: 1 }]);
   assert.equal(third.effect, 'await-decision');
   assert.equal(state.status, 'AWAITING_USER_DECISION');
   assert.equal(state.pendingDecision.cause, 'verification-repair-exhausted');
+  assert.equal(state.revisionCounters['implement-verify'], 3);
 });
 
 test('UNVERIFIED pauses the run for a user decision without faking success', async () => {
