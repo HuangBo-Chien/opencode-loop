@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { tool } from '@opencode-ai/plugin/tool';
 import { createJournalService } from '../src/journal.mjs';
-import { createJournalStore, stableJournalId } from '../src/journal-store.mjs';
+import { createJournalStore, JOURNAL_SCHEMA_VERSION, stableJournalId } from '../src/journal-store.mjs';
+import { MAX_AUTHORED_BODY_INPUT_CHARS, MAX_INDEXED_TEXT_CHARS } from '../src/journal-text.mjs';
 import { createRunStore } from '../src/run-state.mjs';
 
 const CREATED_AT = '2026-09-10T10:00:00.000Z';
@@ -113,6 +114,21 @@ function summaryId(worktree, runId) {
   return stableJournalId('run-summary', projectKey(worktree), runId);
 }
 
+function legacyEntry(kind, partial) {
+  return { ...partial, id: stableJournalId(kind, partial) };
+}
+
+function redactionExpandedAstralBoundary(limit) {
+  const inputPrefix = 'token=x,';
+  const redactedPrefix = 'token=[REDACTED],';
+  const filler = 't'.repeat(limit - redactedPrefix.length - 1);
+  return {
+    input: `${inputPrefix}${filler}😀`,
+    safe: `${redactedPrefix}${filler}`,
+    legacy: `${redactedPrefix}${filler}\uD83D`,
+  };
+}
+
 function errorCode(code) {
   return (error) => error?.code === code;
 }
@@ -150,11 +166,18 @@ test('journal tool schemas apply defaults and enforce public bounds', async () =
   assert.deepEqual(schema('graph_journal_write_insight').parse({ title: 'Title', body: 'Body' }), {
     title: 'Title', body: 'Body', tags: [],
   });
+  for (const length of [20_000, MAX_AUTHORED_BODY_INPUT_CHARS]) {
+    assert.equal(schema('graph_journal_write_insight').parse({
+      title: 'Title', body: 'b'.repeat(length),
+    }).body.length, length);
+  }
+  assert.throws(() => schema('graph_journal_write_insight').parse({
+    title: 'Title', body: 'b'.repeat(MAX_AUTHORED_BODY_INPUT_CHARS + 1),
+  }));
   for (const args of [
     { title: '', body: 'Body' },
     { title: 't'.repeat(513), body: 'Body' },
     { title: 'Title', body: '' },
-    { title: 'Title', body: 'b'.repeat(32_001) },
     { title: 'Title', body: 'Body', tags: Array(17).fill('tag') },
     { title: 'Title', body: 'Body', tags: [''] },
     { title: 'Title', body: 'Body', tags: ['t'.repeat(129)] },
@@ -163,6 +186,14 @@ test('journal tool schemas apply defaults and enforce public bounds', async () =
   assert.deepEqual(schema('graph_journal_promote').parse({ insightId: HEX_A, title: 'Title', body: 'Body' }), {
     insightId: HEX_A, title: 'Title', body: 'Body', tags: [],
   });
+  for (const length of [20_000, MAX_AUTHORED_BODY_INPUT_CHARS]) {
+    assert.equal(schema('graph_journal_promote').parse({
+      insightId: HEX_A, title: 'Title', body: 'b'.repeat(length),
+    }).body.length, length);
+  }
+  assert.throws(() => schema('graph_journal_promote').parse({
+    insightId: HEX_A, title: 'Title', body: 'b'.repeat(MAX_AUTHORED_BODY_INPUT_CHARS + 1),
+  }));
   assert.throws(() => schema('graph_journal_promote').parse({ insightId: 'A'.repeat(64), title: 'Title', body: 'Body' }));
   assert.throws(() => schema('graph_journal_promote').parse({ insightId: HEX_A, title: '', body: 'Body' }));
 });
@@ -342,9 +373,10 @@ test('JournalService insight writes require enabled, available, terminal project
 
 test('project insight projects its summary and is sanitized, bounded, content-stable, and idempotent', async (t) => {
   const h = await realHarness(t, { runId: 'insight-run-001', status: 'SUCCEEDED' });
+  const title = 'T'.repeat(512);
   const input = {
-    title: `Reusable password=title-secret ${'t'.repeat(600)}`,
-    body: `Authorization: Bearer body-secret\n${'b'.repeat(34_000)}`,
+    title,
+    body: 'b'.repeat(MAX_INDEXED_TEXT_CHARS - title.length - 2),
     tags: [
       ' reusable ',
       'token=tag-secret',
@@ -363,6 +395,7 @@ test('project insight projects its summary and is sanitized, bounded, content-st
   assert.equal(first.created, true);
   assert.equal(second.created, false);
   assert.equal(second.entry.id, first.entry.id);
+  assert.deepEqual(second.entry, first.entry);
   assert.notEqual(changed.entry.id, first.entry.id);
   assert.equal(summary.kind, 'run-summary');
   assert.equal(entry.kind, 'insight');
@@ -373,14 +406,447 @@ test('project insight projects its summary and is sanitized, bounded, content-st
     runId: h.state.runId,
     status: 'SUCCEEDED',
   });
-  assert.ok(entry.title.length <= 512);
-  assert.ok(entry.body.length <= 32_000);
+  assert.equal(entry.title.length, 512);
+  assert.equal(`${entry.title}\n\n${entry.body}`.length, MAX_INDEXED_TEXT_CHARS);
+  assert.equal(entry.body, input.body);
+  assert.ok(entry.body.length > 0);
   assert.ok(entry.tags.length <= 16);
   assert.ok(entry.tags.every((tag) => tag.length >= 1 && tag.length <= 128));
   assert.equal(entry.tags[0], 'reusable');
   const serialized = JSON.stringify(entry);
-  for (const secret of ['title-secret', 'body-secret', 'tag-secret']) assert.equal(serialized.includes(secret), false);
+  assert.equal(serialized.includes('tag-secret'), false);
   assert.match(serialized, /\[REDACTED\]/);
+});
+
+test('journal write execution rejects new combined overflow and body truncation without shortening content', async (t) => {
+  const h = await realHarness(t, { runId: 'journal-authored-limit-run' });
+  const overflow = { title: 'Title', body: 'a'.repeat(MAX_INDEXED_TEXT_CHARS), tags: [] };
+
+  const rejectedInsight = await execute(
+    h.tools.graph_journal_write_insight,
+    overflow,
+    h.state.runId,
+    'graph-orchestrator',
+  );
+  assert.equal(rejectedInsight.ok, false);
+  assert.equal(rejectedInsight.code, 'JOURNAL_ERROR');
+
+  const body = 'a'.repeat(MAX_INDEXED_TEXT_CHARS - overflow.title.length - 2);
+  const acceptedInsight = await execute(
+    h.tools.graph_journal_write_insight,
+    { ...overflow, body },
+    h.state.runId,
+    'graph-orchestrator',
+  );
+  assert.equal(acceptedInsight.ok, true);
+  assert.equal(acceptedInsight.entry.body, body);
+
+  const rejectedPromotion = await execute(h.tools.graph_journal_promote, {
+    insightId: acceptedInsight.entry.id,
+    ...overflow,
+  }, h.state.runId, 'graph-orchestrator');
+  assert.equal(rejectedPromotion.ok, false);
+  assert.equal(rejectedPromotion.code, 'JOURNAL_ERROR');
+
+  await assert.rejects(
+    () => h.journalService.writeInsight(h.state, { title: 'Truncated insight', body: 'i'.repeat(34_000), tags: [] }),
+    TypeError,
+  );
+  await assert.rejects(
+    () => h.journalService.promote({
+      insightId: acceptedInsight.entry.id,
+      title: 'Truncated promotion',
+      body: 'p'.repeat(34_000),
+      tags: [],
+    }),
+    TypeError,
+  );
+});
+
+test('journal public write rejects lone surrogates before hashing or persistence', async (t) => {
+  const cases = [
+    { title: 'Title', body: 'bad\uD800' },
+    { title: '\uDC00bad', body: 'Body' },
+  ];
+
+  for (let index = 0; index < cases.length; index += 1) {
+    const h = await realHarness(t, { runId: `ill-formed-journal-${index}` });
+    const schema = tool.schema.object(h.tools.graph_journal_write_insight.args);
+    const input = schema.parse({ ...cases[index], tags: [] });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = await execute(
+        h.tools.graph_journal_write_insight,
+        input,
+        h.state.runId,
+        'graph-orchestrator',
+      );
+      assert.equal(result.ok, false);
+      assert.equal(result.code, 'JOURNAL_ERROR');
+    }
+    assert.deepEqual(await h.journalStore.list('project'), []);
+  }
+});
+
+test('writeInsight rejects over-limit raw prefixes instead of replaying legacy entries', async (t) => {
+  const h = await realHarness(t, { runId: 'raw-prefix-insight' });
+  const bodyPrefix = 'b'.repeat(MAX_AUTHORED_BODY_INPUT_CHARS);
+  const titlePrefix = 'T'.repeat(512);
+  const base = {
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    scope: 'project',
+    kind: 'insight',
+    createdAt: FINISHED_AT,
+    tags: [],
+    sourceIds: [summaryId(h.worktree, h.state.runId)],
+    metadata: { projectKey: projectKey(h.worktree), runId: h.state.runId, status: 'SUCCEEDED' },
+  };
+  const bodyLegacy = legacyEntry('insight', { ...base, title: 'Body prefix', body: bodyPrefix });
+  const titleLegacy = legacyEntry('insight', { ...base, title: titlePrefix, body: 'Title prefix body' });
+  await h.journalStore.write('project', bodyLegacy);
+  await h.journalStore.write('project', titleLegacy);
+  const before = await h.journalStore.list('project');
+
+  const attempts = await Promise.allSettled([
+    h.journalService.writeInsight(h.state, {
+      title: bodyLegacy.title, body: `${bodyPrefix}trailing data`, tags: [],
+    }),
+    h.journalService.writeInsight(h.state, {
+      title: `${titlePrefix}trailing data`, body: titleLegacy.body, tags: [],
+    }),
+  ]);
+
+  assert.deepEqual(attempts.map((attempt) => attempt.status), ['rejected', 'rejected']);
+  assert.ok(attempts.every((attempt) => attempt.reason instanceof TypeError));
+  assert.deepEqual(await h.journalStore.list('project'), before);
+});
+
+test('promote rejects over-limit raw prefixes instead of replaying legacy entries', async (t) => {
+  const h = await realHarness(t, { runId: 'raw-prefix-promotion' });
+  const source = await h.journalService.writeInsight(h.state, {
+    title: 'Source insight', body: 'Source body', tags: [],
+  });
+  const bodyPrefix = 'b'.repeat(MAX_AUTHORED_BODY_INPUT_CHARS);
+  const titlePrefix = 'T'.repeat(512);
+  const base = {
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    scope: 'global',
+    kind: 'promoted-insight',
+    createdAt: source.entry.createdAt,
+    tags: [],
+    sourceIds: [],
+    metadata: { originKind: 'insight' },
+  };
+  const bodyLegacy = legacyEntry('promoted-insight', { ...base, title: 'Body prefix', body: bodyPrefix });
+  const titleLegacy = legacyEntry('promoted-insight', { ...base, title: titlePrefix, body: 'Title prefix body' });
+  await h.journalStore.write('global', bodyLegacy);
+  await h.journalStore.write('global', titleLegacy);
+  const projectBefore = await h.journalStore.list('project');
+  const globalBefore = await h.journalStore.list('global');
+
+  const attempts = await Promise.allSettled([
+    h.journalService.promote({
+      insightId: source.entry.id, title: bodyLegacy.title, body: `${bodyPrefix}trailing data`, tags: [],
+    }),
+    h.journalService.promote({
+      insightId: source.entry.id, title: `${titlePrefix}trailing data`, body: titleLegacy.body, tags: [],
+    }),
+  ]);
+
+  assert.deepEqual(attempts.map((attempt) => attempt.status), ['rejected', 'rejected']);
+  assert.ok(attempts.every((attempt) => attempt.reason instanceof TypeError));
+  assert.deepEqual(await h.journalStore.list('project'), projectBefore);
+  assert.deepEqual(await h.journalStore.list('global'), globalBefore);
+});
+
+test('project insight replays a 20000-character legacy entry through its public tool only when the ID exists', async (t) => {
+  const h = await realHarness(t, { runId: 'legacy-insight-run' });
+  await h.journalService.projectRun(h.state);
+  const input = { title: 'Title', body: 'a'.repeat(20_000), tags: ['legacy'] };
+  const partial = {
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    scope: 'project',
+    kind: 'insight',
+    title: input.title,
+    createdAt: FINISHED_AT,
+    tags: input.tags,
+    sourceIds: [summaryId(h.worktree, h.state.runId)],
+    metadata: {
+      projectKey: projectKey(h.worktree),
+      runId: h.state.runId,
+      status: 'SUCCEEDED',
+    },
+    body: input.body,
+  };
+  const legacy = legacyEntry('insight', partial);
+  await h.journalStore.write('project', legacy);
+
+  const schema = tool.schema.object(h.tools.graph_journal_write_insight.args);
+  const replay = await execute(
+    h.tools.graph_journal_write_insight,
+    schema.parse(input),
+    h.state.runId,
+    'graph-orchestrator',
+  );
+  const rejected = await execute(
+    h.tools.graph_journal_write_insight,
+    schema.parse({ ...input, body: 'b'.repeat(20_000) }),
+    h.state.runId,
+    'graph-orchestrator',
+  );
+
+  assert.equal(replay.ok, true);
+  assert.equal(replay.created, false);
+  assert.deepEqual(replay.entry, legacy);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.code, 'JOURNAL_ERROR');
+  assert.deepEqual(
+    (await h.journalStore.list('project')).filter((entry) => entry.kind === 'insight').map((entry) => entry.id),
+    [legacy.id],
+  );
+});
+
+test('journal promotion replays a 20000-character legacy entry through its public tool only when the ID exists', async (t) => {
+  const h = await realHarness(t, { runId: 'legacy-promotion-run' });
+  const source = await h.journalService.writeInsight(h.state, {
+    title: 'Source insight', body: 'Source body', tags: [],
+  });
+  const input = {
+    insightId: source.entry.id,
+    title: 'Title',
+    body: 'a'.repeat(20_000),
+    tags: ['legacy'],
+  };
+  const partial = {
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    scope: 'global',
+    kind: 'promoted-insight',
+    title: input.title,
+    createdAt: source.entry.createdAt,
+    tags: input.tags,
+    sourceIds: [],
+    metadata: { originKind: 'insight' },
+    body: input.body,
+  };
+  const legacy = legacyEntry('promoted-insight', partial);
+  await h.journalStore.write('global', legacy);
+
+  const schema = tool.schema.object(h.tools.graph_journal_promote.args);
+  const replay = await execute(
+    h.tools.graph_journal_promote,
+    schema.parse(input),
+    h.state.runId,
+    'graph-orchestrator',
+  );
+  const rejected = await execute(
+    h.tools.graph_journal_promote,
+    schema.parse({ ...input, body: 'b'.repeat(20_000) }),
+    h.state.runId,
+    'graph-orchestrator',
+  );
+
+  assert.equal(replay.ok, true);
+  assert.equal(replay.created, false);
+  assert.deepEqual(replay.entry, legacy);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.code, 'JOURNAL_ERROR');
+  assert.deepEqual((await h.journalStore.list('global')).map((entry) => entry.id), [legacy.id]);
+});
+
+test('project insight replays an exact legacy body after raw Markdown persistence repairs its surrogate', async (t) => {
+  const h = await realHarness(t, { runId: 'legacy-persisted-body-insight-run' });
+  await h.journalService.projectRun(h.state);
+  const body = redactionExpandedAstralBoundary(MAX_AUTHORED_BODY_INPUT_CHARS);
+  const input = { title: 'Legacy body insight', body: body.input, tags: ['legacy'] };
+  const schema = tool.schema.object(h.tools.graph_journal_write_insight.args);
+  const parsed = schema.parse(input);
+  const base = {
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    scope: 'project',
+    kind: 'insight',
+    title: input.title,
+    createdAt: FINISHED_AT,
+    tags: input.tags,
+    sourceIds: [summaryId(h.worktree, h.state.runId)],
+    metadata: { projectKey: projectKey(h.worktree), runId: h.state.runId, status: 'SUCCEEDED' },
+  };
+  const legacy = legacyEntry('insight', { ...base, body: body.legacy });
+  const current = legacyEntry('insight', { ...base, body: body.safe });
+  assert.equal(body.legacy.isWellFormed(), false);
+  assert.notEqual(current.id, legacy.id);
+  await h.journalStore.write('project', legacy);
+  const persisted = await h.journalStore.read('project', legacy.id);
+  assert.equal(persisted.body, body.legacy.toWellFormed());
+
+  const replay = await execute(
+    h.tools.graph_journal_write_insight,
+    parsed,
+    h.state.runId,
+    'graph-orchestrator',
+  );
+
+  assert.equal(replay.ok, true);
+  assert.equal(replay.created, false);
+  assert.deepEqual(replay.entry, persisted);
+  assert.deepEqual(
+    (await h.journalStore.list('project')).filter((entry) => entry.kind === 'insight').map((entry) => entry.id),
+    [legacy.id],
+  );
+  assert.equal(await h.journalStore.read('project', current.id), null);
+});
+
+test('journal promotion replays an exact legacy body after raw Markdown persistence repairs its surrogate', async (t) => {
+  const h = await realHarness(t, { runId: 'legacy-persisted-body-promotion-run' });
+  const source = await h.journalService.writeInsight(h.state, {
+    title: 'Source insight', body: 'Source body', tags: [],
+  });
+  const body = redactionExpandedAstralBoundary(MAX_AUTHORED_BODY_INPUT_CHARS);
+  const input = {
+    insightId: source.entry.id,
+    title: 'Legacy body promotion',
+    body: body.input,
+    tags: ['legacy'],
+  };
+  const schema = tool.schema.object(h.tools.graph_journal_promote.args);
+  const parsed = schema.parse(input);
+  const base = {
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    scope: 'global',
+    kind: 'promoted-insight',
+    title: input.title,
+    createdAt: source.entry.createdAt,
+    tags: input.tags,
+    sourceIds: [],
+    metadata: { originKind: 'insight' },
+  };
+  const legacy = legacyEntry('promoted-insight', { ...base, body: body.legacy });
+  const current = legacyEntry('promoted-insight', { ...base, body: body.safe });
+  assert.notEqual(current.id, legacy.id);
+  await h.journalStore.write('global', legacy);
+  const persisted = await h.journalStore.read('global', legacy.id);
+  assert.equal(persisted.body, body.legacy.toWellFormed());
+
+  const replay = await execute(
+    h.tools.graph_journal_promote,
+    parsed,
+    h.state.runId,
+    'graph-orchestrator',
+  );
+
+  assert.equal(replay.ok, true);
+  assert.equal(replay.created, false);
+  assert.deepEqual(replay.entry, persisted);
+  assert.deepEqual((await h.journalStore.list('global')).map((entry) => entry.id), [legacy.id]);
+  assert.equal(await h.journalStore.read('global', current.id), null);
+});
+
+test('journal insight replays an in-limit legacy ID after redaction expands across an astral boundary', async (t) => {
+  const h = await realHarness(t, { runId: 'legacy-in-limit-insight-run' });
+  await h.journalService.projectRun(h.state);
+  const title = redactionExpandedAstralBoundary(512);
+  const tag = redactionExpandedAstralBoundary(128);
+  const input = {
+    title: title.input,
+    body: 'Short legacy insight body',
+    tags: [tag.input],
+  };
+  const schema = tool.schema.object(h.tools.graph_journal_write_insight.args);
+  const parsed = schema.parse(input);
+  assert.equal(title.legacy.isWellFormed(), false);
+  assert.equal(tag.legacy.isWellFormed(), false);
+  assert.ok(`${title.safe}\n\n${input.body}`.length <= MAX_INDEXED_TEXT_CHARS);
+  const base = {
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    scope: 'project',
+    kind: 'insight',
+    createdAt: FINISHED_AT,
+    sourceIds: [summaryId(h.worktree, h.state.runId)],
+    metadata: { projectKey: projectKey(h.worktree), runId: h.state.runId, status: 'SUCCEEDED' },
+    body: input.body,
+  };
+  const legacy = legacyEntry('insight', { ...base, title: title.legacy, tags: [tag.legacy] });
+  const current = legacyEntry('insight', { ...base, title: title.safe, tags: [tag.safe] });
+  assert.notEqual(current.id, legacy.id);
+  await h.journalStore.write('project', legacy);
+
+  const replay = await execute(
+    h.tools.graph_journal_write_insight,
+    parsed,
+    h.state.runId,
+    'graph-orchestrator',
+  );
+
+  assert.equal(replay.ok, true);
+  assert.equal(replay.created, false);
+  assert.deepEqual(replay.entry, legacy);
+  assert.deepEqual(
+    (await h.journalStore.list('project')).filter((entry) => entry.kind === 'insight').map((entry) => entry.id),
+    [legacy.id],
+  );
+  assert.equal(await h.journalStore.read('project', current.id), null);
+});
+
+test('journal promotion replays an in-limit legacy ID after redaction expands across an astral boundary', async (t) => {
+  const h = await realHarness(t, { runId: 'legacy-in-limit-promotion-run' });
+  const source = await h.journalService.writeInsight(h.state, {
+    title: 'Source insight', body: 'Source body', tags: [],
+  });
+  const title = redactionExpandedAstralBoundary(512);
+  const tag = redactionExpandedAstralBoundary(128);
+  const input = {
+    insightId: source.entry.id,
+    title: title.input,
+    body: 'Short legacy promotion body',
+    tags: [tag.input],
+  };
+  const schema = tool.schema.object(h.tools.graph_journal_promote.args);
+  const parsed = schema.parse(input);
+  const base = {
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    scope: 'global',
+    kind: 'promoted-insight',
+    createdAt: source.entry.createdAt,
+    sourceIds: [],
+    metadata: { originKind: 'insight' },
+    body: input.body,
+  };
+  const legacy = legacyEntry('promoted-insight', { ...base, title: title.legacy, tags: [tag.legacy] });
+  const current = legacyEntry('promoted-insight', { ...base, title: title.safe, tags: [tag.safe] });
+  assert.notEqual(current.id, legacy.id);
+  await h.journalStore.write('global', legacy);
+
+  const replay = await execute(
+    h.tools.graph_journal_promote,
+    parsed,
+    h.state.runId,
+    'graph-orchestrator',
+  );
+
+  assert.equal(replay.ok, true);
+  assert.equal(replay.created, false);
+  assert.deepEqual(replay.entry, legacy);
+  assert.deepEqual((await h.journalStore.list('global')).map((entry) => entry.id), [legacy.id]);
+  assert.equal(await h.journalStore.read('global', current.id), null);
+});
+
+test('project insight persists an astral title boundary without lone surrogates and replays idempotently', async (t) => {
+  const h = await realHarness(t, { runId: 'astral-insight-run' });
+  const input = {
+    title: `${'t'.repeat(510)}😀`,
+    body: 'Astral-safe body',
+    tags: [],
+  };
+
+  const first = await h.journalService.writeInsight(h.state, input);
+  const second = await h.journalService.writeInsight(h.state, input);
+  const reread = await h.journalStore.read('project', first.entry.id);
+
+  assert.equal(first.created, true);
+  assert.equal(second.created, false);
+  assert.equal(first.entry.title.length <= 512, true);
+  assert.equal(first.entry.title.isWellFormed(), true);
+  assert.equal(first.entry.body.isWellFormed(), true);
+  assert.deepEqual(second.entry, first.entry);
+  assert.deepEqual(reread, first.entry);
 });
 
 test('promotion rejects missing entries and project entries of the wrong kind', async (t) => {
@@ -447,6 +913,33 @@ test('promotion stores only separately supplied sanitized project-neutral conten
     source.entry.id,
     file,
   ]) assert.equal(serialized.includes(excluded), false, `global journal leaked ${excluded}`);
+});
+
+test('promotion preserves content at the combined indexed-text boundary', async (t) => {
+  const h = await realHarness(t, { runId: 'bounded-promotion-run' });
+  const source = await h.journalService.writeInsight(h.state, {
+    title: 'Source insight',
+    body: 'Project-only source body',
+    tags: [],
+  });
+  const title = 'P'.repeat(512);
+  const input = {
+    insightId: source.entry.id,
+    title,
+    body: 'p'.repeat(MAX_INDEXED_TEXT_CHARS - title.length - 2),
+    tags: ['portable'],
+  };
+
+  const first = await h.journalService.promote(input);
+  const second = await h.journalService.promote(input);
+  const entry = await h.journalStore.read('global', first.entry.id);
+
+  assert.equal(first.created, true);
+  assert.equal(second.created, false);
+  assert.deepEqual(second.entry, first.entry);
+  assert.equal(`${entry.title}\n\n${entry.body}`.length, MAX_INDEXED_TEXT_CHARS);
+  assert.equal(entry.body, input.body);
+  assert.ok(entry.body.length > 0);
 });
 
 test('promotion rejects supplied title, body, or tags containing known project metadata', async (t) => {

@@ -64,18 +64,145 @@ function indexedText(entry) {
   return `${entry.title}\n\n${entry.body}`;
 }
 
+function fakeTokenizer({ contentTokens = (text) => Array.from(text).length, specialTokens = 2 } = {}) {
+  const calls = [];
+  const tokenizer = () => {};
+  tokenizer.calls = calls;
+  tokenizer.encode = (text, { add_special_tokens: addSpecialTokens } = {}) => {
+    calls.push({ text, addSpecialTokens });
+    const count = contentTokens(text) + (addSpecialTokens ? specialTokens : 0);
+    if (!Number.isSafeInteger(count) || count < 0) throw new TypeError('Invalid fake token count');
+    return new Uint32Array(count);
+  };
+  return tokenizer;
+}
+
+function wordPieceContentTokens(value) {
+  return (value.match(/\S+/gu) ?? []).reduce((total, word) => {
+    const characters = Array.from(word);
+    if (characters.length > 100) return total + 1;
+    return total + characters.reduce((count, character) => count + (character === 'é' ? 2 : 1), 0);
+  }, 0);
+}
+
+function hangulWordPieceContentTokens(value) {
+  return (value.match(/\S+/gu) ?? []).reduce((total, word) => {
+    const characters = Array.from(word);
+    if (characters.length > 100) return total + 1;
+    return total + characters.reduce((count, character) => count + (character === '각' ? 3 : 1), 0);
+  }, 0);
+}
+
+function bertWordPieceContentTokens(value) {
+  return (value.match(/[^\s\p{P}\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E]+|[\p{P}\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E]/gu) ?? []).reduce((total, piece) => {
+    if (/^[\p{P}\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E]$/u.test(piece)) return total + 1;
+    const characters = Array.from(piece);
+    if (/^[\x00-\x7F]+$/u.test(piece) && characters.length > 100) return total + 1;
+    return total + characters.reduce((count, character) => count + (character === '각' ? 3 : 1), 0);
+  }, 0);
+}
+
+function measuredDenseTokenizer({ maxCalls = Number.POSITIVE_INFINITY, rejectText, specialTokens = 2 } = {}) {
+  const metrics = { calls: 0, characters: 0, maxCharacters: 0 };
+  const tokenizer = () => {};
+  tokenizer.encode = (text, { add_special_tokens: addSpecialTokens } = {}) => {
+    metrics.calls += 1;
+    metrics.characters += text.length;
+    metrics.maxCharacters = Math.max(metrics.maxCharacters, text.length);
+    if (metrics.calls > maxCalls) throw new Error('Dense tokenizer call budget exceeded');
+    if (text === rejectText) throw new Error('Dense tokenizer received the complete input');
+    const tokens = [];
+    tokens.length = text.length + (addSpecialTokens ? specialTokens : 0);
+    return tokens;
+  };
+  return { metrics, tokenizer };
+}
+
+function fakeExtractor(tokenizer, inference) {
+  const extractor = async (...args) => inference(...args);
+  extractor.tokenizer = tokenizer;
+  return extractor;
+}
+
+async function sparseWhitespaceLegacyProbe(text, requiredOffset) {
+  const {
+    MAX_CANONICAL_TEXT_CHARS,
+    MAX_EMBEDDING_CHUNKS,
+    MAX_EMBEDDING_SEQUENCE_TOKENS,
+    MAX_INDEXED_TOKENS,
+    createEmbeddingProvider,
+  } = await task3Modules();
+  const tokenizer = fakeTokenizer({ contentTokens: (value) => value.includes('x') ? 1 : 0 });
+  const encode = tokenizer.encode;
+  const metrics = { fullInputCalls: 0, maxCharacters: 0 };
+  tokenizer.encode = (value, options) => {
+    metrics.maxCharacters = Math.max(metrics.maxCharacters, value.length);
+    if (value === text) {
+      metrics.fullInputCalls += 1;
+      throw new Error('Sparse tokenizer received the complete legacy input');
+    }
+    return encode(value, options);
+  };
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      assert.ok(batch.every((value) => value !== text));
+      batches.push([...batch]);
+      return batch.map(() => [1, 0]);
+    }),
+  });
+
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  const chunks = batches.flat();
+  assert.equal(metrics.fullInputCalls, 0);
+  assert.ok(metrics.maxCharacters <= MAX_CANONICAL_TEXT_CHARS);
+  assert.ok(chunks.length >= 2 && chunks.length <= MAX_EMBEDDING_CHUNKS);
+  assert.ok(chunks.every((chunk) => chunk.length <= MAX_CANONICAL_TEXT_CHARS && chunk.length < text.length));
+  assert.ok(chunks.every((chunk) => tokenizer.encode(chunk, { add_special_tokens: true }).length <= MAX_EMBEDDING_SEQUENCE_TOKENS));
+  assert.ok(chunks.reduce((total, chunk) => (
+    total + tokenizer.encode(chunk, { add_special_tokens: false }).length
+  ), 0) <= MAX_INDEXED_TOKENS);
+  let requiredMarker;
+  if (requiredOffset !== undefined) {
+    requiredMarker = text[requiredOffset];
+    assert.equal(text.indexOf(requiredMarker), requiredOffset);
+    assert.equal(text.lastIndexOf(requiredMarker), requiredOffset);
+    assert.ok(
+      chunks.some((chunk) => chunk.includes(requiredMarker)),
+      `expected a sparse chunk to intersect source offset ${requiredOffset}`,
+    );
+  }
+  let sourceOffset = 0;
+  const offsets = chunks.slice(0, -1).map((chunk) => {
+    const markerOffset = requiredMarker === undefined ? -1 : chunk.indexOf(requiredMarker);
+    const offset = markerOffset === -1 ? text.indexOf(chunk, sourceOffset) : requiredOffset - markerOffset;
+    assert.ok(offset >= sourceOffset);
+    sourceOffset = offset + chunk.length;
+    return offset;
+  });
+  const suffix = chunks.at(-1);
+  const suffixOffset = text.length - suffix.length;
+  assert.equal(suffix, text.slice(suffixOffset));
+  assert.ok(suffixOffset >= sourceOffset);
+  offsets.push(suffixOffset);
+  assert.equal(offsets[0], 0);
+  assert.equal(offsets.at(-1) + suffix.length, text.length);
+}
+
 function testEmbeddingSpace(model, overrides = {}) {
   return Object.freeze({
     aggregate: 'mean-l2-normalize',
     aggregateVersion: 1,
-    chunkStrategy: 'evenly-spaced-windows',
-    chunkVersion: 1,
+    chunkStrategy: 'token-aware-spanning-windows',
+    chunkVersion: 2,
     dtype: 'q8',
-    maxChunkChars: 3000,
-    maxChunks: 4,
-    maxIndexedChars: 12_000,
+    maxCanonicalChars: 12_000,
+    maxChunks: 48,
+    maxIndexedTokens: 12_000,
+    maxSequenceTokens: 256,
     model,
     normalize: true,
+    overlapTokens: 0,
     pooling: 'mean',
     revision: 'test-revision-1',
     ...overrides,
@@ -107,8 +234,13 @@ async function writeEntries(store, entries) {
 
 test('embedding provider is lazy, caches one q8 pipeline, and returns a plain finite vector', async () => {
   const {
+    EMBEDDING_BATCH_SIZE,
     EMBEDDING_SPACE,
     EMBEDDING_SPACE_DIGEST,
+    MAX_CANONICAL_TEXT_CHARS,
+    MAX_EMBEDDING_CHUNKS,
+    MAX_EMBEDDING_SEQUENCE_TOKENS,
+    MAX_INDEXED_TOKENS,
     MODEL_DTYPE,
     MODEL_NAME,
     MODEL_REVISION,
@@ -120,28 +252,37 @@ test('embedding provider is lazy, caches one q8 pipeline, and returns a plain fi
   assert.deepEqual(EMBEDDING_SPACE, {
     aggregate: 'mean-l2-normalize',
     aggregateVersion: 1,
-    chunkStrategy: 'evenly-spaced-windows',
-    chunkVersion: 1,
+    chunkStrategy: 'token-aware-spanning-windows',
+    chunkVersion: 2,
     dtype: MODEL_DTYPE,
-    maxChunkChars: 3000,
-    maxChunks: 4,
-    maxIndexedChars: 12_000,
+    maxCanonicalChars: 12_000,
+    maxChunks: 48,
+    maxIndexedTokens: 12_000,
+    maxSequenceTokens: 256,
     model: MODEL_NAME,
     normalize: true,
+    overlapTokens: 0,
     pooling: 'mean',
     revision: MODEL_REVISION,
   });
+  assert.equal(MAX_CANONICAL_TEXT_CHARS, 12_000);
+  assert.equal(MAX_EMBEDDING_SEQUENCE_TOKENS, 256);
+  assert.equal(MAX_INDEXED_TOKENS, 12_000);
+  assert.equal(MAX_EMBEDDING_CHUNKS, 48);
+  assert.equal(EMBEDDING_BATCH_SIZE, 8);
   assert.match(EMBEDDING_SPACE_DIGEST, /^[a-f0-9]{64}$/);
 
   const factoryCalls = [];
   const inferenceCalls = [];
+  const tokenizer = fakeTokenizer({ contentTokens: () => 1 });
+  assert.equal(typeof tokenizer, 'function');
   const provider = createEmbeddingProvider({
     pipelineFactory: async (...args) => {
       factoryCalls.push(args);
-      return async (...inferenceArgs) => {
+      return fakeExtractor(tokenizer, async (...inferenceArgs) => {
         inferenceCalls.push(inferenceArgs);
-        return { tolist: () => [[0.6, 0.8]] };
-      };
+        return { tolist: () => inferenceArgs[0].map(() => [0.6, 0.8]) };
+      });
     },
   });
 
@@ -162,30 +303,66 @@ test('embedding provider is lazy, caches one q8 pipeline, and returns a plain fi
   const first = await provider.embed('first embedding');
   const second = await provider.embed('second embedding');
 
-  assert.deepEqual(first, [0.6, 0.8]);
-  assert.deepEqual(second, [0.6, 0.8]);
+  for (const vector of [first, second]) {
+    assert.ok(Math.abs(vector[0] - 0.6) < 1e-12);
+    assert.ok(Math.abs(vector[1] - 0.8) < 1e-12);
+  }
   assert.equal(Array.isArray(first), true);
   assert.equal(factoryCalls.length, 1);
   assert.deepEqual(factoryCalls[0], ['feature-extraction', MODEL_NAME, { dtype: MODEL_DTYPE, revision: MODEL_REVISION }]);
   assert.deepEqual(inferenceCalls, [
-    ['first embedding', { pooling: 'mean', normalize: true }],
-    ['second embedding', { pooling: 'mean', normalize: true }],
+    [['first embedding'], { pooling: 'mean', normalize: true }],
+    [['second embedding'], { pooling: 'mean', normalize: true }],
   ]);
   assert.equal(provider.status().state, 'ready');
   assert.equal(provider.status().lastError, null);
 });
 
+test('embedding space requires a bounded canonical character identity', async () => {
+  const {
+    EMBEDDING_SPACE,
+    EMBEDDING_SPACE_DIGEST,
+    MAX_CANONICAL_TEXT_CHARS,
+    embeddingSpaceDigest,
+    validateEmbeddingSpace,
+  } = await task3Modules();
+  const missingCanonicalLimit = { ...EMBEDDING_SPACE };
+  delete missingCanonicalLimit.maxCanonicalChars;
+  assert.throws(() => validateEmbeddingSpace(missingCanonicalLimit), /invalid shape/i);
+  assert.throws(() => validateEmbeddingSpace({ ...EMBEDDING_SPACE, unexpected: true }), /invalid shape/i);
+  for (const maxCanonicalChars of [0, MAX_CANONICAL_TEXT_CHARS + 1, 1.5, '12000']) {
+    assert.throws(
+      () => validateEmbeddingSpace({ ...EMBEDDING_SPACE, maxCanonicalChars }),
+      /invalid indexing limits/i,
+    );
+  }
+  assert.notEqual(
+    embeddingSpaceDigest({ ...EMBEDDING_SPACE, maxCanonicalChars: MAX_CANONICAL_TEXT_CHARS - 1 }),
+    EMBEDDING_SPACE_DIGEST,
+  );
+});
+
 test('embedding provider validates bounded text and finite model output without a real import', async () => {
   const { createEmbeddingProvider } = await task3Modules();
+  const maximumText = 'x'.repeat(1_000_514);
+  const boundedProvider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(
+      fakeTokenizer({ contentTokens: () => 1 }),
+      async (batch) => batch.map(() => [1, 0]),
+    ),
+  });
+  assert.deepEqual(await boundedProvider.embed(maximumText), [1, 0]);
+  await assert.rejects(() => boundedProvider.embed(`${maximumText}x`), TypeError);
+
   let factoryCalls = 0;
   const invalidOutput = createEmbeddingProvider({
     pipelineFactory: async () => {
       factoryCalls += 1;
-      return async () => ({ tolist: () => [[1, Number.NaN]] });
+      return fakeExtractor(fakeTokenizer(), async () => ({ tolist: () => [[1, Number.NaN]] }));
     },
   });
 
-  for (const value of ['', '   ', null, 42, {}, 'x'.repeat(12_001)]) {
+  for (const value of ['', '   ', null, 42, {}, `${maximumText}x`]) {
     await assert.rejects(() => invalidOutput.embed(value), TypeError);
   }
   assert.equal(factoryCalls, 0);
@@ -193,6 +370,724 @@ test('embedding provider validates bounded text and finite model output without 
   assert.equal(factoryCalls, 1);
   assert.equal(invalidOutput.status().state, 'degraded');
   assert.match(invalidOutput.status().lastError, /embedding inference failed/i);
+});
+
+test('token-aware embedding preserves exact under-budget source substrings without overlap', async () => {
+  const { MAX_EMBEDDING_SEQUENCE_TOKENS, createEmbeddingProvider } = await task3Modules();
+  const tokenizer = fakeTokenizer();
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch, options) => {
+      batches.push([...batch]);
+      assert.deepEqual(options, { pooling: 'mean', normalize: true });
+      return batch.map(() => [1, 0]);
+    }),
+  });
+  const text = `${'alpha '.repeat(60)}\n${'beta.'.repeat(60)} ${'🙂gamma '.repeat(50)}`;
+
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  const chunks = batches.flat();
+  assert.ok(chunks.length > 1);
+  let offset = 0;
+  for (const chunk of chunks) {
+    assert.equal(chunk, text.slice(offset, offset + chunk.length));
+    assert.ok(tokenizer.encode(chunk, { add_special_tokens: true }).length <= MAX_EMBEDDING_SEQUENCE_TOKENS);
+    offset += chunk.length;
+  }
+  assert.equal(offset, text.length);
+  assert.equal(chunks.join(''), text);
+});
+
+test('canonical dense CJK input repacks the complete source within chunk and batch caps', async () => {
+  const {
+    EMBEDDING_BATCH_SIZE,
+    MAX_CANONICAL_TEXT_CHARS,
+    MAX_EMBEDDING_CHUNKS,
+    MAX_EMBEDDING_SEQUENCE_TOKENS,
+    MAX_INDEXED_TOKENS,
+    createEmbeddingProvider,
+  } = await task3Modules();
+  const tokenizer = fakeTokenizer();
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => [1, 0]);
+    }),
+  });
+  const text = '汉'.repeat(MAX_CANONICAL_TEXT_CHARS);
+
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  const chunks = batches.flat();
+  assert.equal(text.length, 12_000);
+  assert.equal(chunks.reduce((total, chunk) => (
+    total + tokenizer.encode(chunk, { add_special_tokens: false }).length
+  ), 0), MAX_INDEXED_TOKENS);
+  assert.equal(chunks.join(''), text);
+  let sourceOffset = 0;
+  for (const chunk of chunks) {
+    assert.equal(chunk, text.slice(sourceOffset, sourceOffset + chunk.length));
+    sourceOffset += chunk.length;
+  }
+  assert.equal(sourceOffset, text.length);
+  assert.ok(chunks.every((chunk) => (
+    tokenizer.encode(chunk, { add_special_tokens: true }).length <= MAX_EMBEDDING_SEQUENCE_TOKENS
+  )));
+  assert.ok(chunks.length <= MAX_EMBEDDING_CHUNKS);
+  assert.ok(batches.every((batch) => batch.length <= EMBEDDING_BATCH_SIZE));
+});
+
+test('canonical token-expanding Unicode falls back to bounded spanning samples', async () => {
+  const {
+    EMBEDDING_BATCH_SIZE,
+    MAX_CANONICAL_TEXT_CHARS,
+    MAX_EMBEDDING_CHUNKS,
+    MAX_EMBEDDING_SEQUENCE_TOKENS,
+    MAX_INDEXED_TOKENS,
+    createEmbeddingProvider,
+  } = await task3Modules();
+  const tokenizer = fakeTokenizer({ contentTokens: (value) => Array.from(value).length * 3 });
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => [1, 0]);
+    }),
+  });
+  const text = Array.from(
+    { length: MAX_CANONICAL_TEXT_CHARS / 2 },
+    (_, index) => String.fromCodePoint(0x10000 + index),
+  ).join('');
+
+  assert.equal(text.length, MAX_CANONICAL_TEXT_CHARS);
+  assert.equal(tokenizer.encode(text, { add_special_tokens: false }).length, 18_000);
+  const setupTokenizerCalls = tokenizer.calls.length;
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  const chunks = batches.flat();
+  assert.ok(
+    tokenizer.calls.slice(setupTokenizerCalls).some((call) => call.text === text),
+    'canonical text may be fully measured before fallback',
+  );
+  assert.ok(chunks.length >= 3 && chunks.length <= MAX_EMBEDDING_CHUNKS);
+  assert.ok(batches.every((batch) => batch.length <= EMBEDDING_BATCH_SIZE));
+  assert.ok(chunks.every((chunk) => (
+    chunk.length > 0
+      && tokenizer.encode(chunk, { add_special_tokens: true }).length <= MAX_EMBEDDING_SEQUENCE_TOKENS
+  )));
+  assert.ok(chunks.reduce((total, chunk) => (
+    total + tokenizer.encode(chunk, { add_special_tokens: false }).length
+  ), 0) <= MAX_INDEXED_TOKENS);
+  assert.notEqual(chunks.join(''), text, 'over-budget canonical text must be sampled rather than fully indexed');
+
+  let sourceOffset = 0;
+  const spans = chunks.map((chunk) => {
+    const start = text.indexOf(chunk, sourceOffset);
+    assert.ok(start >= sourceOffset, 'samples must be source-ordered and non-overlapping');
+    const end = start + chunk.length;
+    sourceOffset = end;
+    return { start, end };
+  });
+  assert.equal(spans[0].start, 0, 'samples must preserve the source prefix');
+  assert.ok(spans.some(({ start, end }) => start <= text.length / 2 && text.length / 2 < end), 'samples must preserve the source midpoint');
+  assert.equal(spans.at(-1).end, text.length, 'samples must preserve the source suffix');
+});
+
+test('canonical non-monotonic WordPiece text keeps a feasible full-source partition', async () => {
+  const {
+    EMBEDDING_BATCH_SIZE,
+    MAX_CANONICAL_TEXT_CHARS,
+    MAX_EMBEDDING_CHUNKS,
+    MAX_EMBEDDING_SEQUENCE_TOKENS,
+    MAX_INDEXED_TOKENS,
+    createEmbeddingProvider,
+  } = await task3Modules();
+  const tokenizer = fakeTokenizer({ contentTokens: hangulWordPieceContentTokens });
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => [1, 0]);
+    }),
+  });
+  const segment = `${'각 '.repeat(70)}${'q'.repeat(101)} `;
+  const text = segment.repeat(49);
+
+  assert.equal(text.length, 11_858);
+  assert.ok(text.length <= MAX_CANONICAL_TEXT_CHARS);
+  assert.equal(tokenizer.encode(text, { add_special_tokens: false }).length, 10_339);
+  const setupTokenizerCalls = tokenizer.calls.length;
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  const providerTokenizerCalls = tokenizer.calls.length - setupTokenizerCalls;
+  const chunks = batches.flat();
+  assert.ok(chunks.length >= 1 && chunks.length <= MAX_EMBEDDING_CHUNKS);
+  assert.ok(batches.every((batch) => batch.length <= EMBEDDING_BATCH_SIZE));
+  assert.ok(chunks.every((chunk) => (
+    chunk.length > 0
+      && tokenizer.encode(chunk, { add_special_tokens: true }).length <= MAX_EMBEDDING_SEQUENCE_TOKENS
+  )));
+  assert.ok(chunks.reduce((total, chunk) => (
+    total + tokenizer.encode(chunk, { add_special_tokens: false }).length
+  ), 0) <= MAX_INDEXED_TOKENS);
+  assert.equal(chunks.join(''), text, 'feasible canonical text must remain complete and contiguous');
+  assert.ok(providerTokenizerCalls <= 1000, `expected bounded tokenizer work, received ${providerTokenizerCalls} calls`);
+});
+
+test('canonical BERT punctuation boundaries recover a feasible full-source partition', async () => {
+  const {
+    EMBEDDING_BATCH_SIZE,
+    MAX_CANONICAL_TEXT_CHARS,
+    MAX_EMBEDDING_CHUNKS,
+    MAX_EMBEDDING_SEQUENCE_TOKENS,
+    MAX_INDEXED_TOKENS,
+    createEmbeddingProvider,
+  } = await task3Modules();
+  const tokenizer = fakeTokenizer({ contentTokens: bertWordPieceContentTokens });
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => [1, 0]);
+    }),
+  });
+  const text = `${'q'.repeat(101)},${'각'.repeat(98)},`.repeat(40);
+
+  assert.equal(text.length, 8_040);
+  assert.ok(text.length <= MAX_CANONICAL_TEXT_CHARS);
+  assert.equal(tokenizer.encode('각', { add_special_tokens: false }).length, 3);
+  assert.equal(tokenizer.encode('q'.repeat(101), { add_special_tokens: false }).length, 1);
+  assert.equal(tokenizer.encode('a。각', { add_special_tokens: false }).length, 5);
+  assert.equal(tokenizer.encode(text, { add_special_tokens: false }).length, 11_880);
+  const setupTokenizerCalls = tokenizer.calls.length;
+
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  const providerTokenizerCalls = tokenizer.calls.length - setupTokenizerCalls;
+  const chunks = batches.flat();
+  assert.ok(chunks.length >= 1 && chunks.length <= MAX_EMBEDDING_CHUNKS);
+  assert.ok(batches.every((batch) => batch.length <= EMBEDDING_BATCH_SIZE));
+  assert.equal(chunks.join(''), text, 'feasible punctuation-delimited source must remain complete and contiguous');
+  assert.ok(chunks.every((chunk) => (
+    chunk.length > 0
+      && tokenizer.encode(chunk, { add_special_tokens: true }).length <= MAX_EMBEDDING_SEQUENCE_TOKENS
+  )));
+  assert.ok(chunks.reduce((total, chunk) => (
+    total + tokenizer.encode(chunk, { add_special_tokens: false }).length
+  ), 0) <= MAX_INDEXED_TOKENS);
+  assert.ok(providerTokenizerCalls <= 1200, `expected bounded tokenizer work, received ${providerTokenizerCalls} calls`);
+});
+
+test('canonical BERT ASCII symbol boundaries recover a feasible full-source partition', async () => {
+  const {
+    EMBEDDING_BATCH_SIZE,
+    MAX_CANONICAL_TEXT_CHARS,
+    MAX_EMBEDDING_CHUNKS,
+    MAX_EMBEDDING_SEQUENCE_TOKENS,
+    MAX_INDEXED_TOKENS,
+    createEmbeddingProvider,
+  } = await task3Modules();
+  const tokenizer = fakeTokenizer({ contentTokens: bertWordPieceContentTokens });
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => [1, 0]);
+    }),
+  });
+  const text = `${'q'.repeat(101)}+${'각'.repeat(98)}+`.repeat(40);
+
+  assert.equal(text.length, 8_040);
+  assert.ok(text.length <= MAX_CANONICAL_TEXT_CHARS);
+  assert.equal(tokenizer.encode('a+각', { add_special_tokens: false }).length, 5);
+  assert.equal(tokenizer.encode(text, { add_special_tokens: false }).length, 11_880);
+  const setupTokenizerCalls = tokenizer.calls.length;
+
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  const providerTokenizerCalls = tokenizer.calls.length - setupTokenizerCalls;
+  const chunks = batches.flat();
+  assert.ok(chunks.length >= 1 && chunks.length <= MAX_EMBEDDING_CHUNKS);
+  assert.ok(batches.every((batch) => batch.length <= EMBEDDING_BATCH_SIZE));
+  assert.equal(chunks.join(''), text, 'feasible BERT-symbol-delimited source must remain complete and contiguous');
+  assert.ok(chunks.every((chunk) => (
+    chunk.length > 0
+      && tokenizer.encode(chunk, { add_special_tokens: true }).length <= MAX_EMBEDDING_SEQUENCE_TOKENS
+  )));
+  const indexedTokens = chunks.reduce((total, chunk) => (
+    total + tokenizer.encode(chunk, { add_special_tokens: false }).length
+  ), 0);
+  assert.equal(indexedTokens, 11_880);
+  assert.ok(indexedTokens <= MAX_INDEXED_TOKENS);
+  assert.ok(providerTokenizerCalls <= 1200, `expected bounded tokenizer work, received ${providerTokenizerCalls} calls`);
+});
+
+test('canonical character boundary completely embeds non-additive WordPiece text', async () => {
+  const { MAX_CANONICAL_TEXT_CHARS, createEmbeddingProvider } = await task3Modules();
+  const tokenizer = fakeTokenizer({ contentTokens: wordPieceContentTokens });
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => [1, 0]);
+    }),
+  });
+  const text = `${'q'.repeat(11_000)}${'é'.repeat(1_000)}`;
+
+  assert.equal(text.length, 12_000);
+  assert.equal(tokenizer.encode('q'.repeat(101), { add_special_tokens: false }).length, 1);
+  assert.equal(tokenizer.encode('q'.repeat(100), { add_special_tokens: false }).length, 100);
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  assert.equal(MAX_CANONICAL_TEXT_CHARS, text.length);
+  assert.deepEqual(batches.flat(), [text]);
+});
+
+test('oversized character boundary sparsely embeds WordPiece text without a full encode', async () => {
+  const {
+    MAX_CANONICAL_TEXT_CHARS,
+    MAX_EMBEDDING_CHUNKS,
+    MAX_EMBEDDING_SEQUENCE_TOKENS,
+    MAX_INDEXED_TOKENS,
+    createEmbeddingProvider,
+  } = await task3Modules();
+  const text = `${'q'.repeat(11_000)}${' '.repeat(1_001)}`;
+  const tokenizer = fakeTokenizer({ contentTokens: wordPieceContentTokens });
+  const encode = tokenizer.encode;
+  let fullInputCalls = 0;
+  let maxCharacters = 0;
+  tokenizer.encode = (value, options) => {
+    maxCharacters = Math.max(maxCharacters, value.length);
+    if (value === text) {
+      fullInputCalls += 1;
+      throw new Error('WordPiece tokenizer received the complete oversized input');
+    }
+    return encode(value, options);
+  };
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => [1, 0]);
+    }),
+  });
+
+  assert.equal(text.length, MAX_CANONICAL_TEXT_CHARS + 1);
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  const chunks = batches.flat();
+  assert.equal(fullInputCalls, 0);
+  assert.ok(maxCharacters < text.length);
+  assert.ok(chunks.length <= MAX_EMBEDDING_CHUNKS);
+  assert.ok(chunks.every((chunk) => tokenizer.encode(chunk, { add_special_tokens: true }).length <= MAX_EMBEDDING_SEQUENCE_TOKENS));
+  assert.ok(chunks.reduce((total, chunk) => (
+    total + tokenizer.encode(chunk, { add_special_tokens: false }).length
+  ), 0) <= MAX_INDEXED_TOKENS);
+  assert.ok(text.startsWith(chunks[0]));
+  assert.ok(text.endsWith(chunks.at(-1)));
+  let sourceOffset = 0;
+  for (const chunk of chunks) {
+    const offset = text.indexOf(chunk, sourceOffset);
+    assert.ok(offset >= sourceOffset);
+    sourceOffset = offset + chunk.length;
+  }
+});
+
+test('sparse whitespace legacy input keeps separate bounded edge windows', async () => {
+  await sparseWhitespaceLegacyProbe(`x${' '.repeat(12_000)}`);
+});
+
+test('sparse near-maximum non-token-dense legacy input keeps bounded edge windows', async () => {
+  const length = 1_000_514;
+  const midpoint = Math.floor(length / 2);
+  const text = `x${' '.repeat(midpoint - 1)}M${' '.repeat(length - midpoint - 1)}`;
+  await sparseWhitespaceLegacyProbe(text, midpoint);
+});
+
+test('token-aware embedding samples first, middle, and last spans within token and batch caps', async () => {
+  const {
+    EMBEDDING_BATCH_SIZE,
+    MAX_EMBEDDING_CHUNKS,
+    MAX_EMBEDDING_SEQUENCE_TOKENS,
+    MAX_INDEXED_TOKENS,
+    createEmbeddingProvider,
+  } = await task3Modules();
+  const tokenizer = fakeTokenizer();
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return {
+        data: new Float32Array(batch.flatMap(() => [1, 0])),
+        dims: [batch.length, 2],
+      };
+    }),
+  });
+  const text = Array.from({ length: 80 }, (_, index) => (
+    `SECTION-${String(index).padStart(3, '0')}|${String.fromCharCode(65 + index % 26).repeat(230)}\n`
+  )).join('');
+
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  const chunks = batches.flat();
+  assert.ok(chunks.length > 2);
+  assert.ok(chunks.length <= MAX_EMBEDDING_CHUNKS);
+  assert.ok(batches.every((batch) => batch.length <= EMBEDDING_BATCH_SIZE));
+  assert.ok(chunks.every((chunk) => tokenizer.encode(chunk, { add_special_tokens: true }).length <= MAX_EMBEDDING_SEQUENCE_TOKENS));
+  assert.ok(chunks.reduce((total, chunk) => total + tokenizer.encode(chunk, { add_special_tokens: false }).length, 0) <= MAX_INDEXED_TOKENS);
+  assert.ok(text.startsWith(chunks[0]));
+  assert.ok(text.endsWith(chunks.at(-1)));
+
+  let sourceOffset = 0;
+  const offsets = chunks.map((chunk) => {
+    const offset = text.indexOf(chunk, sourceOffset);
+    assert.ok(offset >= sourceOffset);
+    sourceOffset = offset + chunk.length;
+    return offset;
+  });
+  assert.ok(offsets.some((offset) => offset >= text.length * 0.4 && offset <= text.length * 0.6));
+});
+
+test('over-budget dense embedding bounds tokenizer work before materializing all chunks', async () => {
+  const {
+    MAX_EMBEDDING_CHUNKS,
+    MAX_EMBEDDING_SEQUENCE_TOKENS,
+    MAX_INDEXED_TOKENS,
+    createEmbeddingProvider,
+  } = await task3Modules();
+  const { metrics, tokenizer } = measuredDenseTokenizer();
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => [1, 0]);
+    }),
+  });
+  const text = `A${'x'.repeat(1_000_512)}Z`;
+
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  const chunks = batches.flat();
+  assert.ok(
+    metrics.calls < 1000 && metrics.characters < text.length * 6,
+    `expected bounded tokenizer work, received ${metrics.calls} calls and ${metrics.characters} characters`,
+  );
+  assert.ok(chunks.length <= MAX_EMBEDDING_CHUNKS);
+  assert.ok(chunks.every((chunk) => chunk.length + 2 <= MAX_EMBEDDING_SEQUENCE_TOKENS));
+  assert.ok(chunks.reduce((total, chunk) => total + chunk.length, 0) <= MAX_INDEXED_TOKENS);
+  assert.ok(chunks[0].startsWith('A'));
+  assert.ok(chunks.at(-1).endsWith('Z'));
+  let sourceOffset = 0;
+  for (const chunk of chunks) {
+    const offset = text.indexOf(chunk, sourceOffset);
+    assert.ok(offset >= sourceOffset);
+    sourceOffset = offset + chunk.length;
+  }
+});
+
+test('oversized sparse sampling never encodes the full maximum-size dense input', async () => {
+  const { createEmbeddingProvider } = await task3Modules();
+  const text = `A${'x'.repeat(1_000_512)}Z`;
+  const { metrics, tokenizer } = measuredDenseTokenizer({ rejectText: text });
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => [1, 0]);
+    }),
+  });
+
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  assert.ok(metrics.maxCharacters < 10_000);
+  assert.ok(metrics.calls < 1000);
+  assert.ok(text.startsWith(batches.flat()[0]));
+  assert.ok(text.endsWith(batches.flat().at(-1)));
+});
+
+test('over-budget sampling greedily expands underfilled heading and tail spans', async () => {
+  const {
+    MAX_EMBEDDING_CHUNKS,
+    MAX_EMBEDDING_SEQUENCE_TOKENS,
+    MAX_INDEXED_TOKENS,
+    createEmbeddingProvider,
+  } = await task3Modules();
+  const tokenizer = fakeTokenizer();
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => [1, 0]);
+    }),
+  });
+  const text = `HEAD🙂\n${'x'.repeat(13_000)}\nTAIL🙂`;
+
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  const chunks = batches.flat();
+  const contentTokenCapacity = MAX_EMBEDDING_SEQUENCE_TOKENS - 2;
+  const contentTokenCounts = chunks.map((chunk) => tokenizer.encode(chunk, { add_special_tokens: false }).length);
+  assert.equal(contentTokenCounts[0], contentTokenCapacity);
+  assert.ok(
+    contentTokenCounts.slice(1, -1).every((count) => count === contentTokenCapacity),
+    `expected full middle spans, received ${contentTokenCounts.join(', ')}`,
+  );
+  assert.equal(contentTokenCounts.at(-1), contentTokenCapacity);
+  assert.ok(chunks.length <= MAX_EMBEDDING_CHUNKS);
+  assert.ok(chunks.reduce((total, chunk) => total + tokenizer.encode(chunk, { add_special_tokens: false }).length, 0) <= MAX_INDEXED_TOKENS);
+  let sourceOffset = 0;
+  const offsets = chunks.map((chunk) => {
+    const offset = text.indexOf(chunk, sourceOffset);
+    assert.ok(offset >= sourceOffset);
+    assert.equal(chunk, text.slice(offset, offset + chunk.length));
+    const first = chunk.charCodeAt(0);
+    const last = chunk.charCodeAt(chunk.length - 1);
+    assert.ok(!(first >= 0xdc00 && first <= 0xdfff));
+    assert.ok(!(last >= 0xd800 && last <= 0xdbff));
+    sourceOffset = offset + chunk.length;
+    return offset;
+  });
+  assert.equal(offsets[0], 0);
+  assert.equal(offsets.at(-1) + chunks.at(-1).length, text.length);
+  assert.ok(chunks.every((chunk) => tokenizer.encode(chunk, { add_special_tokens: true }).length <= MAX_EMBEDDING_SEQUENCE_TOKENS));
+});
+
+test('over-budget zoned trim refits a non-monotonic WordPiece span', async () => {
+  const {
+    MAX_EMBEDDING_CHUNKS,
+    MAX_EMBEDDING_SEQUENCE_TOKENS,
+    MAX_INDEXED_TOKENS,
+    createEmbeddingProvider,
+  } = await task3Modules();
+  const contentTokens = (value) => (value.match(/\S+/gu) ?? []).reduce((total, word) => (
+    total + (/^q+$/u.test(word) && word.length > 100 ? 1 : Array.from(word).length)
+  ), 0);
+  const tokenizer = fakeTokenizer({ contentTokens });
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => [1, 0]);
+    }),
+  });
+  const text = `${'abc '.repeat(3073)}${'q'.repeat(101)} ${'xyz '.repeat(931)}`;
+
+  assert.equal(tokenizer.encode('q'.repeat(101), { add_special_tokens: false }).length, 1);
+  assert.equal(tokenizer.encode('q'.repeat(100), { add_special_tokens: false }).length, 100);
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  assert.ok(tokenizer.calls.some((call) => (
+    call.addSpecialTokens
+      && call.text.match(/q+/u)?.[0].length === 100
+      && contentTokens(call.text) + 2 > MAX_EMBEDDING_SEQUENCE_TOKENS
+  )));
+  const chunks = batches.flat();
+  assert.ok(chunks.length <= MAX_EMBEDDING_CHUNKS);
+  assert.ok(chunks.every((chunk) => tokenizer.encode(chunk, { add_special_tokens: true }).length <= MAX_EMBEDDING_SEQUENCE_TOKENS));
+  assert.ok(chunks.reduce((total, chunk) => (
+    total + tokenizer.encode(chunk, { add_special_tokens: false }).length
+  ), 0) <= MAX_INDEXED_TOKENS);
+  assert.ok(text.startsWith(chunks[0]));
+  assert.ok(text.endsWith(chunks.at(-1)));
+  let sourceOffset = 0;
+  for (const chunk of chunks) {
+    const offset = text.indexOf(chunk, sourceOffset);
+    assert.ok(offset >= sourceOffset);
+    sourceOffset = offset + chunk.length;
+  }
+});
+
+test('oversized sparse sampling avoids full input and respects candidate token capacity', async () => {
+  const { MAX_INDEXED_TOKENS, createEmbeddingProvider } = await task3Modules();
+  const tokenizer = fakeTokenizer();
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => [1, 0]);
+    }),
+  });
+  const text = Array.from({ length: 60 }, (_, index) => (
+    `CHUNK-${String(index).padStart(3, '0')}|${'x'.repeat(243)}\n`
+  )).join('');
+
+  assert.ok(48 * 254 > MAX_INDEXED_TOKENS);
+  assert.deepEqual(await provider.embed(text), [1, 0]);
+  const fullContentCounts = tokenizer.calls.filter((call) => call.text === text && call.addSpecialTokens === false).length;
+  const chunks = batches.flat();
+  assert.equal(fullContentCounts, 0);
+  assert.ok(chunks.length <= Math.floor(MAX_INDEXED_TOKENS / 254));
+  assert.ok(chunks.reduce((total, chunk) => total + Array.from(chunk).length, 0) <= MAX_INDEXED_TOKENS);
+  assert.ok(text.startsWith(chunks[0]));
+  assert.ok(text.endsWith(chunks.at(-1)));
+  let sourceOffset = 0;
+  const offsets = chunks.map((chunk) => {
+    const offset = text.indexOf(chunk, sourceOffset);
+    assert.ok(offset >= sourceOffset);
+    sourceOffset = offset + chunk.length;
+    return offset;
+  });
+  assert.ok(offsets.some((offset) => offset >= text.length * 0.4 && offset <= text.length * 0.6));
+});
+
+test('over-budget embedding aggregates distinct vectors in source order across batches', async () => {
+  const { EMBEDDING_BATCH_SIZE, createEmbeddingProvider } = await task3Modules();
+  const { tokenizer } = measuredDenseTokenizer({ maxCalls: 600 });
+  const text = `A${'x'.repeat(99_998)}Z`;
+  const batches = [];
+  let outputIndex = 0;
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => {
+        outputIndex += 1;
+        return [outputIndex, 1];
+      });
+    }),
+  });
+
+  const vector = await provider.embed(text);
+  const chunks = batches.flat();
+  assert.ok(chunks.length > EMBEDDING_BATCH_SIZE);
+  assert.equal(outputIndex, chunks.length);
+  assert.ok(batches.length > 1);
+  assert.ok(batches.slice(0, -1).every((batch) => batch.length === EMBEDDING_BATCH_SIZE));
+  assert.ok(batches.at(-1).length >= 1 && batches.at(-1).length <= EMBEDDING_BATCH_SIZE);
+  assert.ok(text.startsWith(chunks[0]));
+  assert.ok(text.endsWith(chunks.at(-1)));
+  let sourceOffset = 0;
+  for (const chunk of chunks) {
+    const offset = text.indexOf(chunk, sourceOffset);
+    assert.ok(offset >= sourceOffset);
+    sourceOffset = offset + chunk.length;
+  }
+  const mean = [(chunks.length + 1) / 2, 1];
+  const norm = Math.hypot(...mean);
+  assert.ok(Math.abs(vector[0] - mean[0] / norm) < 1e-12);
+  assert.ok(Math.abs(vector[1] - mean[1] / norm) < 1e-12);
+});
+
+test('long query-like text aggregates equal chunk vectors and applies final L2 normalization', async () => {
+  const { createEmbeddingProvider } = await task3Modules();
+  const tokenizer = fakeTokenizer();
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+      batches.push([...batch]);
+      return batch.map((_, index) => index % 2 === 0 ? [1, 0] : [0, 1]);
+    }),
+  });
+
+  const vector = await provider.embed(`Explain ${'q'.repeat(392)}`);
+  assert.equal(batches.flat().length, 2);
+  assert.ok(Math.abs(vector[0] - Math.SQRT1_2) < 1e-12);
+  assert.ok(Math.abs(vector[1] - Math.SQRT1_2) < 1e-12);
+});
+
+test('embedding provider scale-normalizes one huge finite vector without overflow', async () => {
+  const { createEmbeddingProvider } = await task3Modules();
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(fakeTokenizer(), async (batch) => (
+      batch.map(() => [Number.MAX_VALUE, Number.MAX_VALUE])
+    )),
+  });
+
+  const vector = await provider.embed('one huge vector');
+  assert.ok(vector.every(Number.isFinite));
+  assert.ok(Math.abs(Math.hypot(...vector) - 1) < 1e-12);
+  assert.ok(Math.abs(vector[0] - Math.SQRT1_2) < 1e-12);
+  assert.ok(Math.abs(vector[1] - Math.SQRT1_2) < 1e-12);
+  assert.equal(provider.status().state, 'ready');
+});
+
+test('embedding provider rejects a non-finite final aggregate as a safe inference failure', async () => {
+  const { createEmbeddingProvider } = await task3Modules();
+  const batches = [];
+  const provider = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(fakeTokenizer(), async (batch) => {
+      batches.push([...batch]);
+      return batch.map(() => [Number.MAX_VALUE, Number.MAX_VALUE]);
+    }),
+  });
+  const text = `${'a'.repeat(200)}\n${'b'.repeat(200)}\n${'c'.repeat(200)}`;
+
+  await assert.rejects(() => provider.embed(text), { code: 'EMBEDDING_INFERENCE_FAILED' });
+  assert.equal(batches.flat().length, 3);
+  assert.equal(provider.status().state, 'degraded');
+  assert.equal(provider.status().errorCode, 'EMBEDDING_INFERENCE_FAILED');
+  assert.doesNotMatch(JSON.stringify(provider.status()), /MAX_VALUE|Infinity|NaN/i);
+});
+
+test('token-aware splitting terminates for CJK, emoji, whitespace, code, and giant no-space text', { timeout: 10_000 }, async () => {
+  const { MAX_EMBEDDING_SEQUENCE_TOKENS, createEmbeddingProvider } = await task3Modules();
+  const cases = [
+    '汉字'.repeat(300),
+    '🙂'.repeat(300),
+    `head${' '.repeat(700)}tail`,
+    'function example() { return 1; }\n'.repeat(30),
+    'z'.repeat(20_000),
+  ];
+
+  for (const text of cases) {
+    const tokenizer = fakeTokenizer();
+    const batches = [];
+    const provider = createEmbeddingProvider({
+      pipelineFactory: async () => fakeExtractor(tokenizer, async (batch) => {
+        batches.push([...batch]);
+        return batch.map(() => [1, 0]);
+      }),
+    });
+    assert.deepEqual(await provider.embed(text), [1, 0]);
+    const chunks = batches.flat();
+    assert.ok(chunks.length > 0);
+    assert.ok(chunks.every((chunk) => tokenizer.encode(chunk, { add_special_tokens: true }).length <= MAX_EMBEDDING_SEQUENCE_TOKENS));
+    assert.ok(chunks.every((chunk) => {
+      const first = chunk.charCodeAt(0);
+      const last = chunk.charCodeAt(chunk.length - 1);
+      return !(first >= 0xdc00 && first <= 0xdfff) && !(last >= 0xd800 && last <= 0xdbff);
+    }));
+    assert.ok(text.startsWith(chunks[0]));
+    assert.ok(text.endsWith(chunks.at(-1)));
+    if (Array.from(text).length <= 12_000) assert.equal(chunks.join(''), text);
+  }
+});
+
+test('malformed batched output and tokenizer failures are safe inference failures', async () => {
+  const { createEmbeddingProvider } = await task3Modules();
+  const malformed = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor(fakeTokenizer(), async () => ({
+      data: new Float32Array([1, 0]),
+      dims: [2, 1],
+    })),
+  });
+  await assert.rejects(() => malformed.embed('one input'), { code: 'EMBEDDING_INFERENCE_FAILED' });
+  assert.equal(malformed.status().state, 'degraded');
+
+  let tokenizerCalls = 0;
+  const tokenizerFailure = createEmbeddingProvider({
+    pipelineFactory: async () => fakeExtractor({
+      encode() {
+        tokenizerCalls += 1;
+        throw new Error('C:\\private\\tokenizer failure');
+      },
+    }, async () => assert.fail('inference must not run')),
+  });
+  await assert.rejects(() => tokenizerFailure.embed('tokenize me'), { code: 'EMBEDDING_INFERENCE_FAILED' });
+  assert.equal(tokenizerCalls, 1, 'unrelated tokenizer errors must not retry through sparse sampling');
+  assert.equal(tokenizerFailure.status().errorCode, 'EMBEDDING_INFERENCE_FAILED');
+  assert.doesNotMatch(JSON.stringify(tokenizerFailure.status()), /private|tokenizer failure/i);
+});
+
+test('missing public tokenizer is an initialization failure with normal cooldown semantics', async () => {
+  const { createEmbeddingProvider } = await task3Modules();
+  let now = 0;
+  let calls = 0;
+  const provider = createEmbeddingProvider({
+    now: () => now,
+    pipelineFactory: async () => {
+      calls += 1;
+      return async () => [[1, 0]];
+    },
+  });
+
+  await assert.rejects(() => provider.embed('query'), { code: 'EMBEDDING_INITIALIZATION_FAILED' });
+  assert.equal(calls, 1);
+  assert.equal(provider.status().nextRetryAt, 30_000);
+  await assert.rejects(() => provider.embed('query'), { code: 'EMBEDDING_INITIALIZATION_FAILED' });
+  assert.equal(calls, 1);
+  now = 30_000;
+  await assert.rejects(() => provider.embed('query'), { code: 'EMBEDDING_INITIALIZATION_FAILED' });
+  assert.equal(calls, 2);
+  assert.doesNotMatch(JSON.stringify(provider.status()), /tokenizer|private/i);
 });
 
 test('initialization retry is query-driven, single-flight, cooled down and capped at three attempts', async () => {
@@ -230,7 +1125,7 @@ test('provider recovers after cooldown and reuses the successful extractor', asy
   let calls = 0;
   const provider = createEmbeddingProvider({ now: () => now, pipelineFactory: async () => {
     if (++calls === 1) throw new Error('offline');
-    return async () => [[1, 0]];
+    return fakeExtractor(fakeTokenizer(), async (batch) => batch.map(() => [1, 0]));
   } });
   await assert.rejects(provider.embed('query'));
   now = 30_000;
@@ -637,7 +1532,7 @@ test('lexical fallback shares a 2 MiB aggregate journal-byte budget across scope
   assert.ok(result.candidates.bytes <= JOURNAL_SEARCH_MAX_BYTES);
 });
 
-test('sidecar cache is reused and revision, digest, or dimension mismatch rebuilds it', async (t) => {
+test('sidecar cache reuse embeds each query and lazily migrates stale space, digest, and dimensions', async (t) => {
   const {
     JOURNAL_EMBEDDING_SCHEMA_VERSION,
     createJournalSearch,
@@ -648,6 +1543,7 @@ test('sidecar cache is reused and revision, digest, or dimension mismatch rebuil
   const store = createJournalStore({ worktree, globalDirectory });
   const entry = journalEntry({ title: 'Digest-bound cache', body: 'Stable indexed content.' });
   await store.write('project', entry);
+  const sidecarPath = join(worktree, '.opencode-loop', 'journal', 'index', `${entry.id}.json`);
   const provider = deterministicProvider(new Map([
     ['cache-query', [1, 0]],
     [indexedText(entry), [0.8, 0.6]],
@@ -664,23 +1560,60 @@ test('sidecar cache is reused and revision, digest, or dimension mismatch rebuil
   assert.match(initial.digest, /^[a-f0-9]{64}$/);
   assert.equal(initial.dimensions, 2);
   assert.deepEqual(initial.vector, [0.8, 0.6]);
+  assert.equal(provider.calls.filter((text) => text === 'cache-query').length, 1);
   assert.equal(provider.calls.filter((text) => text === indexedText(entry)).length, 1);
 
   await search.search({ query: 'cache-query', scope: 'project' });
+  assert.equal(provider.calls.filter((text) => text === 'cache-query').length, 2, 'every search must embed its query once');
   assert.equal(provider.calls.filter((text) => text === indexedText(entry)).length, 1, 'matching sidecar must be reused');
 
-  const staleRevisionSpace = { ...initial.space, revision: 'test-stale-revision' };
-  await store.writeEmbedding('project', entry.id, {
+  const characterSpace = {
+    aggregate: 'mean-l2-normalize',
+    aggregateVersion: 1,
+    chunkStrategy: 'evenly-spaced-windows',
+    chunkVersion: 1,
+    dtype: 'q8',
+    maxChunkChars: 3000,
+    maxChunks: 4,
+    maxIndexedChars: 12_000,
+    model: provider.model,
+    normalize: true,
+    pooling: 'mean',
+    revision: 'test-revision-1',
+  };
+  const staleSidecar = JSON.stringify({
     ...initial,
-    space: staleRevisionSpace,
-    spaceDigest: embeddingSpaceDigest(staleRevisionSpace),
+    space: characterSpace,
+    spaceDigest: sha256(JSON.stringify(characterSpace)),
+    vector: [0, 1],
   });
-  await search.search({ query: 'cache-query', scope: 'project' });
-  assert.equal(provider.calls.filter((text) => text === indexedText(entry)).length, 2, 'revision mismatch must rebuild');
+  await writeFile(sidecarPath, staleSidecar, { mode: 0o600 });
+  assert.equal(await store.readEmbedding('project', entry.id), null, 'old character-space sidecar must not be reusable');
 
-  const current = await store.readEmbedding('project', entry.id);
+  const metadataResult = await search.search({ scope: 'project' });
+  assert.equal(metadataResult.mode, 'metadata');
+  assert.equal(await readFile(sidecarPath, 'utf8'), staleSidecar, 'metadata-only search must not migrate sidecars');
+  const disabledResult = await createJournalSearch({ store, embeddingProvider: provider, semanticSearch: false }).search({
+    query: 'cache-query',
+    scope: 'project',
+  });
+  assert.equal(disabledResult.mode, 'text-fallback');
+  assert.equal(await readFile(sidecarPath, 'utf8'), staleSidecar, 'disabled semantic search must not migrate sidecars');
+  assert.equal(provider.calls.filter((text) => text === 'cache-query').length, 2);
+  assert.equal(provider.calls.filter((text) => text === indexedText(entry)).length, 1);
+
+  await search.search({ query: 'cache-query', scope: 'project' });
+  assert.equal(provider.calls.filter((text) => text === 'cache-query').length, 3);
+  assert.equal(provider.calls.filter((text) => text === indexedText(entry)).length, 2, 'old character-space sidecar must rebuild lazily');
+  const migrated = await store.readEmbedding('project', entry.id);
+  assert.deepEqual(migrated, initial);
+  assert.deepEqual(migrated.space, provider.embeddingSpace);
+  assert.equal(migrated.spaceDigest, embeddingSpaceDigest(provider.embeddingSpace));
+
+  const current = migrated;
   await store.writeEmbedding('project', entry.id, { ...current, digest: '0'.repeat(64) });
   await search.search({ query: 'cache-query', scope: 'project' });
+  assert.equal(provider.calls.filter((text) => text === 'cache-query').length, 4);
   assert.equal(provider.calls.filter((text) => text === indexedText(entry)).length, 3, 'digest mismatch must rebuild');
 
   await store.writeEmbedding('project', entry.id, {
@@ -689,17 +1622,13 @@ test('sidecar cache is reused and revision, digest, or dimension mismatch rebuil
     vector: [0.8, 0.6, 0],
   });
   await search.search({ query: 'cache-query', scope: 'project' });
+  assert.equal(provider.calls.filter((text) => text === 'cache-query').length, 5);
   assert.equal(provider.calls.filter((text) => text === indexedText(entry)).length, 4, 'dimension mismatch must rebuild');
   assert.deepEqual(await store.readEmbedding('project', entry.id), initial);
 });
 
-test('long entries embed bounded spanning chunks and later sections contribute to ranking', async (t) => {
-  const {
-    MAX_EMBEDDING_CHUNKS,
-    MAX_INDEXED_CHARS,
-    createJournalSearch,
-    createJournalStore,
-  } = await task3Modules();
+test('search embeds each trimmed query and complete candidate entry exactly once', async (t) => {
+  const { createJournalSearch, createJournalStore } = await task3Modules();
   const { worktree, globalDirectory } = await roots(t);
   const store = createJournalStore({ worktree, globalDirectory });
   const longEntry = journalEntry({
@@ -718,27 +1647,27 @@ test('long entries embed bounded spanning chunks and later sections contribute t
     createdAt: '2026-09-10T09:00:00.000Z',
   });
   await writeEntries(store, [longEntry, comparison]);
+  const query = 'conceptual request';
   const provider = deterministicProvider((text) => {
-    if (text === 'conceptual request' || text.includes('LATE_SECTION_SIGNAL')) return [1, 0];
+    if (text === query || text === indexedText(longEntry)) return [1, 0];
     return [0, 1];
   });
 
   const result = await createJournalSearch({ store, embeddingProvider: provider }).search({
-    query: 'conceptual request',
+    query: `  ${query}  `,
     scope: 'project',
   });
 
-  const longChunks = provider.calls.filter((text) => text.length === 3000);
-  assert.equal(MAX_INDEXED_CHARS, 12_000);
-  assert.equal(MAX_EMBEDDING_CHUNKS, 4);
-  assert.equal(longChunks.length, MAX_EMBEDDING_CHUNKS);
-  assert.equal(longChunks.reduce((total, chunk) => total + chunk.length, 0), MAX_INDEXED_CHARS);
-  assert.ok(longChunks[0].includes(longEntry.title));
-  assert.ok(longChunks.at(-1).includes('LATE_SECTION_SIGNAL'));
+  assert.equal(provider.calls.filter((text) => text === query).length, 1);
+  assert.equal(provider.calls.filter((text) => text === indexedText(longEntry)).length, 1);
+  assert.equal(provider.calls.filter((text) => text === indexedText(comparison)).length, 1);
+  assert.equal(provider.calls.length, 3, 'provider must receive one query and one call per cache-miss entry');
+  assert.ok(provider.calls.every((text) => text.length > 0), 'provider must never receive empty text');
+  assert.equal(provider.calls.some((text) => text.length === 3000), false, 'search must not create character windows');
   assert.equal(result.hits[0].id, longEntry.id);
   const sidecar = await store.readEmbedding('project', longEntry.id);
-  assert.ok(sidecar.vector[0] > 0.3, `later-section contribution missing from ${sidecar.vector}`);
-  assert.ok(Math.abs(Math.hypot(...sidecar.vector) - 1) < 1e-12, 'aggregate vector must be normalized');
+  assert.equal(sidecar.digest, sha256(indexedText(longEntry)));
+  assert.deepEqual(sidecar.vector, [1, 0]);
 });
 
 test('embedding concurrency is capped at two across simultaneous searches', async (t) => {

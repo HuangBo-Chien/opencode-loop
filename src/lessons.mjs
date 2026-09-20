@@ -11,7 +11,13 @@
 
 import { resolve } from 'node:path';
 import { JOURNAL_SCHEMA_VERSION, stableJournalId } from './journal-store.mjs';
-import { sanitizeJournalText } from './journal-text.mjs';
+import {
+  codePointSafePrefix,
+  MAX_INDEXED_TEXT_CHARS,
+  sanitizeIndexedEntryText,
+  sanitizeJournalText,
+  sanitizeJournalTextForLegacyReplay,
+} from './journal-text.mjs';
 import { safeJournalStage } from './journal-errors.mjs';
 
 export const LESSON_KINDS = Object.freeze({
@@ -24,8 +30,6 @@ const LESSON_CATEGORIES = new Set(['pitfall', 'surprise', 'repeated-mistake']);
 const MAX_OBSERVATION_TEXT_CHARS = 1000;
 const MAX_OBSERVATIONS_PER_SOURCE = 8;
 const MAX_OBSERVATION_LINKS = 8;
-const MAX_BODY_CHARS = 32_000;
-const MAX_TITLE_CHARS = 512;
 const MAX_TEXT_CHARS = 1000;
 const MAX_IDENTIFIER_CHARS = 128;
 const MAX_TAGS = 16;
@@ -37,9 +41,13 @@ const MAX_RUN_IDS = 8;
 const MAX_PENDING_BACKFILL_RUNS = 64;
 const MAX_BACKFILL_OFFSET = 1_000_000;
 const INJECTION_TEXT_CHARS = 240;
+const FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/;
+const REPLACEMENT_CHARACTER = '\uFFFD';
+const HIGH_SURROGATE_START = 0xD800;
+const HIGH_SURROGATE_END = 0xDBFF;
 
 function sanitizedText(value, limit = MAX_TEXT_CHARS) {
-  if (typeof value !== 'string') return null;
+  if (typeof value !== 'string' || !value.isWellFormed()) return null;
   const result = sanitizeJournalText(value, limit);
   return result.text.length ? result : null;
 }
@@ -47,6 +55,13 @@ function sanitizedText(value, limit = MAX_TEXT_CHARS) {
 function oneLine(value, limit = MAX_IDENTIFIER_CHARS) {
   const sanitized = sanitizedText(value, limit);
   if (sanitized === null) return null;
+  const text = sanitized.text.replace(/\s+/g, ' ').trim();
+  return text.length ? text.slice(0, limit) : null;
+}
+
+function oneLineForLegacyReplay(value, limit = MAX_IDENTIFIER_CHARS) {
+  if (typeof value !== 'string') return null;
+  const sanitized = sanitizeJournalTextForLegacyReplay(value, limit);
   const text = sanitized.text.replace(/\s+/g, ' ').trim();
   return text.length ? text.slice(0, limit) : null;
 }
@@ -69,9 +84,36 @@ function fingerprintOf(text) {
   return stableJournalId(normalizeLessonText(text));
 }
 
+function isFingerprint(value) {
+  return typeof value === 'string' && FINGERPRINT_PATTERN.test(value);
+}
+
 function stableContentId(kind, entry) {
   const { id: _id, ...content } = entry;
   return stableJournalId(kind, content);
+}
+
+function persistedEntryForLegacyReplay(entry) {
+  return { ...entry, body: entry.body.toWellFormed() };
+}
+
+async function legacyReplay(store, scope, kind, expected) {
+  const existing = await store.read(scope, expected.id);
+  if (existing === null || existing.id !== expected.id) return null;
+  const existingHash = stableContentId(kind, existing);
+  const persistedHash = stableContentId(kind, persistedEntryForLegacyReplay(expected));
+  if (existingHash !== expected.id && existingHash !== persistedHash) return null;
+  return { created: false, entry: existing };
+}
+
+function legacyEntry(kind, partial, content, tags = content.legacyTags) {
+  const legacy = {
+    ...partial,
+    title: content.legacyTitle,
+    tags,
+    body: content.legacyBody,
+  };
+  return { ...legacy, id: stableContentId(kind, legacy) };
 }
 
 function observationText(source, limit = MAX_OBSERVATION_TEXT_CHARS) {
@@ -79,16 +121,33 @@ function observationText(source, limit = MAX_OBSERVATION_TEXT_CHARS) {
   return sanitized === null ? null : sanitized.text;
 }
 
+function commandPrefixForLegacyReplay(value) {
+  return value.slice(0, 200);
+}
+
 function collectObservations(state) {
   const observations = [];
   const seen = new Set();
-  function push(category, text, source) {
+  function push(category, text, source, legacyText = text) {
     const body = observationText(text);
     if (body === null) return;
     const fingerprint = fingerprintOf(body);
     if (seen.has(fingerprint)) return;
     seen.add(fingerprint);
-    observations.push({ body, category, fingerprint, source });
+    let legacy = null;
+    if (typeof legacyText === 'string') {
+      const legacyBody = sanitizeJournalTextForLegacyReplay(legacyText, MAX_OBSERVATION_TEXT_CHARS).text;
+      const legacyFingerprint = legacyBody.length ? fingerprintOf(legacyBody) : null;
+      const currentTitle = oneLine(body, 200) ?? 'Run observation';
+      const legacyTitle = legacyBody.length
+        ? oneLineForLegacyReplay(legacyBody, 200) ?? 'Run observation'
+        : null;
+      if (legacyFingerprint !== null
+        && (legacyFingerprint !== fingerprint || legacyBody !== body || legacyTitle !== currentTitle)) {
+        legacy = { body: legacyBody, fingerprint: legacyFingerprint };
+      }
+    }
+    observations.push({ body, category, fingerprint, source, legacy });
   }
 
   const learnings = state?.artifacts?.findings?.payload?.learnings;
@@ -105,29 +164,61 @@ function collectObservations(state) {
       if (artifact?.kind !== 'verification') continue;
       const verdict = artifact.payload?.verdict;
       if (verdict !== 'FAIL' && verdict !== 'UNVERIFIED') continue;
-      const summary = oneLine(artifact.payload?.summary, 400) ?? 'no summary supplied';
+      const suppliedSummary = artifact.payload?.summary;
+      const currentSummary = oneLine(suppliedSummary, 400);
+      const summary = currentSummary ?? 'no summary supplied';
+      const legacySummary = currentSummary === null
+        ? 'no summary supplied'
+        : oneLineForLegacyReplay(suppliedSummary, 400) ?? 'no summary supplied';
       const failing = (Array.isArray(artifact.payload?.commands) ? artifact.payload.commands : [])
         .filter((command) => command && Number.isInteger(command.exitCode) && command.exitCode !== 0)
         .slice(0, 4)
-        .map((command) => String(command.command ?? '').slice(0, 200))
-        .filter(Boolean);
-      push('failure', `Verification ${verdict} on node ${artifact.nodeId ?? '[unknown]'}: ${summary}${failing.length ? ` — failing commands: ${failing.join('; ')}` : ''}`, `verification:${name}`);
+        .map((command) => {
+          const value = String(command.command ?? '');
+          return {
+            current: codePointSafePrefix(value, 200),
+            legacy: commandPrefixForLegacyReplay(value),
+          };
+        })
+        .filter((command) => command.current.length);
+      const currentCommands = failing.map((command) => command.current);
+      const legacyCommands = failing.map((command) => command.legacy);
+      const currentPrefix = `Verification ${verdict} on node ${artifact.nodeId ?? '[unknown]'}: ${summary}`;
+      const legacyPrefix = `Verification ${verdict} on node ${artifact.nodeId ?? '[unknown]'}: ${legacySummary}`;
+      const currentText = `${currentPrefix}${currentCommands.length ? ` — failing commands: ${currentCommands.join('; ')}` : ''}`;
+      const legacyText = `${legacyPrefix}${legacyCommands.length ? ` — failing commands: ${legacyCommands.join('; ')}` : ''}`;
+      push('failure', currentText, `verification:${name}`, legacyText);
     }
   }
 
   if (Array.isArray(state?.violations)) {
     for (let index = 0; index < state.violations.length && index < MAX_OBSERVATIONS_PER_SOURCE; index += 1) {
       const violation = state.violations[index];
-      const kind = oneLine(violation?.kind, 128);
+      const suppliedKind = violation?.kind;
+      const kind = oneLine(suppliedKind, 128);
       if (kind === null) continue;
-      const detail = sanitizedText(violation?.detail, 600)?.text ?? '';
-      push('violation', `${kind}${detail ? `: ${detail}` : ''}`, 'violations');
+      const legacyKind = oneLineForLegacyReplay(suppliedKind, 128) ?? kind;
+      const suppliedDetail = violation?.detail;
+      const currentDetail = sanitizedText(suppliedDetail, 600);
+      const detail = currentDetail?.text ?? '';
+      const legacyDetail = currentDetail === null
+        ? ''
+        : sanitizeJournalTextForLegacyReplay(suppliedDetail, 600).text;
+      const currentText = `${kind}${detail ? `: ${detail}` : ''}`;
+      const legacyText = `${legacyKind}${legacyDetail ? `: ${legacyDetail}` : ''}`;
+      push('violation', currentText, 'violations', legacyText);
     }
   }
   return observations;
 }
 
-function observationEntry({ projectKey, runId, createdAt, body, category, fingerprint, source }) {
+function observationEntry({ projectKey, runId, createdAt, body, category, fingerprint, source, legacyFingerprint = null }) {
+  if (!isFingerprint(fingerprint)) throw new TypeError('Lesson observation fingerprint must be a lowercase SHA-256 digest');
+  if (legacyFingerprint !== null && !isFingerprint(legacyFingerprint)) {
+    throw new TypeError('Lesson observation legacy fingerprint must be a lowercase SHA-256 digest');
+  }
+  const metadata = { projectKey, runId, category, fingerprint, source };
+  if (legacyFingerprint !== null) metadata.legacyFingerprint = legacyFingerprint;
   const partial = {
     schemaVersion: JOURNAL_SCHEMA_VERSION,
     scope: 'project',
@@ -136,36 +227,87 @@ function observationEntry({ projectKey, runId, createdAt, body, category, finger
     createdAt,
     tags: [category],
     sourceIds: [stableJournalId('run-summary', projectKey, runId)],
-    metadata: { projectKey, runId, category, fingerprint, source },
+    metadata,
     body,
   };
   return { ...partial, id: stableJournalId('lesson-observation', projectKey, runId, fingerprint) };
 }
 
+function observationEntryForLegacyReplay(input) {
+  const entry = observationEntry(input);
+  return { ...entry, title: oneLineForLegacyReplay(input.body, 200) ?? 'Run observation' };
+}
+
 function sanitizedEntryContent({ title, body, tags = [] } = {}) {
-  const sanitizedTitle = oneLine(title, MAX_TITLE_CHARS);
-  const sanitizedBody = sanitizedText(body, MAX_BODY_CHARS)?.text ?? null;
-  if (sanitizedTitle === null || sanitizedBody === null) throw new TypeError('Lesson title and body must be nonempty strings');
+  const text = sanitizeIndexedEntryText({ title, body });
+  if (text === null) throw new TypeError('Lesson title and body must be nonempty strings');
   if (!Array.isArray(tags)) throw new TypeError('Lesson tags must be an array');
   const sanitizedTags = [];
+  const legacyTags = [];
   for (let index = 0; index < tags.length && index < MAX_TAGS; index += 1) {
     const tag = oneLine(tags[index], MAX_TAG_CHARS);
     if (tag === null) throw new TypeError('Lesson tags must contain nonempty strings');
     if (!sanitizedTags.includes(tag)) sanitizedTags.push(tag);
+    const legacyTag = oneLineForLegacyReplay(tags[index], MAX_TAG_CHARS);
+    if (legacyTag === null) throw new TypeError('Lesson tags must contain nonempty strings');
+    if (!legacyTags.includes(legacyTag)) legacyTags.push(legacyTag);
   }
-  return { title: sanitizedTitle, body: sanitizedBody, tags: sanitizedTags };
+  return { ...text, tags: sanitizedTags, legacyTags };
 }
 
-function consolidateObservations(entries) {
+function historicalRepairFingerprint(body, storedFingerprint) {
+  const replacementIndex = body.indexOf(REPLACEMENT_CHARACTER);
+  if (replacementIndex < 0 || replacementIndex !== body.lastIndexOf(REPLACEMENT_CHARACTER)) return null;
+  const prefix = body.slice(0, replacementIndex);
+  const suffix = body.slice(replacementIndex + REPLACEMENT_CHARACTER.length);
+  const repairedBody = `${prefix}${suffix}`;
+  if (!repairedBody.isWellFormed() || !normalizeLessonText(repairedBody).length) return null;
+
+  for (let codeUnit = HIGH_SURROGATE_START; codeUnit <= HIGH_SURROGATE_END; codeUnit += 1) {
+    const historicalBody = `${prefix}${String.fromCharCode(codeUnit)}${suffix}`;
+    if (historicalBody.toWellFormed() === body && fingerprintOf(historicalBody) === storedFingerprint) {
+      return fingerprintOf(repairedBody);
+    }
+  }
+  return null;
+}
+
+function verifiedObservation(entry, projectKey) {
+  if (entry.kind !== 'lesson-observation' || entry.metadata?.projectKey !== projectKey) return null;
+  const runId = typeof entry.metadata?.runId === 'string' && entry.metadata.runId.length
+    ? entry.metadata.runId
+    : null;
+  const storedFingerprint = isFingerprint(entry.metadata?.fingerprint)
+    ? entry.metadata.fingerprint
+    : null;
+  if (runId === null || storedFingerprint === null
+    || entry.id !== stableJournalId('lesson-observation', projectKey, runId, storedFingerprint)
+    || typeof entry.body !== 'string' || !entry.body.length || !entry.body.isWellFormed()) return null;
+
+  const bodyFingerprint = fingerprintOf(entry.body);
+  if (storedFingerprint === bodyFingerprint) {
+    return { entry, fingerprint: bodyFingerprint, historicalFingerprint: null };
+  }
+  const repairedFingerprint = historicalRepairFingerprint(entry.body, storedFingerprint);
+  if (repairedFingerprint === null) return null;
+  return {
+    entry,
+    fingerprint: repairedFingerprint,
+    historicalFingerprint: storedFingerprint,
+  };
+}
+
+function consolidateObservations(entries, projectKey) {
   const groups = new Map();
-  for (const entry of entries) {
-    if (entry.kind !== 'lesson-observation') continue;
-    const fingerprint = typeof entry.metadata?.fingerprint === 'string' ? entry.metadata.fingerprint : null;
-    if (fingerprint === null) continue;
+  for (const candidate of entries) {
+    const observation = verifiedObservation(candidate, projectKey);
+    if (observation === null) continue;
+    const { entry, fingerprint, historicalFingerprint } = observation;
     let group = groups.get(fingerprint);
     if (group === undefined) {
       group = {
         fingerprint,
+        historicalFingerprints: new Set(),
         text: entry.body,
         category: typeof entry.metadata?.category === 'string' ? entry.metadata.category : null,
         occurrences: 0,
@@ -175,18 +317,25 @@ function consolidateObservations(entries) {
       };
       groups.set(fingerprint, group);
     }
+    if (historicalFingerprint !== null) group.historicalFingerprints.add(historicalFingerprint);
     group.occurrences += 1;
     if (entry.createdAt < group.firstSeen) {
       group.firstSeen = entry.createdAt;
       // Canonical text comes from the earliest phrasing so a later
       // lowercased/normalized echo does not overwrite the original wording.
       group.text = entry.body;
+      group.category = typeof entry.metadata?.category === 'string' ? entry.metadata.category : null;
     }
     if (entry.createdAt > group.lastSeen) group.lastSeen = entry.createdAt;
     const runId = typeof entry.metadata?.runId === 'string' ? entry.metadata.runId : null;
     if (runId !== null && group.runIds.length < MAX_RUN_IDS && !group.runIds.includes(runId)) group.runIds.push(runId);
   }
-  return [...groups.values()];
+  return [...groups.values()].map(({ historicalFingerprints, ...group }) => ({
+    ...group,
+    fingerprint: historicalFingerprints.size
+      ? [...historicalFingerprints].sort()[0]
+      : group.fingerprint,
+  }));
 }
 
 function pathTokens(paths) {
@@ -276,18 +425,25 @@ export function createLessonService({ runStore, lessonStore, lessonSearch, journ
     if (error?.code === 'PROJECT_WORKTREE_UNAVAILABLE') projectAvailable = false;
   }
 
-  async function writeObserved(entry) {
+  async function writeObserved(entry, legacy = null) {
     let flight = flights.get(entry.id);
     let owner = false;
     if (flight === undefined) {
       owner = true;
       flight = (async () => {
         try {
-          if (await lessonStore.exists('project', entry.id)) {
-            projectAvailable = true;
-            return false;
+          if (legacy !== null) {
+            const existing = await lessonStore.read('project', legacy.id);
+            const persisted = persistedEntryForLegacyReplay(legacy);
+            if (existing !== null
+              && existing.id === legacy.id
+              && stableContentId('lesson-observation', existing) === stableContentId('lesson-observation', persisted)) {
+              projectAvailable = true;
+              return false;
+            }
           }
           const result = await lessonStore.write('project', entry);
+          projectAvailable = true;
           return result?.created !== false;
         } catch (error) {
           recordFailure('Lesson observation write failed', error);
@@ -314,11 +470,23 @@ export function createLessonService({ runStore, lessonStore, lessonSearch, journ
       const observations = collectObservations(state);
       let created = 0;
       for (const observation of observations) {
-        const result = await writeObserved(observationEntry({
+        const input = {
           projectKey, runId, createdAt,
           body: observation.body, category: observation.category,
           fingerprint: observation.fingerprint, source: observation.source,
-        }));
+          legacyFingerprint: observation.legacy !== null
+            && observation.legacy.fingerprint !== observation.fingerprint
+            ? observation.legacy.fingerprint
+            : null,
+        };
+        const legacy = observation.legacy === null ? null : observationEntryForLegacyReplay({
+          projectKey, runId, createdAt,
+          body: observation.legacy.body,
+          category: observation.category,
+          fingerprint: observation.legacy.fingerprint,
+          source: observation.source,
+        });
+        const result = await writeObserved(observationEntry(input), legacy);
         if (result === null) return Object.freeze({ created, failed: true, reason: 'projection-failed' });
         if (result) { created += 1; projected += 1; }
       }
@@ -387,7 +555,7 @@ export function createLessonService({ runStore, lessonStore, lessonSearch, journ
   }
 
   function lessonCandidates(entries) {
-    const candidates = consolidateObservations(entries).map((group) => ({
+    const candidates = consolidateObservations(entries, projectKey).map((group) => ({
       kind: 'lesson-observation',
       id: group.fingerprint,
       category: group.category,
@@ -450,7 +618,7 @@ export function createLessonService({ runStore, lessonStore, lessonSearch, journ
 
   async function consolidatedTop(limit = MAX_CONSOLIDATED) {
     const entries = await listedProjectEntries();
-    const ranked = consolidateObservations(entries)
+    const ranked = consolidateObservations(entries, projectKey)
       .sort((left, right) => right.occurrences - left.occurrences || right.lastSeen.localeCompare(left.lastSeen));
     return ranked.slice(0, limit).map((group) => Object.freeze({
       fingerprint: group.fingerprint,
@@ -511,6 +679,21 @@ export function createLessonService({ runStore, lessonStore, lessonSearch, journ
       body: content.body,
     };
     const entry = { ...partial, id: stableContentId('lesson', partial) };
+    if (content.withinRawInputLimits) {
+      const legacy = legacyEntry(
+        'lesson',
+        partial,
+        content,
+        [...new Set([category, ...content.legacyTags])],
+      );
+      if (!content.withinLimit || legacy.id !== entry.id) {
+        const replay = await legacyReplay(lessonStore, 'project', 'lesson', legacy);
+        if (replay !== null) return replay;
+      }
+    }
+    if (!content.withinLimit) {
+      throw new TypeError(`Lesson indexed text must not exceed ${MAX_INDEXED_TEXT_CHARS} characters`);
+    }
     try {
       const result = await lessonStore.write('project', entry);
       projectAvailable = true;
@@ -576,6 +759,16 @@ export function createLessonService({ runStore, lessonStore, lessonSearch, journ
       body: content.body,
     };
     const entry = { ...partial, id: stableContentId('promoted-lesson', partial) };
+    if (content.withinRawInputLimits) {
+      const legacy = legacyEntry('promoted-lesson', partial, content);
+      if (!content.withinLimit || legacy.id !== entry.id) {
+        const replay = await legacyReplay(lessonStore, 'global', 'promoted-lesson', legacy);
+        if (replay !== null) return replay;
+      }
+    }
+    if (!content.withinLimit) {
+      throw new TypeError(`Lesson indexed text must not exceed ${MAX_INDEXED_TEXT_CHARS} characters`);
+    }
     try {
       return await lessonStore.write('global', entry);
     } catch (error) {

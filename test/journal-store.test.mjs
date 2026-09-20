@@ -4,7 +4,7 @@ import fsPromises, { appendFile, lstat, mkdir, mkdtemp, readFile, readdir, renam
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
-import { captureRequest, sanitizeJournalText } from '../src/journal-text.mjs';
+import * as journalText from '../src/journal-text.mjs';
 import { EMBEDDING_SPACE, EMBEDDING_SPACE_DIGEST } from '../src/embeddings.mjs';
 import {
   JOURNAL_EMBEDDING_SCHEMA_VERSION,
@@ -14,6 +14,10 @@ import {
   stableJournalId,
 } from '../src/journal-store.mjs';
 import GraphPlugin from '../src/index.mjs';
+
+const { captureRequest, sanitizeJournalText } = journalText;
+const EXPECTED_MAX_INDEXED_TEXT_CHARS = 12_000;
+const EXPECTED_MAX_AUTHORED_BODY_INPUT_CHARS = 32_000;
 
 const JOURNAL_OPTIONS = Object.freeze({
   enabled: true,
@@ -144,6 +148,42 @@ test('sanitizeJournalText normalizes CRLF, trims outer whitespace, and reports e
   for (const limit of [0, 32001, 1.5, '10', null]) {
     assert.throws(() => sanitizeJournalText('text', limit), TypeError);
   }
+});
+
+test('sanitizeJournalText never splits astral characters at raw or final truncation boundaries', () => {
+  const finalBoundary = sanitizeJournalText('a😀b', 2);
+  assert.deepEqual(finalBoundary, { text: 'a', truncated: true, redactions: 0 });
+  assert.equal(finalBoundary.text.isWellFormed(), true);
+
+  const limit = 8;
+  const rawCap = limit + 4096;
+  const rawBoundary = sanitizeJournalText(`${' '.repeat(rawCap - 1)}😀tail`, limit);
+  assert.deepEqual(rawBoundary, { text: '', truncated: true, redactions: 0 });
+  assert.equal(rawBoundary.text.isWellFormed(), true);
+});
+
+test('sanitizeJournalText rejects ill-formed Unicode before sanitizing or slicing', () => {
+  for (const input of ['bad\uD800', '\uDC00bad', `${'x'.repeat(5000)}\uD800`]) {
+    assert.throws(
+      () => sanitizeJournalText(input, 32),
+      { name: 'TypeError', message: /well-formed Unicode/i },
+    );
+  }
+});
+
+test('captureRequest never retains half an astral character at its bounded part edge', () => {
+  const limit = 8;
+  const rawCap = limit + 4096;
+  const captured = captureRequest([
+    { type: 'text', text: `${' '.repeat(rawCap - 1)}😀tail` },
+  ], { ...JOURNAL_OPTIONS, maxUserRequestChars: limit });
+
+  assert.equal(captured, null);
+});
+
+test('journal text exports the shared indexed-text boundary', () => {
+  assert.equal(journalText.MAX_INDEXED_TEXT_CHARS, EXPECTED_MAX_INDEXED_TEXT_CHARS);
+  assert.equal(journalText.MAX_AUTHORED_BODY_INPUT_CHARS, EXPECTED_MAX_AUTHORED_BODY_INPUT_CHARS);
 });
 
 test('sanitizeJournalText bounds raw input before normalization and redaction', () => {
@@ -827,6 +867,19 @@ test('journal store round trips Markdown with one JSON frontmatter object', asyn
   assert.equal(Object.hasOwn(frontmatter, 'body'), false);
   assert.deepEqual({ ...frontmatter, body: raw.slice(delimiter + 5) }, expected);
   if (process.platform !== 'win32') assert.equal((await lstat(target)).mode & 0o777, 0o600);
+});
+
+test('journal store round trips legacy entries above the new indexed-text write boundary', async (t) => {
+  const { worktree, globalDirectory } = await roots(t);
+  const store = createJournalStore({ worktree, globalDirectory });
+  const expected = entry({
+    title: 'Legacy external entry',
+    body: 'l'.repeat(journalText.MAX_INDEXED_TEXT_CHARS + 1),
+  });
+
+  assert.ok(`${expected.title}\n\n${expected.body}`.length > journalText.MAX_INDEXED_TEXT_CHARS);
+  assert.equal((await store.write('project', expected)).created, true);
+  assert.deepEqual(await store.read('project', expected.id), expected);
 });
 
 test('project and global journals are isolated and enforce their allowed kinds', async (t) => {
