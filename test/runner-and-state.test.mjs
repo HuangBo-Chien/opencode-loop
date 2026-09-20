@@ -950,6 +950,114 @@ test('UNVERIFIED pauses the run for a user decision without faking success', asy
   assert.equal(state.status, 'ABORTED');
 });
 
+test('two consecutive identical verification rejections pause the run for a user decision', async () => {
+  const state = freshRun();
+  await dispatchCriticAndPass(state);
+  await dispatchImplementerAndSucceed(state);
+  const admit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  assert.equal(admit.allowed, true, JSON.stringify(admit));
+  runner.beginNode(state, admit.nodeId, { now: NOW, sessionId: 'sess-verify' });
+  // An authored ref to a nonexistent artifact is the deterministic
+  // STALE_CHANGE shape the breaker exists for; dispatchVerifier cannot pass
+  // changeRefs through, so rejected submissions go directly to the runner
+  // (the node stays RUNNING between them, exactly like a correcting session).
+  const ghost = { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], changeRefs: ['change:ghost@1'], snapshot: { 'src/a.ts': 'hash-post' }, now: NOW };
+
+  const first = runner.submitVerification(state, ghost);
+  assert.equal(first.ok, false);
+  assert.equal(first.code, 'STALE_CHANGE');
+  assert.match(first.detail, /artifact change:ghost@1 does not exist — if this ref was derived from dependsOn/);
+  assert.equal(state.nodes['verify-1'].state, 'RUNNING');
+  assert.equal(state.nodes['verify-1'].rejectionStreak.count, 1);
+  assert.equal(state.status, 'RUNNING');
+
+  const second = runner.submitVerification(state, ghost);
+  assert.equal(second.ok, false);
+  assert.equal(second.code, 'REJECTION_LOOP');
+  assert.match(second.detail, /two consecutive identical STALE_CHANGE rejections: artifact change:ghost@1 does not exist/);
+  assert.equal(state.nodes['verify-1'].state, 'PENDING');
+  assert.equal(state.nodes['verify-1'].rejectionStreak.count, 2);
+  assert.equal(state.nodes['verify-1'].finishedAt, NOW);
+  assert.equal(state.status, 'AWAITING_USER_DECISION');
+  assert.equal(state.pendingDecision.cause, 'runner-rejection');
+  assert.match(state.pendingDecision.detail, /artifact change:ghost@1 does not exist/);
+});
+
+test('a different rejection detail restarts the streak instead of firing early', async () => {
+  const state = freshRun();
+  await dispatchCriticAndPass(state);
+  await dispatchImplementerAndSucceed(state);
+  const admit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  assert.equal(admit.allowed, true, JSON.stringify(admit));
+  runner.beginNode(state, admit.nodeId, { now: NOW, sessionId: 'sess-verify' });
+  const submission = (ref) => ({ nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], changeRefs: [ref], snapshot: { 'src/a.ts': 'hash-post' }, now: NOW });
+
+  const detailX = runner.submitVerification(state, submission('change:ghost@1'));
+  assert.equal(detailX.code, 'STALE_CHANGE');
+  const detailY = runner.submitVerification(state, submission('change:ghost@2'));
+  assert.equal(detailY.code, 'STALE_CHANGE');
+  // One rejection of each detail: no identical pair yet, so no pause.
+  assert.equal(state.nodes['verify-1'].state, 'RUNNING');
+  assert.equal(state.status, 'RUNNING');
+  assert.equal(state.nodes['verify-1'].rejectionStreak.detail, 'artifact change:ghost@2 does not exist — if this ref was derived from dependsOn rather than authored in the submission, no payload change can fix it; report the rejection instead of resubmitting');
+
+  const repeatY = runner.submitVerification(state, submission('change:ghost@2'));
+  assert.equal(repeatY.code, 'REJECTION_LOOP');
+  assert.equal(state.status, 'AWAITING_USER_DECISION');
+  assert.equal(state.pendingDecision.cause, 'runner-rejection');
+  assert.match(state.pendingDecision.detail, /artifact change:ghost@2 does not exist/);
+});
+
+test('an accepted verdict resets the rejection streak', async () => {
+  const state = freshRun();
+  await dispatchCriticAndPass(state);
+  await dispatchImplementerAndSucceed(state);
+  const admit = runner.admitDispatch(state, { agent: 'graph-verifier', now: NOW });
+  assert.equal(admit.allowed, true, JSON.stringify(admit));
+  runner.beginNode(state, admit.nodeId, { now: NOW, sessionId: 'sess-verify' });
+  const ghost = { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], changeRefs: ['change:ghost@1'], snapshot: { 'src/a.ts': 'hash-post' }, now: NOW };
+
+  assert.equal(runner.submitVerification(state, ghost).code, 'STALE_CHANGE');
+  // A valid FAIL on the same RUNNING attempt is accepted and clears the streak.
+  const repair = runner.submitVerification(state, { nodeId: 'verify-1', verdict: 'FAIL', commands: [{ command: 'npm test', exitCode: 1 }], summary: 'real regression', now: NOW });
+  assert.equal(repair.ok, true, JSON.stringify(repair));
+  assert.equal(state.nodes['verify-1'].rejectionStreak, null);
+
+  runner.beginNode(state, 'verify-1', { now: NOW, sessionId: 'sess-verify-2' });
+  const again = runner.submitVerification(state, ghost);
+  assert.equal(again.code, 'STALE_CHANGE');
+  assert.equal(state.nodes['verify-1'].rejectionStreak.count, 1);
+  assert.equal(state.nodes['verify-1'].state, 'RUNNING');
+  assert.equal(state.status, 'RUNNING');
+  assert.equal(state.pendingDecision, undefined);
+});
+
+test('the rejection streak persists with the run document and across re-dispatch', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-rejection-streak-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const store = createRunStore({ worktree: dir });
+  const state = await store.createRun({ runId: 'r-streak', rootSessionId: 'r-streak', now: NOW });
+  runner.submitPlan(state, { intent: 'change', nodes: changeGraph().nodes, now: NOW });
+  await dispatchCriticAndPass(state);
+  await dispatchImplementerAndSucceed(state);
+  runner.beginNode(state, 'verify-1', { now: NOW, sessionId: 'sess-verify' });
+  const ghost = { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], changeRefs: ['change:ghost@1'], snapshot: { 'src/a.ts': 'hash-post' }, now: NOW };
+  assert.equal(runner.submitVerification(state, ghost).code, 'STALE_CHANGE');
+  assert.equal(runner.submitVerification(state, ghost).code, 'REJECTION_LOOP');
+  await store.saveRun(state);
+
+  const reloaded = await store.loadRun('r-streak');
+  assert.equal(reloaded.status, 'AWAITING_USER_DECISION');
+  assert.equal(reloaded.nodes['verify-1'].rejectionStreak.code, 'STALE_CHANGE');
+  assert.equal(reloaded.nodes['verify-1'].rejectionStreak.count, 2);
+  // A fresh session resubmitting the same broken payload is still the same
+  // loop: the continued count fires immediately without another free pass.
+  runner.beginNode(reloaded, 'verify-1', { now: NOW, sessionId: 'sess-verify-2' });
+  const repeat = runner.submitVerification(reloaded, ghost);
+  assert.equal(repeat.code, 'REJECTION_LOOP');
+  assert.equal(reloaded.nodes['verify-1'].rejectionStreak.count, 3);
+});
+
 test('change submission cross-checks the side-effect ledger and writeScope', async () => {
   const state = freshRun();
   await dispatchCriticAndPass(state);

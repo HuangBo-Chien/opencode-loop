@@ -118,6 +118,28 @@ function pauseForDecision(state, cause, detail, now) {
   state.updatedAt = now;
 }
 
+// Circuit breaker for deterministic verification rejections: two consecutive
+// identical content-level rejections mean no payload change can fix the
+// submission, so instead of burning the session in a loop the run pauses for
+// a user decision and the node returns to PENDING (graph_run_decide's
+// in-flight check can then pass). The streak deliberately persists across
+// re-dispatches — a fresh session resubmitting the same broken payload is
+// still the same loop — and resets only on an accepted verdict (which also
+// covers rejections the corrected payload outgrew) or a different rejection.
+function trackRejection(state, node, code, detail, now) {
+  const previous = node.rejectionStreak;
+  node.rejectionStreak = previous && previous.code === code && previous.detail === detail
+    ? { code, detail, count: previous.count + 1 }
+    : { code, detail, count: 1 };
+  if (node.rejectionStreak.count >= 2) {
+    node.state = 'PENDING';
+    node.finishedAt = now;
+    pauseForDecision(state, 'runner-rejection', detail, now);
+    return { ok: false, code: 'REJECTION_LOOP', detail: `two consecutive identical ${code} rejections: ${detail}` };
+  }
+  return { ok: false, code, detail };
+}
+
 // Irreversible user termination. Evidence is preserved untouched; only the
 // status, the reason and the decision record change.
 function abortRun(state, { reason, now }) {
@@ -361,6 +383,9 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         startedAt: null,
         finishedAt: null,
         reconcile: false,
+        // Rejection-streak circuit breaker state (see trackRejection); null
+        // on a fresh graph because a replaced plan is genuinely new work.
+        rejectionStreak: null,
       };
     }
     // Explore/analyze nodes document evidence the plan was built on; the plan
@@ -565,20 +590,21 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     // nonzero commands against, so failures that predate the change can be
     // told apart from regressions the change introduced.
     if (verdict === 'BASELINE') {
-      if (node.spec.baseline !== true) return { ok: false, code: 'INVALID_VERDICT', detail: 'BASELINE verdicts are only accepted on baseline verify nodes (declare baseline: true in the plan)' };
-      if (!commands.length) return { ok: false, code: 'INSUFFICIENT_EVIDENCE', detail: 'BASELINE requires at least one recorded command (the pre-change suite evidence)' };
+      if (node.spec.baseline !== true) return trackRejection(state, node, 'INVALID_VERDICT', 'BASELINE verdicts are only accepted on baseline verify nodes (declare baseline: true in the plan)', now);
+      if (!commands.length) return trackRejection(state, node, 'INSUFFICIENT_EVIDENCE', 'BASELINE requires at least one recorded command (the pre-change suite evidence)', now);
       const name = `baseline:${nodeId}`;
       const previous = state.artifacts[name];
       const version = previous ? previous.version + 1 : 1;
       if (previous && previous.status === 'valid') previous.status = 'superseded';
       state.artifacts[name] = { kind: 'baseline', nodeId, version, basedOn: [], payload: { commands, summary }, status: 'valid', createdAt: now };
       node.state = 'SUCCEEDED';
+      node.rejectionStreak = null;
       node.finishedAt = now;
       completeIfDone(state, now);
       return { ok: true, effect: 'baseline' };
     }
     if (node.spec.baseline === true && (verdict === 'PASS' || verdict === 'FAIL')) {
-      return { ok: false, code: 'INVALID_VERDICT', detail: 'baseline verify nodes only accept BASELINE or UNVERIFIED verdicts (there is no change to judge yet)' };
+      return trackRejection(state, node, 'INVALID_VERDICT', 'baseline verify nodes only accept BASELINE or UNVERIFIED verdicts (there is no change to judge yet)', now);
     }
     if (verdict === 'PASS') {
       // Nonzero exit codes are tolerated only when the exact command and
@@ -586,9 +612,9 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       // did not get worse. Everything else is a regression this change owns.
       const unmatched = commands.filter((command) => command.exitCode !== 0 && !baselineMatches(state, command));
       if (!commands.length || !commands.some((command) => command.exitCode === 0) || unmatched.length) {
-        return { ok: false, code: 'INSUFFICIENT_EVIDENCE', detail: unmatched.length
+        return trackRejection(state, node, 'INSUFFICIENT_EVIDENCE', unmatched.length
           ? `nonzero commands not covered by a baseline entry: ${unmatched.map((command) => command.command).join('; ')} — every failing command on PASS must match a declared baseline (same command and exitCode)`
-          : 'PASS requires at least one command with exitCode 0 (baseline matches tolerate pre-existing failures but never substitute for a green command)' };
+          : 'PASS requires at least one command with exitCode 0 (baseline matches tolerate pre-existing failures but never substitute for a green command)', now);
       }
       // Deliverable-backed work earns real-surface evidence: when any
       // dependency implement node declared deliverables, PASS must cite at
@@ -596,12 +622,14 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       // not only a green command.
       const deliverableDeps = node.spec.dependsOn.map((dep) => state.nodes[dep]).filter((dep) => dep && dep.spec.kind === 'implement' && Array.isArray(dep.spec.deliverables) && dep.spec.deliverables.length);
       if (deliverableDeps.length && !artifacts.length) {
-        return { ok: false, code: 'ARTIFACT_REQUIRED', detail: `implement nodes with declared deliverables (${deliverableDeps.map((dep) => dep.spec.id).join(', ')}) require at least one artifact path (an existing evidence file) on PASS` };
+        return trackRejection(state, node, 'ARTIFACT_REQUIRED', `implement nodes with declared deliverables (${deliverableDeps.map((dep) => dep.spec.id).join(', ')}) require at least one artifact path (an existing evidence file) on PASS`, now);
       }
       const refs = changeRefs ?? node.spec.dependsOn.map((dep) => depArtifactRef(state, dep));
       for (const ref of refs) {
         const resolution = artifactRef(state, ref);
-        if (resolution.missing) return { ok: false, code: 'STALE_CHANGE', detail: resolution.missing };
+        if (resolution.missing) {
+          return trackRejection(state, node, 'STALE_CHANGE', `${resolution.missing} — if this ref was derived from dependsOn rather than authored in the submission, no payload change can fix it; report the rejection instead of resubmitting`, now);
+        }
       }
       const name = `verification:${nodeId}`;
       const previous = state.artifacts[name];
@@ -609,6 +637,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       if (previous && previous.status === 'valid') previous.status = 'superseded';
       state.artifacts[name] = { kind: 'verification', nodeId, version, basedOn: refs, payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot, status: 'valid', createdAt: now };
       node.state = 'SUCCEEDED';
+      node.rejectionStreak = null;
       node.finishedAt = now;
       completeIfDone(state, now);
       return { ok: true, effect: 'advance' };
@@ -616,6 +645,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     if (verdict === 'FAIL') {
       state.revisionCounters['implement-verify'] += 1;
       node.state = 'PENDING';
+      node.rejectionStreak = null;
       node.finishedAt = now;
       // Failed verification is durable evidence: store it (superseded — it
       // gates nothing) so repair dispatches and audits can cite the exact
@@ -651,6 +681,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     // its evidence preserved as a superseded verification artifact.
     if (verdict === 'UNVERIFIED') {
       node.state = 'PENDING';
+      node.rejectionStreak = null;
       node.finishedAt = now;
       const name = `verification:${nodeId}`;
       const previous = state.artifacts[name];
@@ -661,7 +692,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       pauseForDecision(state, 'verification-unverified', summary || 'verifier could not verify', now);
       return { ok: true, effect: 'await-decision', detail: 'verification could not be completed; run paused for a user decision (evidence preserved)' };
     }
-    return { ok: false, code: 'INVALID_VERDICT', detail: 'verdict must be PASS, FAIL or UNVERIFIED' };
+    return trackRejection(state, node, 'INVALID_VERDICT', 'verdict must be PASS, FAIL or UNVERIFIED', now);
   }
 
   function recordSideEffect(state, { nodeId, tool, target, now }) {

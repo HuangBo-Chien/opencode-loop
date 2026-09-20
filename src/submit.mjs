@@ -340,7 +340,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
   });
 
   const graph_run_decide = tool({
-    description: 'Orchestrator delivers the user\'s decision for a run paused by exhaustion or an UNVERIFIED verdict (AWAITING_USER_DECISION) or deliberately rotates/terminates a run. action="abort" irreversibly marks the run ABORTED (all findings, plans, reviews, violations and dispatch history preserved; dispatch closed). action="reset" archives the run in place (decision + successorRunId, original status and evidence untouched) and starts a fresh successor run with reset counters that re-walks the explorer → planner → critic gates without replaying any implementer work or side effects. A user-provided reason is required; native permission ask enforces user confirmation.',
+    description: 'Orchestrator delivers the user\'s decision for a run paused by exhaustion, an UNVERIFIED verdict, or repeated identical runner rejections (AWAITING_USER_DECISION), or deliberately rotates/terminates a run. action="abort" irreversibly marks the run ABORTED (all findings, plans, reviews, violations and dispatch history preserved; dispatch closed). action="reset" archives the run in place (decision + successorRunId, original status and evidence untouched) and starts a fresh successor run with reset counters that re-walks the explorer → planner → critic gates without replaying any implementer work or side effects. A user-provided reason is required; native permission ask enforces user confirmation.',
     args: {
       action: z.enum(['reset', 'abort']),
       reason: z.string().min(1).max(2000),
