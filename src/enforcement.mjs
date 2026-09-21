@@ -11,12 +11,13 @@ import { createDispatchBindings } from './dispatch-bindings.mjs';
 import { parseNodeIdHint, TARGET_REQUIRED_AGENTS } from './dispatch-target.mjs';
 import { formatLessonsBlock } from './lessons.mjs';
 import { assertSettlementCapacity, isUncertainEffect } from './runner.mjs';
+import { isConfiguredMcpTool, toolPermission } from './tool-permissions.mjs';
 
 const READ_ONLY_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-multimodal']);
 // Tools that never mutate run state or the workspace stay available to graph
 // children even when their dispatch binding is gone (rejected dispatch, idle
 // session, terminated run). Write paths keep failing closed.
-const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'list', 'skill', 'graph_status', 'graph_inspect', 'graph_journal_search', 'graph_journal_read', 'graph_lesson_search', 'graph_lesson_read']);
+const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'list', 'skill', 'lsp', 'graph_status', 'graph_inspect', 'graph_journal_search', 'graph_journal_read', 'graph_lesson_search', 'graph_lesson_read']);
 const NOW = () => new Date().toISOString();
 
 function rejectionPrompt(decision) {
@@ -94,7 +95,7 @@ function learningsPrompt(state) {
   return `[RUNNER] Explorer learnings (incorporate these; re-validate against current state before relying on them):\n${lines.join('\n')}`;
 }
 
-export function createEnforcement({ settings, store, runner, bindings, client, dispatches = createDispatchBindings({ store, runner, bindings, client }), lessons = null }) {
+export function createEnforcement({ settings, store, runner, bindings, client, dispatches = createDispatchBindings({ store, runner, bindings, client }), lessons = null, getToolPermissions = () => null }) {
   const deniedCalls = new Map();
   const startedCalls = new Map();
   const observedToolParts = new Map();
@@ -114,6 +115,23 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
 
   function pausedEffect(binding, tool) {
     return ['edit', 'write', 'bash'].includes(tool) && store.getRun(binding?.runId)?.status === 'AWAITING_USER_DECISION';
+  }
+
+  // An allow/ask is not a read-only declaration. Configured MCP calls retain
+  // the active-dispatch fence and also require a healthy run for the root.
+  // This is admission only, not a sandbox or a ledger of MCP-internal effects.
+  function configuredToolDenial(sessionID, tool) {
+    const policy = getToolPermissions();
+    if (!isConfiguredMcpTool(policy, tool)) return null;
+    const binding = bindings.get(sessionID);
+    if (!binding && !dispatches.managed(sessionID)) return null;
+    if (!binding || store.getRun(binding.runId)?.status !== 'RUNNING' || !binding.root && !dispatches.current(binding)) {
+      return 'BINDING_UNAVAILABLE: configured MCP tools require a RUNNING run and an active, verified dispatch';
+    }
+    if (toolPermission(policy, binding.agent, tool) === 'deny') {
+      return 'TOOL_PERMISSION_DENIED: this role does not permit the configured MCP tool';
+    }
+    return null;
   }
 
   // Known project lessons ride into explorer/planner/implementer dispatches.
@@ -295,6 +313,8 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
 
   async function onToolBefore(input, output) {
     const { tool, sessionID, callID } = input ?? {};
+    const configuredDenial = configuredToolDenial(sessionID, tool);
+    if (configuredDenial) throw new Error(configuredDenial);
     if (tool === 'task') {
       const binding = bindings.get(sessionID);
       if (!binding?.root) return;
@@ -576,6 +596,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       return result;
     },
     onPermissionAsk: (input, output) => childOperation(input, output, async (i, o) => {
+      if (configuredToolDenial(i?.sessionID, i?.type)) { o.status = 'deny'; return; }
       if (pausedEffect(bindings.get(i?.sessionID), i?.type)) { o.status = 'deny'; return; }
       if (!READ_ONLY_TOOLS.has(i?.type) && dispatches.managed(i?.sessionID) && !bindings.get(i.sessionID)?.root && !dispatches.current(bindings.get(i.sessionID)) && !canCloseout(bindings.get(i.sessionID), i?.type)) { o.status = 'deny'; return; }
       return onPermissionAsk(i, o);

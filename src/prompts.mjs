@@ -54,7 +54,18 @@ filesTouched 僅填 workspace 相對的具體檔案路徑,禁止目錄、尾端 
   'graph-multimodal': () => `你負責分析使用者提供或工具實際可讀的圖片、截圖與其他多模態輸入,回報可觀察內容、與任務的關係及不確定性;必要時以 graph_submit_findings 註冊發現供 planner 引用。若目前模型或工具不支援該輸入,或未實際取得輸入,明確說明不支援/無法讀取並交還協調者,禁止憑檔名想像內容。不要編輯、執行 shell 或派遣代理。`,
 };
 
+const codeNavigation = `理解程式碼、定位符號或確認呼叫關係時,優先使用當前可用且獲授權的程式碼查詢工具(MCP/LSP),遵守專案指定的工具優先順序。toolPermissions 設定不代表工具已連線或索引可用;需要專案路徑時明確指定當前專案。缺少工具、索引或結果不完整時用 read/glob/grep 補充,如實回報限制;不要改用 shell 繞過工具拒絕。已取得的目前原始碼區段視為已讀,未取得的區段及可能過期的索引需另外核對。
+配置型 MCP 呼叫只限 RUNNING run 與有效派遣(root 不需子派遣);暫停、結束或派遣撤銷後停止新 MCP 呼叫。權限 allow/ask 不表示工具唯讀或其內部修改受 writeScope/ledger 追蹤;只使用符合本角色與任務範圍的操作。`;
+
+const navigationByRole = {
+  'graph-explorer': '查詢用途:定位符號、呼叫端與相關測試,建立可追溯探索證據。',
+  'graph-planner': '查詢用途:核對依賴與修改範圍,不要只依賴探索摘要制定計畫。',
+  'graph-plan-critic': '查詢用途:獨立核對遺漏的呼叫端、共享依賴與測試盲點。',
+  'graph-implementer': '查詢用途:修改前確認現況與影響範圍;MCP 查詢不需要 shell 授權,但不能據此擴大 writeScope。',
+  'graph-verifier': '查詢用途:找出回歸檢查範圍;查詢結果不能取代目前工作樹上的實際驗證。',
+};
+
 export function createAgentPrompt(name, options) {
   if (!Object.hasOwn(roles, name)) throw new Error(`Unknown graph agent: ${name}`);
-  return `你是 ${name}。\n${shared}\n\n${roles[name](options)}`;
+  return `你是 ${name}。\n${shared}\n\n${codeNavigation}\n${navigationByRole[name] ?? ''}\n\n${roles[name](options)}`;
 }

@@ -50,7 +50,9 @@ export default async function GraphPlugin(context, options = {}) {
   const store = createJournaledRunStore(baseStore, journalService, lessonService);
   const runner = createRunner({ maxAttempts: settings.maxAttempts, maxPlanRevisions: settings.maxPlanRevisions, implementerParallel: settings.maxImplementerParallel, readerParallel: settings.maxParallel });
   const bindings = new Map();
-  const enforcement = createEnforcement({ settings: { worktree, journal: settings.journal, lessons: settings.lessons }, store, runner, bindings, client: context.client, lessons: lessonService });
+  let toolPermissions = null;
+  const getToolPermissions = () => toolPermissions;
+  const enforcement = createEnforcement({ settings: { worktree, journal: settings.journal, lessons: settings.lessons }, store, runner, bindings, client: context.client, lessons: lessonService, getToolPermissions });
   const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches });
   const journalTools = createJournalTools({
     journalService,
@@ -68,8 +70,8 @@ export default async function GraphPlugin(context, options = {}) {
   });
 
   return {
-    async config(config) { registerAgents(config, settings); },
-    tool: { graph_status: createStatusTool(settings, journalService, lessonService), ...tools, ...journalTools, ...lessonTools },
+    async config(config) { toolPermissions = registerAgents(config, settings); },
+    tool: { graph_status: createStatusTool(settings, journalService, lessonService, getToolPermissions), ...tools, ...journalTools, ...lessonTools },
     'chat.message': enforcement.onChatMessage,
     'tool.execute.before': enforcement.onToolBefore,
     'tool.execute.after': enforcement.onToolAfter,

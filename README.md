@@ -285,7 +285,7 @@ Consider adding the state directory to `.gitignore`. Start OpenCode in that proj
 | `graph-verifier` | subagent | Evidence-bound verification | `graph_submit_verification` | `bash` ask; no edit |
 | `graph-multimodal` | subagent | Analyze supported visual inputs honestly | `graph_submit_findings` | `webfetch`, `websearch` ask |
 
-All graph agents may call `graph_status` and `graph_inspect`; every role also receives `skill: 'allow'` through the shared permission baseline, and `skill` is classified as a read-only tool (it stays available to child sessions whose dispatch binding is gone, while write tools keep failing closed). Unknown tools (including arbitrary MCP tools) default to deny, and `read` explicitly denies `*.env`/`*.env.*`. Native agent definitions and the default agent remain intact unless `setDefaultAgent` is true. Any existing definition with one of the seven reserved names causes an atomic collision error.
+All graph agents may call `graph_status` and `graph_inspect`; every role also receives `skill: 'allow'` through the shared permission baseline, and `skill` is classified as a read-only tool (it stays available to child sessions whose dispatch binding is gone, while write tools keep failing closed). Unknown tools (including arbitrary MCP tools) default to deny, and `read` explicitly denies `*.env`/`*.env.*`. `toolPermissions` can opt roles into LSP and named MCP tools as described below. Native agent definitions and the default agent remain intact unless `setDefaultAgent` is true. Any existing definition with one of the seven reserved names causes an atomic collision error.
 
 Classifying `skill` as side-effect-free is an assumption based on OpenCode host 1.18.x behavior (the pinned SDK is `@opencode-ai/plugin@1.18.25`). If a newer host ever makes the `skill` tool mutate run state or the workspace, revisit both its `READ_ONLY_TOOLS` membership and the blanket `allow`.
 
@@ -300,6 +300,116 @@ Journal access is intentionally narrower. Prefer native `ask` when a journal ope
 
 Implementer, verifier and multimodal roles receive none of the journal tools.
 
+### Configurable MCP and LSP permissions
+
+Add `toolPermissions` to the **options object of the existing plugin tuple** in
+`opencode.jsonc`. Keep the current plugin path and other options. This is a
+plugin option, not a new top-level OpenCode field. For example, the options
+object can contain:
+
+```jsonc
+{
+  "maxAttempts": 3,
+  "toolPermissions": {
+    "shared": {
+      "lsp": "allow",
+      "codegraph_codegraph_explore": "allow"
+    },
+    "agents": {
+      "graph-multimodal": {
+        "lsp": "deny",
+        "codegraph_codegraph_explore": "deny"
+      }
+    }
+  }
+}
+```
+
+The example opts the other six roles into the CodeGraph query and LSP, while
+leaving all other MCP tools denied. No MCP is built into this plugin's policy.
+The MCP server must be declared separately in OpenCode's `mcp` configuration;
+LSP must also be available in the host. Updating the source checkout alone does
+not update a separately installed plugin: update the installation referenced by
+the tuple, then **quit and restart OpenCode** to load the code and configuration.
+
+Rules:
+
+- Both `shared` and `agents` are optional and default to empty objects. Agent
+  keys must be full names from the seven-role table. Values are exactly
+  `allow`, `ask`, or `deny`; nested native permission objects are not supported.
+- Precedence is **existing role baseline → shared → role-specific rules**.
+  Within each layer, the last matching rule wins. Overridden keys move to the
+  end of the role's rules; a role wildcard can override a shared exact rule.
+  `ask` remains a native permission request; the runner never grants it.
+- Keys are `lsp`, exact MCP tool names, or a literal MCP tool prefix with one
+  trailing `*`. `codegraph_*` is supported, but includes **future tools** on that
+  server. Prefer exact query names when only one operation is needed. Leading
+  or interior wildcards, `?`, global `*`, native controls (`bash`, `edit`,
+  `write`, `task`, etc.), and `graph_*` tools cannot be configured here.
+  Native MCP resource helpers (`read_mcp_resource`, `list_mcp_resources`,
+  `list_mcp_resource_templates`) are also excluded: they use the host's `read`
+  permission and are not server-prefixed MCP operations.
+- MCP names use the pinned host's naming rule:
+  `sanitize(serverName) + '_' + sanitize(toolName)`, replacing characters outside
+  `[a-zA-Z0-9_-]` with `_`. Thus server `codegraph` + tool `codegraph_explore`
+  becomes `codegraph_codegraph_explore`. Rules must fit inside one configured
+  server namespace. Ambiguous normalized names or overlapping namespaces
+  (such as `code` and `code_graph` for `code_graph_*`) are rejected.
+  Rule matching, reserved-name protection and collision checks follow the host:
+  case-insensitive on Windows, case-sensitive on other platforms.
+- At most 128 rules per map, at most seven role overrides, and at most 256
+  characters per rule. Configuration is copied and deeply frozen. Unknown keys,
+  invalid values, accessors and non-plain data are rejected. Shape validation
+  also runs when the plugin is disabled; MCP namespace validation runs in the
+  enabled plugin's config hook before any agents are registered.
+- A disabled or unreachable MCP may still have a valid permission rule. No
+  network connection or tool discovery occurs during validation; an exact tool
+  name typo within a valid namespace cannot be detected here. `graph_status`
+  reports the ordered compiled rules under `toolPermissions.agents`, with
+  `validated` indicating config-hook validation and `availabilityChecked: false`.
+  These are plugin-generated rules, not a host connection/availability check or
+  a report of every effective host permission.
+
+For example, this override lets a verifier use only one operation even when
+the shared policy permits the whole server:
+
+```jsonc
+"toolPermissions": {
+  "shared": { "codegraph_*": "allow" },
+  "agents": {
+    "graph-verifier": {
+      "codegraph_*": "deny",
+      "codegraph_codegraph_explore": "allow"
+    }
+  }
+}
+```
+
+**Runner boundary:** configured MCP calls require a RUNNING run and an active,
+verified child dispatch; the root requires a RUNNING run too. Paused, completed,
+rejected and revoked work cannot start new MCP calls. Late after-hooks remain
+processable. Permission does **not** classify an MCP as read-only, sandbox its
+implementation, or add its internal writes to the edit/bash ledger. Use this
+entry point for reviewed query operations that fit the role; it is not a grant
+to write outside `writeScope`. Native LSP navigation is classified as read-only
+and may be used after dispatch completion if native permissions allow it; this
+assumes the pinned host's LSP lookup behavior, not arbitrary server extensions.
+
+All roles now receive capability-aware navigation guidance: explorer locates
+symbols, planner checks dependencies, critic checks omissions, implementer
+checks impact before editing, and verifier locates regression checks. Project
+instructions determine tool preference. For CodeGraph, check that the project
+has an index, pass the current project's absolute `projectPath`, and treat
+returned current source sections as already read. Fall back to read/glob/grep
+for missing sections or unavailable indexing. Graph results never replace
+actual verifier commands, and denied tools must not be routed through shell.
+
+Verification after installation: in an indexed project, use a bounded query
+through explorer/planner/critic/implementer/verifier, including an implementer
+with `allowShell: false`. Check a role-specific deny and an unconfigured MCP
+remain unavailable. Unit/hook tests exercise these policies without a real MCP;
+real-model tool selection and host connectivity require this separate smoke test.
+
 ## Options
 
 The default plugin function accepts `(context, options)`. Supported options are plain data:
@@ -309,6 +419,7 @@ The default plugin function accepts `(context, options)`. Supported options are 
 | `enabled` | `true` | Boolean; false returns no hooks |
 | `setDefaultAgent` | `false` | Boolean; true selects `graph-orchestrator` |
 | `models` | `{}` | Map of seven full agent names to nonempty model strings, max 256 characters, no surrounding whitespace or control characters |
+| `toolPermissions` | `{ shared: {}, agents: {} }` | Shared and per-role allow/ask/deny rules for LSP and configured MCP namespaces; see above |
 | `maxAttempts` | `3` | Integer 1–20; enforced per-node attempt budget (including the first attempt) and the verification repair loop cap |
 | `maxParallel` | `4` | Integer 1–16; maximum concurrent read-only exploration/analysis tasks (mechanical `READER_CAPACITY` gate shared by explorer and multimodal) |
 | `maxImplementerParallel` | `2` | Integer 1–4; enforced cap on concurrently RUNNING (or reserved) implement nodes, narrowed by the critic's `approvedParallel`; write scopes stay pairwise disjoint by plan validation |

@@ -8,6 +8,8 @@ import { createRunner } from '../src/runner.mjs';
 import { createSubmitTools } from '../src/submit.mjs';
 import { createEnforcement } from '../src/enforcement.mjs';
 import { cleanJson } from '../src/json-safe.mjs';
+import { parseOptions } from '../src/config.mjs';
+import { registerAgents } from '../src/agents.mjs';
 
 const SPECS = [
   { id: 'explore-1', kind: 'explore', agent: 'graph-explorer', dependsOn: [], inputs: [], outputs: [], acceptance: ['evidence'] },
@@ -17,7 +19,7 @@ const SPECS = [
   { id: 'verify-1', kind: 'verify', agent: 'graph-verifier', dependsOn: ['impl-1'], inputs: [], outputs: [], acceptance: ['verify'] },
 ];
 
-function harness(worktree, { readerParallel, saveRun } = {}) {
+function harness(worktree, { readerParallel, saveRun, toolPermissions } = {}) {
   const backing = createRunStore({ worktree, stateDirectory: '.opencode-loop' });
   const store = saveRun ? { ...backing, saveRun: (state) => saveRun(state, backing) } : backing;
   const runner = createRunner({ maxAttempts: 3, maxPlanRevisions: 2, readerParallel });
@@ -30,10 +32,96 @@ function harness(worktree, { readerParallel, saveRun } = {}) {
     message: async ({ path }) => ({ data: (hostMessages.get(path.id) ?? []).find((m) => m.info.id === path.messageID) }),
   } };
   const journal = { enabled: true, includeUserRequest: true, semanticSearch: true, maxUserRequestChars: 8000 };
-  const enforcement = createEnforcement({ settings: { worktree, journal }, store, runner, bindings, client });
+  const policy = toolPermissions ? registerAgents({ mcp: { codegraph: { enabled: false } } }, parseOptions({ toolPermissions })) : null;
+  const enforcement = createEnforcement({ settings: { worktree, journal }, store, runner, bindings, client, getToolPermissions: () => policy });
   const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches });
   return { store, runner, bindings, enforcement, tools, calls: [], hostMessages, client };
 }
+
+const QUERY_TOOL = 'codegraph_codegraph_explore';
+const QUERY_PERMISSIONS = { shared: { lsp: 'allow', [QUERY_TOOL]: 'ask' } };
+
+test('configured MCP works across the real role handoff, including implementer without shell', async () => {
+  const h = harness(undefined, { toolPermissions: QUERY_PERMISSIONS });
+  await startRun(h);
+  const query = async sessionID => {
+    await h.enforcement.onToolBefore({ sessionID, tool: QUERY_TOOL, callID: `query-${sessionID}` }, { args: { projectPath: 'project', query: 'symbol' } });
+    const permission = { status: 'ask' };
+    await h.enforcement.onPermissionAsk({ sessionID, type: QUERY_TOOL }, permission);
+    assert.equal(permission.status, 'ask', 'runner never grants native ask');
+  };
+  await query('root');
+  for (const [id, agent] of [['explorer', 'graph-explorer'], ['planner', 'graph-planner'], ['critic', 'graph-plan-critic'], ['implementer', 'graph-implementer'], ['verifier', 'graph-verifier']]) {
+    await dispatch(h, agent, agent === 'graph-implementer' ? { nodeId: 'impl-1' } : agent === 'graph-verifier' ? { nodeId: 'verify-1' } : {});
+    await bindChild(h, id, agent);
+    await query(id);
+    let result;
+    if (agent === 'graph-planner') result = await h.tools.graph_submit_plan.execute({ intent: 'change', specs: SPECS }, ctx(h, id, agent));
+    if (agent === 'graph-plan-critic') result = await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, id, agent));
+    if (agent === 'graph-implementer') {
+      await assert.rejects(h.enforcement.onToolBefore({ sessionID: id, tool: 'bash', callID: 'shell-denied' }, { args: { command: 'codegraph explore symbol' } }), /blocked-bash/);
+      result = await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: [], summary: 'no-op query fixture' }, ctx(h, id, agent));
+    }
+    if (result) assert.equal(JSON.parse(result).ok, true, result);
+    await childIdle(h, id);
+  }
+  assert.equal(h.enforcement.internals.READ_ONLY_TOOLS.has(QUERY_TOOL), false);
+});
+
+for (const status of ['AWAITING_USER_DECISION', 'RECOVERY_REQUIRED', 'SUCCEEDED', 'FAILED', 'ABORTED']) {
+  test(`configured MCP blocks root and children in ${status}, without blocking late after-hooks`, async () => {
+    const h = harness(undefined, { toolPermissions: QUERY_PERMISSIONS });
+    await startRun(h);
+    await dispatch(h, 'graph-explorer');
+    await bindChild(h, 'reader', 'graph-explorer');
+    await h.enforcement.onToolBefore({ sessionID: 'reader', tool: QUERY_TOOL, callID: 'already-started' }, { args: {} });
+    h.store.getRun('root').status = status;
+    for (const sessionID of ['root', 'reader']) {
+      await assert.rejects(h.enforcement.onToolBefore({ sessionID, tool: QUERY_TOOL, callID: 'new-query' }, { args: {} }), /BINDING_UNAVAILABLE/);
+      const permission = { status: 'ask' };
+      await h.enforcement.onPermissionAsk({ sessionID, type: QUERY_TOOL }, permission);
+      assert.equal(permission.status, 'deny');
+      await assert.doesNotReject(h.enforcement.onToolBefore({ sessionID, tool: 'lsp', callID: 'lookup' }, { args: {} }));
+    }
+    await assert.doesNotReject(h.enforcement.onToolAfter({ sessionID: 'reader', tool: QUERY_TOOL, callID: 'already-started' }, {}));
+  });
+}
+
+test('role deny overrides native approval, and finished or revoked MCP dispatches stay closed', async () => {
+  const h = harness(undefined, { toolPermissions: { ...QUERY_PERMISSIONS, agents: { 'graph-planner': { [QUERY_TOOL]: 'deny' } } } });
+  await startRun(h);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'planner', 'graph-planner');
+  await assert.rejects(h.enforcement.onToolBefore({ sessionID: 'planner', tool: QUERY_TOOL }, { args: {} }), /TOOL_PERMISSION_DENIED/);
+  const permission = { status: 'allow' };
+  await h.enforcement.onPermissionAsk({ sessionID: 'planner', type: QUERY_TOOL }, permission);
+  assert.equal(permission.status, 'deny');
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'reader', 'graph-explorer');
+  await childIdle(h, 'reader');
+  await assert.rejects(h.enforcement.onToolBefore({ sessionID: 'reader', tool: QUERY_TOOL }, { args: {} }), /BINDING_UNAVAILABLE/);
+  await assert.doesNotReject(h.enforcement.onToolBefore({ sessionID: 'reader', tool: 'lsp' }, { args: {} }));
+  await dispatch(h, 'graph-explorer');
+  await bindChild(h, 'revoked-reader', 'graph-explorer');
+  const result = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs: SPECS }, ctx(h, 'planner', 'graph-planner')));
+  assert.equal(result.ok, true);
+  await assert.rejects(h.enforcement.onToolBefore({ sessionID: 'revoked-reader', tool: QUERY_TOOL }, { args: {} }), /BINDING_UNAVAILABLE/);
+});
+
+test('configured MCP stays closed for a rejected child and does not affect unmanaged native sessions', async () => {
+  const h = harness(undefined, { toolPermissions: QUERY_PERMISSIONS });
+  await startRun(h);
+  const rejected = await dispatch(h, 'graph-implementer', { nodeId: 'absent' });
+  assert.match(rejected.args.prompt, /RUNNER_REJECTED/);
+  await h.enforcement.onEvent({ event: { type: 'session.created', properties: { info: { id: 'rejected', parentID: 'root' } } } });
+  await assert.rejects(h.enforcement.onToolBefore({ sessionID: 'rejected', tool: QUERY_TOOL }, { args: {} }), /BINDING_UNAVAILABLE/);
+  await assert.doesNotReject(h.enforcement.onToolBefore({ sessionID: 'rejected', tool: 'lsp' }, { args: {} }));
+  h.client.session.get = async ({ path }) => ({ data: { id: path.id } });
+  const permission = { status: 'ask' };
+  await h.enforcement.onPermissionAsk({ sessionID: 'native-build', type: QUERY_TOOL }, permission);
+  assert.equal(permission.status, 'ask');
+  await assert.doesNotReject(h.enforcement.onToolBefore({ sessionID: 'native-build', tool: QUERY_TOOL }, { args: {} }));
+});
 
 async function startRun(h) {
   await h.enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });

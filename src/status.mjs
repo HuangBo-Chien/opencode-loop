@@ -98,7 +98,7 @@ function lessonsStatus(options, runtime, unavailable) {
   });
 }
 
-export function createStatusTool(options, journalService, lessonService = null) {
+export function createStatusTool(options, journalService, lessonService = null, getToolPermissions = () => null) {
   return tool({
     description: 'Report plugin capabilities and enforcement scope. Does not start, inspect, or mutate graph runs (use graph_inspect / graph_run_resume).',
     args: {},
@@ -121,6 +121,7 @@ export function createStatusTool(options, journalService, lessonService = null) 
           lessonUnavailable = true;
         }
       }
+      const toolPermissions = getToolPermissions();
       return JSON.stringify({
         package: 'opencode-loop', version,
         workflowMode: 'gated',
@@ -137,6 +138,7 @@ export function createStatusTool(options, journalService, lessonService = null) 
           maxImplementerParallel: options.maxImplementerParallel, maxPlanRevisions: options.maxPlanRevisions,
         },
         stateDirectory: options.stateDirectory,
+        toolPermissions: { validated: toolPermissions !== null, availabilityChecked: false, agents: toolPermissions ?? {} },
         journal: journalStatus(options, runtime, unavailable),
         lessons: lessonsStatus(options, lessonRuntime, lessonUnavailable),
       });
