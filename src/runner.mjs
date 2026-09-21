@@ -11,6 +11,7 @@
 //   artifacts invalidate downstream results conservatively.
 
 import { cleanJson } from './json-safe.mjs';
+import { artifactRef, canonicalRef, exactRef, lineageIndex, consumedRefs, publishArtifact, retainedLineage, validateRepairTargets, repairClosure, applyRepair, repairSettlementPending } from './artifact-dependencies.mjs';
 import { matchScopePath, normalizeScopePath, validateFileClaim, validateTaskGraph, validateDependencies, canonicalOutput, ARTIFACT_REF_PATTERN } from './task-spec.mjs';
 
 const READ_ONLY_AGENTS = new Set(['graph-explorer', 'graph-multimodal', 'graph-planner', 'graph-plan-critic']);
@@ -54,17 +55,6 @@ function baselineMatches(state, command) {
     && artifact.status === 'valid'
     && Array.isArray(artifact.payload?.commands)
     && artifact.payload.commands.some((entry) => entry?.command === command.command && entry?.exitCode === command.exitCode));
-}
-
-function artifactRef(state, ref) {
-  const atIndex = ref.lastIndexOf('@');
-  const name = atIndex === -1 ? ref : ref.slice(0, atIndex);
-  const version = atIndex === -1 ? null : Number(ref.slice(atIndex + 1));
-  const artifact = state.artifacts[name];
-  if (!artifact) return { missing: `artifact ${ref} does not exist` };
-  if (version !== null && artifact.version !== version) return { missing: `artifact ${ref} is not the current version (v${artifact.version})` };
-  if (artifact.status !== 'valid') return { missing: `artifact ${name}@${artifact.version} is ${artifact.status}` };
-  return { artifact };
 }
 
 // PASS/FAIL verification binding derives one artifact ref per dependsOn entry,
@@ -355,6 +345,7 @@ function archiveForReset(state, { reason, successorRunId, now }) {
 }
 
 function completeIfDone(state, now) {
+  if (state.repairPlanRevision) return false;
   const nodes = Object.values(state.nodes);
   if (nodes.length && nodes.every((node) => node.state === 'SUCCEEDED' || node.state === 'SKIPPED')) {
     state.status = 'SUCCEEDED';
@@ -402,12 +393,13 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         : [];
       return findings.length ? { reviseFindings: findings } : null;
     }
-    if (chosen.spec.kind === 'implement') {
+    if (chosen.spec.kind === 'implement' || chosen.spec.kind === 'verify') {
+      if (chosen.repairEvidence) return { repairEvidence: chosen.repairEvidence };
       const failures = Object.values(state.artifacts)
         .filter((artifact) => {
           if (artifact.kind !== 'verification' || artifact.payload?.verdict !== 'FAIL') return false;
           const verifier = state.nodes[artifact.nodeId];
-          return Array.isArray(verifier?.spec?.dependsOn) && verifier.spec.dependsOn.includes(chosen.spec.id);
+          return (artifact.payload.affectedNodeIds ?? artifact.payload.repairTargets ?? verifier?.spec?.dependsOn ?? []).includes(chosen.spec.id);
         })
         .sort((a, b) => b.version - a.version);
       const latest = failures[0];
@@ -429,6 +421,10 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   // Attempt exhaustion keeps sorted-path semantics: the node fails, and write
   // agents additionally fail the run.
   function admissibleNode(state, chosen, agent, now, checkDeps) {
+    if (repairSettlementPending(state, chosen.spec.id)) return { allowed: false, code: 'REPAIR_SETTLEMENT_PENDING', detail: `${chosen.spec.id} must await revoked host lifetimes and pending effects` };
+    if (state.repairPlanRevision && !['plan', 'explore', 'analyze'].includes(chosen.spec.kind)) {
+      return { allowed: false, code: 'PLAN_REVISION_REQUIRED', ...state.repairPlanRevision };
+    }
     if (!ELIGIBLE_STATES.has(chosen.state)) {
       return { allowed: false, code: 'NODE_NOT_ADMISSIBLE', detail: `${chosen.spec.id} is ${chosen.state} and cannot begin` };
     }
@@ -532,7 +528,13 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     if (state.status !== 'RUNNING') throw new Error('Node execution requires a RUNNING run; paused runs permit settlement only');
     const node = state.nodes[nodeId];
     if (!node) throw new Error(`Unknown node ${nodeId}`);
+    if (repairSettlementPending(state, nodeId)) throw new Error(`${nodeId} must await repair settlement before replacement`);
+    if (state.repairPlanRevision && !['plan', 'explore', 'analyze'].includes(node.spec.kind)) throw new Error(state.repairPlanRevision.detail);
     if (node.state !== 'PENDING' && node.state !== 'INCOMPLETE' && node.state !== 'STALE') throw new Error(`Node ${nodeId} is ${node.state} and cannot begin`);
+    const refs = consumedRefs(state, node);
+    assertSettlementCapacity({ ...state, nodes: { ...state.nodes, [nodeId]: { ...node, consumedRefs: refs } } });
+    node.consumedRefs = refs;
+    node.producedRef = null;
     node.state = 'RUNNING';
     node.attempt += 1;
     node.startedAt = now;
@@ -562,10 +564,11 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     if ([...nodes].some(([id, spec]) => id !== spec.id)) return { ok: false, code: 'INVALID_GRAPH', detail: 'Map keys must match TaskSpec node ids' };
     if (!Array.isArray(basedOn)) return { ok: false, code: 'INVALID_GRAPH', detail: 'plan.basedOn must be an array of artifact references' };
     const normalized = normalizePlanInputs(graph.nodes, version);
-    const plan = { kind: 'plan', nodeId: 'plan', version, basedOn, payload: { intent, specs: [...normalized.values()], parallel }, status: 'valid', createdAt: now };
+    const plan = { kind: 'plan', nodeId: 'plan', version, basedOn: basedOn.map((ref) => typeof ref === 'string' ? exactRef(state, ref) : ref), payload: { intent, specs: [...normalized.values()], parallel }, status: 'valid', createdAt: now };
     const artifacts = planArtifacts(state, plan);
     const liveness = validatePlanLiveness(normalized, artifacts, basedOn);
     if (!liveness.ok) return { ok: false, code: 'INVALID_GRAPH', detail: liveness.errors.join('; ') };
+    const artifactLineage = retainedLineage(state, artifacts, Object.fromEntries([...normalized].map(([id, spec]) => [id, { spec }])));
     state.mode = intent;
     state.status = 'RUNNING';
     state.blockedReason = null;
@@ -599,6 +602,8 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       }
     }
     state.artifacts = artifacts;
+    state.artifactLineage = artifactLineage;
+    state.repairPlanRevision = null;
     state.updatedAt = now;
     return { ok: true, version, mode: intent };
   }
@@ -614,10 +619,10 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     }
     const previous = state.artifacts.review;
     const version = previous ? previous.version + 1 : 1;
-    if (previous && previous.status === 'valid') previous.status = 'superseded';
 
     if (verdict === 'PASS') {
-      state.artifacts.review = { kind: 'review', nodeId: reviewNode.spec.id, version, basedOn: [`plan@${planVersion}`], payload: { verdict, findings, approvedParallel }, status: 'valid', createdAt: now };
+      publishArtifact(state, 'review', { kind: 'review', nodeId: reviewNode.spec.id, version, basedOn: reviewNode.consumedRefs ?? [`plan@${planVersion}`], payload: { verdict, findings, approvedParallel }, status: 'valid', createdAt: now });
+      reviewNode.producedRef = `review@${version}`;
       reviewNode.state = 'SUCCEEDED';
       reviewNode.finishedAt = now;
       completeIfDone(state, now);
@@ -625,8 +630,8 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       return { ok: true, effect: 'advance' };
     }
     if (verdict === 'REVISE') {
+      publishArtifact(state, 'review', { kind: 'review', nodeId: reviewNode.spec.id, version, basedOn: reviewNode.consumedRefs ?? [`plan@${planVersion}`], payload: { verdict, findings }, status: 'superseded', createdAt: now });
       state.revisionCounters['plan-review'] += 1;
-      state.artifacts.review = { kind: 'review', nodeId: reviewNode.spec.id, version, basedOn: [`plan@${planVersion}`], payload: { verdict, findings }, status: 'superseded', createdAt: now };
       plan.status = 'superseded';
       reviewNode.state = 'PENDING';
       reviewNode.finishedAt = now;
@@ -640,7 +645,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       return { ok: true, effect: 'revise' };
     }
     if (verdict === 'FAIL') {
-      state.artifacts.review = { kind: 'review', nodeId: reviewNode.spec.id, version, basedOn: [`plan@${planVersion}`], payload: { verdict, findings }, status: 'valid', createdAt: now };
+      publishArtifact(state, 'review', { kind: 'review', nodeId: reviewNode.spec.id, version, basedOn: reviewNode.consumedRefs ?? [`plan@${planVersion}`], payload: { verdict, findings }, status: 'valid', createdAt: now });
       reviewNode.state = 'PENDING';
       reviewNode.finishedAt = now;
       pauseForDecision(state, 'plan-rejected-by-critic', findings.length ? `plan rejected by critic: ${findings[0]}` : 'plan rejected by critic', now);
@@ -753,40 +758,43 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     const name = `change:${nodeId}`;
     const previous = state.artifacts[name];
     const version = previous ? previous.version + 1 : 1;
-    if (previous && previous.status === 'valid') previous.status = 'superseded';
-    const basedOn = state.artifacts.review?.status === 'valid'
+    const basedOn = node.consumedRefs ?? (state.artifacts.review?.status === 'valid'
       ? [`review@${state.artifacts.review.version}`]
-      : [`plan@${state.artifacts.plan?.version ?? 1}`];
-    state.artifacts[name] = { kind: 'change', nodeId, version, basedOn, payload: { filesTouched: checked.claimed, filesDeleted: [...new Set(filesDeleted)], summary, checksRun, unresolved, risks }, snapshot, status: 'valid', createdAt: now };
+      : [`plan@${state.artifacts.plan?.version ?? 1}`]);
+    publishArtifact(state, name, { kind: 'change', nodeId, version, basedOn, payload: { filesTouched: checked.claimed, filesDeleted: [...new Set(filesDeleted)], summary, checksRun, unresolved, risks }, snapshot, status: 'valid', createdAt: now });
+    node.producedRef = `${name}@${version}`;
     node.state = 'SUCCEEDED';
     node.lastFailure = null;
+    node.repairEvidence = null;
     node.finishedAt = now;
     state.updatedAt = now;
     return { ok: true, version };
   }
 
-  function supersedeChangeAndInvalidate(state, nodeId, now) {
-    const name = `change:${nodeId}`;
-    const change = state.artifacts[name];
-    if (change && change.status === 'valid') change.status = 'superseded';
-    for (const artifact of Object.values(state.artifacts)) {
-      if (artifact.status !== 'valid') continue;
-      if (artifact.kind === 'verification' && artifact.basedOn.some((ref) => ref === `${name}@${change?.version ?? 1}`)) {
-        artifact.status = 'stale';
-        const verifier = state.nodes[artifact.nodeId];
-        if (verifier && verifier.state === 'SUCCEEDED') {
-          verifier.state = 'STALE';
-          // Re-verification is new work against a new change version, not a
-          // retry of the invalidated attempt.
-          verifier.attempt = 0;
-          verifier.lastFailure = null;
-        }
+  function submitVerification(state, args) {
+    const checked = validateRepairTargets(state, args);
+    if (!checked.ok) return checked;
+    const candidate = structuredClone(state);
+    let result;
+    try {
+      result = verificationTransition(candidate, { ...args, effectiveTargets: checked.targets });
+      assertSettlementCapacity(candidate);
+    } catch (error) {
+      return { ok: false, code: 'PROVENANCE_CAPACITY', detail: `Verification could not fit durable evidence/provenance; revise the plan or inspect capacity: ${error.message}` };
+    }
+    // Preserve object identity for pure callers holding nodes/artifacts, and do
+    // not touch healthy siblings. Public callers publish this candidate to disk first.
+    for (const group of ['nodes', 'artifacts']) {
+      for (const [id, value] of Object.entries(candidate[group])) {
+        if (JSON.stringify(state[group][id]) === JSON.stringify(value)) candidate[group][id] = state[group][id];
+        else if (state[group][id]) { Object.assign(state[group][id], value); candidate[group][id] = state[group][id]; }
       }
     }
-    state.updatedAt = now;
+    Object.assign(state, candidate);
+    return result;
   }
 
-  function submitVerification(state, { nodeId, verdict, commands = [], artifacts = [], probed = [], skipped = [], changeRefs = null, summary = '', snapshot = {}, now }) {
+  function verificationTransition(state, { nodeId, verdict, commands = [], artifacts = [], probed = [], skipped = [], changeRefs = null, summary = '', snapshot = {}, effectiveTargets, now }) {
     if (state.status === 'AWAITING_USER_DECISION') return { ok: false, code: 'AWAITING_DECISION', detail: 'paused submissions are closeout evidence only' };
     if (TERMINAL_RUN.has(state.status)) return { ok: false, code: 'RUN_TERMINATED', detail: state.failReason ?? 'run already finished' };
     const node = state.nodes[nodeId];
@@ -803,8 +811,8 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       const name = `baseline:${nodeId}`;
       const previous = state.artifacts[name];
       const version = previous ? previous.version + 1 : 1;
-      if (previous && previous.status === 'valid') previous.status = 'superseded';
-      state.artifacts[name] = { kind: 'baseline', nodeId, version, basedOn: [], payload: { commands, summary }, status: 'valid', createdAt: now };
+      publishArtifact(state, name, { kind: 'baseline', nodeId, version, basedOn: node.consumedRefs ?? [], payload: { commands, summary }, status: 'valid', createdAt: now });
+      node.producedRef = `${name}@${version}`;
       node.state = 'SUCCEEDED';
       node.rejectionStreak = null;
       node.finishedAt = now;
@@ -832,10 +840,13 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       if (deliverableDeps.length && !artifacts.length) {
         return trackRejection(state, node, 'ARTIFACT_REQUIRED', `implement nodes with declared deliverables (${deliverableDeps.map((dep) => dep.spec.id).join(', ')}) require at least one artifact path (an existing evidence file) on PASS`, now);
       }
-      const refs = changeRefs ?? node.spec.dependsOn.map((dep) => depArtifactRef(state, dep));
+      const refs = changeRefs ?? node.consumedRefs ?? node.spec.dependsOn.map((dep) => depArtifactRef(state, dep));
+      const history = lineageIndex(state);
+      const consumed = new Set((node.consumedRefs ?? []).map(canonicalRef));
       for (const ref of refs) {
         const resolution = artifactRef(state, ref);
-        if (resolution.missing) {
+        const consumedHistory = consumed.has(canonicalRef(ref)) && history.get(canonicalRef(ref))?.status === 'valid';
+        if (resolution.missing && !consumedHistory) {
           // The streak identity is the raw missing-reason (guidance prose is
           // presentation only), so rewording the clause can never silently
           // reset a persisted streak.
@@ -846,15 +857,23 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       const name = `verification:${nodeId}`;
       const previous = state.artifacts[name];
       const version = previous ? previous.version + 1 : 1;
-      if (previous && previous.status === 'valid') previous.status = 'superseded';
-      state.artifacts[name] = { kind: 'verification', nodeId, version, basedOn: refs, payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot, status: 'valid', createdAt: now };
+      publishArtifact(state, name, { kind: 'verification', nodeId, version, basedOn: changeRefs ?? [...new Set([...(node.consumedRefs ?? []), ...refs])], payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot, status: 'valid', createdAt: now });
+      node.producedRef = `${name}@${version}`;
       node.state = 'SUCCEEDED';
+      node.repairEvidence = null;
       node.rejectionStreak = null;
       node.finishedAt = now;
       completeIfDone(state, now);
       return { ok: true, effect: 'advance' };
     }
     if (verdict === 'FAIL') {
+      const submittedAttempt = node.attempt;
+      const closure = repairClosure(state, effectiveTargets, nodeId);
+      const revision = applyRepair(state, closure, effectiveTargets, nodeId, now);
+      for (const id of closure.nodeIds) if (state.nodes[id]) state.nodes[id].repairEvidence = {
+        verifier: nodeId, directTarget: effectiveTargets.includes(id), summary: String(summary).slice(0, 500),
+        commands: commands.slice(0, 5).map((command) => `${String(command?.command ?? '').slice(0, 200)} (exit ${command?.exitCode ?? '?'})`),
+      };
       state.revisionCounters['implement-verify'] += 1;
       node.state = 'PENDING';
       node.rejectionStreak = null;
@@ -865,12 +884,14 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       const name = `verification:${nodeId}`;
       const previous = state.artifacts[name];
       const version = previous ? previous.version + 1 : 1;
-      if (previous && previous.status === 'valid') previous.status = 'superseded';
       const refs = node.spec.dependsOn.map((dep) => depArtifactRef(state, dep));
-      state.artifacts[name] = { kind: 'verification', nodeId, version, basedOn: refs, payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot, status: 'superseded', createdAt: now };
+      publishArtifact(state, name, { kind: 'verification', nodeId, version, basedOn: node.consumedRefs ?? refs, payload: { verdict, commands, summary, artifacts, probed, skipped,
+        repairTargets: effectiveTargets, affectedNodeIds: closure.nodeIds, invalidatedRefs: closure.refs, ...revision }, snapshot, status: 'superseded', createdAt: now });
+      const repair = { repairTargets: effectiveTargets, affectedNodeIds: closure.nodeIds, invalidatedRefs: closure.refs, ...revision };
       if (state.revisionCounters['implement-verify'] >= maxAttempts) {
+        node.attempt = submittedAttempt;
         pauseForDecision(state, 'verification-repair-exhausted', 'verification repair loop exhausted (maxAttempts reached)', now);
-        return { ok: true, effect: 'await-decision', detail: 'verification repair loop exhausted; awaiting user decision' };
+        return { ok: true, effect: 'await-decision', ...repair, detail: 'verification repair loop exhausted; awaiting user decision' };
       }
       // The next dispatch verifies a NEW change version the repair will mint;
       // the loop budget lives on revisionCounters['implement-verify'], so the
@@ -879,14 +900,8 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       // attempts only; FAIL repair rounds are capped by the runner-global
       // revision counter, not the node's attempt budget.
       node.attempt = 0;
-      const repairs = node.spec.dependsOn.map((dep) => state.nodes[dep]).filter((dep) => dep && dep.spec.kind === 'implement');
-      for (const repair of repairs) {
-        supersedeChangeAndInvalidate(state, repair.spec.id, now);
-        repair.state = 'PENDING';
-        repair.finishedAt = now;
-      }
       state.updatedAt = now;
-      return { ok: true, effect: 'repair', detail: 'verification failed; implementer repair dispatches will carry this evidence' };
+      return { ok: true, effect: 'repair', ...repair, detail: revision.detail ?? 'verification failed; affected repair dispatches will carry this evidence' };
     }
     // UNVERIFIED is honest uncertainty, not a work failure: the run pauses
     // for an explicit user decision (graph_run_decide) with the verdict and
@@ -898,9 +913,8 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       const name = `verification:${nodeId}`;
       const previous = state.artifacts[name];
       const version = previous ? previous.version + 1 : 1;
-      if (previous && previous.status === 'valid') previous.status = 'superseded';
       const refs = node.spec.dependsOn.map((dep) => depArtifactRef(state, dep));
-      state.artifacts[name] = { kind: 'verification', nodeId, version, basedOn: refs, payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot, status: 'superseded', createdAt: now };
+      publishArtifact(state, name, { kind: 'verification', nodeId, version, basedOn: node.consumedRefs ?? refs, payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot, status: 'superseded', createdAt: now });
       pauseForDecision(state, 'verification-unverified', summary || 'verifier could not verify', now);
       return { ok: true, effect: 'await-decision', detail: 'verification could not be completed; run paused for a user decision (evidence preserved)' };
     }
@@ -933,6 +947,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   function resumeRun(state, { now }) {
     if (TERMINAL_RUN.has(state.status)) return { ok: false, code: 'RUN_TERMINATED', changed: false };
     if (state.status === 'AWAITING_USER_DECISION') return { ok: false, code: 'AWAITING_DECISION', changed: false };
+    if (repairSettlementPending(state)) return { ok: false, code: 'REPAIR_SETTLEMENT_PENDING', changed: false };
     const report = { recovered: [], recoveryRequired: [] };
     for (const node of Object.values(state.nodes)) {
       if (node.state === 'RUNNING') {
@@ -981,7 +996,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         if (current === undefined || current !== recorded) {
           artifact.status = 'stale';
           const node = state.nodes[artifact.nodeId];
-          // Deliberate asymmetry with supersedeChangeAndInvalidate: drift
+          // Deliberate asymmetry with repair invalidation: drift
           // invalidation has no revision counter, so per-node attempts are
           // the only bound on repeated drift re-verification — they must NOT
           // be reset on this route.
@@ -1027,6 +1042,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     const checkDeps = dependencyChecker(state);
     const nodes = Object.values(state.nodes).map((node) => {
       const deps = checkDeps(node);
+      const settling = repairSettlementPending(state, node.spec.id);
       return {
         id: node.spec.id, kind: node.spec.kind, agent: node.spec.agent, state: node.state,
         attempt: node.attempt, maxAttempts: nodeMaxAttempts(node, maxAttempts),
@@ -1035,8 +1051,10 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         lastFailure: node.lastFailure ?? null,
         recoveryAction: node.state === 'FAILED' ? 'inspect-failure' : node.lastFailure?.retryable && node.state === 'RUNNING' ? 'correct-and-resubmit'
           : ['INCOMPLETE', 'RECOVERY_REQUIRED'].includes(node.state) || node.state === 'RUNNING' && !node.sessionId ? 'resume-then-fresh-session' : null,
-        ready: ELIGIBLE_STATES.has(node.state) && node.attempt < nodeMaxAttempts(node, maxAttempts) && deps.ok,
-        waitingOn: deps.ok ? [] : deps.missing,
+        ready: ELIGIBLE_STATES.has(node.state) && node.attempt < nodeMaxAttempts(node, maxAttempts) && deps.ok
+          && !settling && (!state.repairPlanRevision || ['plan', 'explore', 'analyze'].includes(node.spec.kind)),
+        waitingOn: [...deps.missing, ...(settling ? ['REPAIR_SETTLEMENT_PENDING: await revoked host lifetimes and pending effects'] : []),
+          ...(state.repairPlanRevision && !['plan', 'explore', 'analyze'].includes(node.spec.kind) ? [state.repairPlanRevision.detail] : [])],
         writeScope: node.spec.writeScope ?? [], reconcile: node.reconcile === true,
         ...nodeProgress(state, node),
       };
@@ -1049,6 +1067,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     return {
       runId: state.runId, status: state.status, mode: state.mode, failReason: state.failReason,
       pendingDecision: state.pendingDecision ?? null,
+      ...(state.repairPlanRevision ?? { needsPlanRevision: false, offendingRefs: [] }),
       closeouts: (state.closeouts ?? []).map(({ nodeId, dispatchId, tool, payload, at }) => ({ nodeId, dispatchId, tool, summary: payload.summary ?? null, at })),
       decision: state.decision ?? null,
       successorRunId: state.successorRunId ?? null,

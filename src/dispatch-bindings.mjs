@@ -121,6 +121,12 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       if (typeof callID !== 'string' || !callID.length || callID.length > 256 || used.includes(recordKey)) return denied('DUPLICATE_DISPATCH', 'a unique host callID is required, including after recovery');
       if (used.length >= 900) return denied('DISPATCH_LIMIT', 'run dispatch history reached its persistence-safe limit');
       if ([...records.values()].filter((r) => r.runId === root.runId).length >= 128) return denied('DISPATCH_LIMIT', 'too many outstanding task calls');
+      // Selective repair revokes authority without ending host lifetimes. Both
+      // fresh dispatch and task_id replacement wait for old calls AND effects.
+      if (target && ([...records.values()].some((r) => r.runId === root.runId && r.nodeId === target && r.repairRevoked)
+        || (state.pendingEffects ?? []).some((effect) => effect.nodeId === target && effect.repairRevoked))) {
+        return denied('REPAIR_SETTLEMENT_PENDING', `${target} has revoked host lifetimes or pending effects; wait for exact terminal/effect settlement before replacement`);
+      }
       // A free-role continuation keeps the session identity: round-1
       // planners, explorers and multimodal sessions are free-bound (no node
       // identity to resume), but their conversation can still pick up the
@@ -680,14 +686,19 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     });
   }
 
-  // Accepted plan replacement revokes execution, not native host lifetimes.
+  // Plan publication revokes all execution; repair selects only affected nodes.
+  // Neither transition ends native host lifetimes.
   // Save the candidate graph and revoked ledger before changing live authority.
-  async function revokeExecution(state) {
-    const dispatchReservations = [...records.values()].filter((r) => r.runId === state.runId).map((r) => ({ ...r, settlementOnly: true }));
+  async function revokeExecution(state, { nodeIds = null } = {}) {
+    const selected = nodeIds === null ? null : new Set(nodeIds);
+    const affected = (r) => r.runId === state.runId && (selected === null || selected.has(r.nodeId));
+    const revoked = (r) => affected(r) ? { ...r, settlementOnly: true, ...(selected ? { repairRevoked: true } : {}) } : { ...r };
+    const dispatchReservations = [...records.values()].filter((r) => r.runId === state.runId).map(revoked);
     await persist(state, undefined, { dispatchReservations,
-      settledDispatches: (state.settledDispatches ?? []).map((r) => ({ ...r, settlementOnly: true })) });
-    for (const record of records.values()) if (record.runId === state.runId) record.settlementOnly = true;
-    for (const binding of bindings.values()) if (!binding.root && binding.runId === state.runId) binding.settlementOnly = true;
+      ...(selected ? { pendingEffects: (state.pendingEffects ?? []).map((effect) => selected.has(effect.nodeId) ? { ...effect, repairRevoked: true } : effect) } : {}),
+      settledDispatches: (state.settledDispatches ?? []).map(revoked) }, selected !== null);
+    for (const record of records.values()) if (affected(record)) Object.assign(record, revoked(record));
+    for (const binding of bindings.values()) if (!binding.root && affected(binding)) Object.assign(binding, revoked(binding));
   }
 
   function invalidate(runId) {
@@ -760,6 +771,8 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     return [...records.values()].filter((r) => r.runId === runId).map((r) => ({
       callID: r.callID, nodeId: r.nodeId, agent: r.agent, sessionId: r.sessionId, bound: r.bound, continuation: r.continuation,
       resumed: r.resumed === true, targeted: r.targeted === true,
+      ...(r.repairRevoked ? { repairRevoked: true } : {}),
+      ...(r.settlementOnly ? { settlementOnly: true } : {}),
       errorCode: r.errorCode ?? null,
     }));
   }

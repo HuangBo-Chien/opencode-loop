@@ -48,6 +48,7 @@ function revisionPrompt(decision) {
     const commands = (evidence.commands ?? []).join('; ');
     return [
       `[RUNNER 修復要求] 前次驗證失敗(verifier ${evidence.verifier}):${evidence.summary || '(未附摘要)'}`,
+      evidence.directTarget === false ? '此節點是受影響的下游消費者:依新證據重新執行與驗證本節點,不要重做無關的已成功前置工作。' : '',
       commands ? `失敗命令:${commands}` : '',
     ].filter(Boolean).join('\n');
   }
