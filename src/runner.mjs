@@ -11,7 +11,7 @@
 //   artifacts invalidate downstream results conservatively.
 
 import { cleanJson } from './json-safe.mjs';
-import { matchScopePath, normalizeScopePath, validateFileClaim } from './task-spec.mjs';
+import { matchScopePath, normalizeScopePath, validateFileClaim, validateTaskGraph, validateDependencies, canonicalOutput, ARTIFACT_REF_PATTERN } from './task-spec.mjs';
 
 const READ_ONLY_AGENTS = new Set(['graph-explorer', 'graph-multimodal', 'graph-planner', 'graph-plan-critic']);
 const WRITE_AGENTS = new Set(['graph-implementer', 'graph-verifier']);
@@ -72,11 +72,10 @@ function artifactRef(state, ref) {
 // baseline verify deps mint baseline:<id>, other verify deps mint
 // verification:<id>. Verify nodes never produce change: artifacts, so a
 // verify→verify dependency must bind to the upstream verification instead.
+const verificationDependencyName = (spec, id) => spec?.kind === 'verify' ? canonicalOutput(spec) : `change:${id}`;
+
 function depArtifactRef(state, dep) {
-  const depNode = state.nodes[dep];
-  const name = depNode?.spec?.kind === 'verify'
-    ? (depNode.spec.baseline === true ? `baseline:${dep}` : `verification:${dep}`)
-    : `change:${dep}`;
+  const name = verificationDependencyName(state.nodes[dep]?.spec, dep);
   return `${name}@${state.artifacts[name]?.version ?? 1}`;
 }
 
@@ -110,18 +109,199 @@ function normalizePlanInputs(specs, version) {
   return rewritten;
 }
 
+const completedByPlan = (spec) => ['explore', 'analyze', 'plan'].includes(spec.kind);
+
+// A current explicit pin has a finite read window: its slot will be replaced
+// on the producer's next success. Protect that read in BOTH validation and
+// dispatch, including pinned provenance of pre-existing evidence. Unpinned
+// inputs may consume the replacement and need no direct read-before-write edge.
+function publicationReaders(nodes, artifacts) {
+  const readers = new Map([...nodes.keys()].map((id) => [id, new Map()]));
+  const producers = new Map([...nodes.values()].filter((node) => !completedByPlan(node.spec))
+    .map((node) => [canonicalOutput(node.spec), node.spec.id]));
+  // Every cache belongs to this calculation only. Publications, state changes
+  // and replans must be observed by the next inspection/admission/check.
+  const resolutions = new Map();
+  const resolve = (ref) => {
+    if (!resolutions.has(ref)) resolutions.set(ref, artifactRef({ artifacts }, ref));
+    return resolutions.get(ref);
+  };
+  const inputs = new Map([...nodes].map(([id, node]) => [id, new Set(node.spec.inputs ?? [])]));
+  // Only prerequisites that scheduling actually awaits can order a future
+  // publication before a read: dependsOn and currently unresolved inputs.
+  const prerequisites = new Map([...nodes].map(([id, node]) => [id, [
+    ...(node.spec.dependsOn ?? []),
+    ...[...inputs.get(id)].filter((ref) => resolve(ref).missing)
+      .map((ref) => producers.get(ref.split('@')[0])).filter(Boolean),
+  ]]));
+  function awaitsPublication(id, producer, seen = new Set()) {
+    const node = nodes.get(id);
+    if (!node || completedByPlan(node.spec) || ['SUCCEEDED', 'SKIPPED'].includes(node.state) || seen.has(id)) return false;
+    if (id === producer) return true;
+    seen.add(id);
+    return prerequisites.get(id).some((dep) => awaitsPublication(dep, producer, seen));
+  }
+  // Build the reachable provenance graph once. Propagate only pins naming a
+  // proposed publisher (at most one per node), rather than recursively copying
+  // entire historical chains for every ref. The worklist also handles shared
+  // ancestors and legacy provenance cycles without recursion or partial caches.
+  const sources = new Map();
+  const parents = new Map();
+  const provenance = new Map();
+  const work = [];
+  function collect(root) {
+    const pending = [root];
+    while (pending.length) {
+      const ref = pending.pop();
+      if (sources.has(ref)) continue;
+      const pins = new Set();
+      sources.set(ref, pins);
+      const { artifact } = resolve(ref);
+      if (!artifact) continue;
+      const [name, pin] = ref.split('@');
+      if (pin !== undefined && producers.has(name)) {
+        pins.add(name);
+        work.push([ref, name]);
+      }
+      // Current-plan publications have already consumed their provenance.
+      if (name === 'plan' || nodes.get(producers.get(name))?.state === 'SUCCEEDED') continue;
+      if (!provenance.has(artifact)) provenance.set(artifact, new Set(artifact.basedOn ?? []));
+      for (const source of provenance.get(artifact)) {
+        if (!parents.has(source)) parents.set(source, new Set());
+        parents.get(source).add(ref);
+        pending.push(source);
+      }
+    }
+  }
+  const reads = [];
+  for (const node of nodes.values()) {
+    if (completedByPlan(node.spec) || ['SUCCEEDED', 'SKIPPED'].includes(node.state)) continue;
+    for (const ref of inputs.get(node.spec.id)) {
+      const [name, pin] = ref.split('@');
+      // A latest-version read behind its producer consumes the replacement,
+      // not the old slot's provenance. Explicit old pins still need protection
+      // and will form a rejection cycle if replacement must happen first.
+      const producer = producers.get(name);
+      if (pin === undefined && producer && producer !== node.spec.id && awaitsPublication(node.spec.id, producer)) continue;
+      collect(ref);
+      reads.push([node.spec.id, ref]);
+    }
+  }
+  for (let index = 0; index < work.length; index++) {
+    const [ref, name] = work[index];
+    for (const parent of parents.get(ref) ?? []) {
+      if (!sources.get(parent).has(name)) {
+        sources.get(parent).add(name);
+        work.push([parent, name]);
+      }
+    }
+  }
+  for (const [id, ref] of reads) {
+    for (const name of sources.get(ref)) {
+      const producer = producers.get(name);
+      // Own-slot reads finish before the node's own publication. Overlapping
+      // refs need just one barrier per publisher/reader, with a witness ref.
+      if (producer !== id && !readers.get(producer).has(id)) readers.get(producer).set(id, { id, via: `preserve ${ref} before replacing ${name}` });
+    }
+  }
+  return new Map([...readers].map(([id, entries]) => [id, [...entries.values()]]));
+}
+
+// Project replacement effects without touching the accepted run. Status-only
+// propagation also prevents a previous PASS, based on the old approval/change,
+// from bootstrapping a new review. Historical payloads remain inspectable.
+function planArtifacts(state, plan) {
+  const artifacts = Object.fromEntries(Object.entries(state.artifacts).map(([name, artifact]) => [name, { ...artifact }]));
+  // Invalidate old provenance before installing the new plan, so an unpinned
+  // historical `plan` reference cannot silently rebind to the replacement.
+  for (const artifact of Object.values(artifacts)) {
+    if (artifact.status === 'valid' && ['plan', 'review', 'baseline'].includes(artifact.kind)) artifact.status = 'superseded';
+  }
+  let changed;
+  do {
+    changed = false;
+    for (const artifact of Object.values(artifacts)) {
+      if (artifact.status !== 'valid') continue;
+      if ((artifact.basedOn ?? []).some((ref) => artifactRef({ artifacts }, ref).missing)) {
+        artifact.status = 'stale';
+        changed = true;
+      }
+    }
+  } while (changed);
+  artifacts.plan = plan;
+  return artifacts;
+}
+
+function validatePlanLiveness(nodes, artifacts, basedOn) {
+  const errors = [];
+  const producers = new Map([...nodes.values()].filter((spec) => !completedByPlan(spec)).map((spec) => [canonicalOutput(spec), spec]));
+  const edges = new Map([...nodes].map(([id, spec]) => [id, spec.dependsOn.map((id) => ({ id, via: 'dependsOn' }))]));
+  function requireRef(id, ref, { historicalOnly = false, origin = 'input', planProvenance = false } = {}) {
+    if (typeof ref !== 'string' || !ARTIFACT_REF_PATTERN.test(ref)) {
+      errors.push(`${id}: invalid artifact reference ${String(ref)}`);
+      return;
+    }
+    const [name, pin] = ref.split('@');
+    const consumer = planProvenance ? null : nodes.get(id);
+    const resolution = artifactRef({ artifacts }, ref);
+    // Plan is installed by this submission, not a retained prior own output.
+    // Other valid own-slot evidence can be read before publishing its successor.
+    const submittedPlan = name === 'plan' && (consumer?.kind === 'plan' || planProvenance);
+    if (!resolution.missing && !submittedPlan) return;
+    if ((consumer && !['explore', 'analyze'].includes(consumer.kind) && canonicalOutput(consumer) === name)
+      || (planProvenance && name === 'plan')) {
+      errors.push(`${id} --${ref}--> ${id}: artifact dependency cycle (self-reference); remove this input or cite independent existing evidence`);
+      return;
+    }
+    const producer = producers.get(name);
+    const nextVersion = (artifacts[name]?.version ?? 0) + 1;
+    if (!historicalOnly && producer && (pin === undefined || Number(pin) === nextVersion)) {
+      edges.get(id).push({ id: producer.id, via: ref });
+      return;
+    }
+    errors.push(`${id}: ${origin} ${ref}: ${resolution.missing}; ${producer && !historicalOnly
+      ? `${producer.id} can publish only ${name}@${nextVersion} in this plan; correct the pin or use ${name}`
+      : 'no satisfiable future producer; submit currently-valid evidence first or correct the input/producer (explore/analyze nodes document existing findings, they do not publish on plan acceptance)'}`);
+  }
+  for (const spec of nodes.values()) {
+    for (const ref of spec.inputs ?? []) requireRef(spec.id, ref, { historicalOnly: completedByPlan(spec) });
+    // PASS derives evidence from every dependsOn entry, even without inputs.
+    // Keep this naming identical to submitVerification's default bindings.
+    if (spec.kind === 'verify' && spec.baseline !== true) {
+      for (const dep of spec.dependsOn) requireRef(spec.id, verificationDependencyName(nodes.get(dep), dep), { origin: `dependsOn ${dep} requires` });
+    }
+  }
+  for (const ref of basedOn) requireRef('plan.basedOn', ref, { historicalOnly: true, planProvenance: true });
+  if (errors.length) return { ok: false, errors };
+  const readers = publicationReaders(new Map([...nodes].map(([id, spec]) => [id, { spec, state: 'PENDING' }])), artifacts);
+  for (const [id, dependencies] of readers) edges.get(id).push(...dependencies);
+  return validateDependencies(nodes, (spec) => edges.get(spec.id));
+}
+
+function dependencyChecker(state) {
+  const readers = publicationReaders(new Map(Object.entries(state.nodes)), state.artifacts);
+  const results = new Map();
+  return (node) => {
+    if (results.has(node)) return results.get(node);
+    const missing = [];
+    for (const dep of new Set(node.spec.dependsOn ?? [])) {
+      const dependency = state.nodes[dep];
+      if (!dependency) missing.push(`dependency ${dep} does not exist`);
+      else if (dependency.state !== 'SUCCEEDED') missing.push(`dependency ${dep} is ${dependency.state}`);
+    }
+    for (const input of new Set(node.spec.inputs ?? [])) {
+      const resolution = artifactRef(state, input);
+      if (resolution.missing) missing.push(resolution.missing);
+    }
+    for (const reader of readers.get(node.spec.id) ?? []) missing.push(`${reader.id} must consume ${reader.via}`);
+    const result = { ok: missing.length === 0, missing };
+    results.set(node, result);
+    return result;
+  };
+}
+
 export function depsSatisfied(state, node) {
-  const missing = [];
-  for (const dep of node.spec.dependsOn ?? []) {
-    const dependency = state.nodes[dep];
-    if (!dependency) missing.push(`dependency ${dep} does not exist`);
-    else if (dependency.state !== 'SUCCEEDED') missing.push(`dependency ${dep} is ${dependency.state}`);
-  }
-  for (const input of node.spec.inputs ?? []) {
-    const resolution = artifactRef(state, input);
-    if (resolution.missing) missing.push(resolution.missing);
-  }
-  return { ok: missing.length === 0, missing };
+  return dependencyChecker(state)(node);
 }
 
 // Exhaustion and fundamental rejection no longer fail the run silently: the
@@ -248,11 +428,11 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   // Per-node admissibility shared by the sorted and coordinator-targeted paths.
   // Attempt exhaustion keeps sorted-path semantics: the node fails, and write
   // agents additionally fail the run.
-  function admissibleNode(state, chosen, agent, now) {
+  function admissibleNode(state, chosen, agent, now, checkDeps) {
     if (!ELIGIBLE_STATES.has(chosen.state)) {
       return { allowed: false, code: 'NODE_NOT_ADMISSIBLE', detail: `${chosen.spec.id} is ${chosen.state} and cannot begin` };
     }
-    const deps = depsSatisfied(state, chosen);
+    const deps = checkDeps(chosen);
     if (!deps.ok) {
       return { allowed: false, code: 'NODE_NOT_ADMISSIBLE', detail: `${chosen.spec.id} is not yet admissible: ${deps.missing.join(', ')}${artifactNameHint(deps.missing)}` };
     }
@@ -311,6 +491,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       return { allowed: false, code: 'ALREADY_RUNNING', detail: `a ${agent} task for this run is still in flight` };
     }
 
+    const checkDeps = dependencyChecker(state);
     // Coordinator-targeted dispatch: validate exactly the requested node so
     // the binding always matches the node the coordinator described.
     if (typeof nodeId === 'string' && nodeId.length) {
@@ -318,7 +499,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       if (!chosen) {
         return { allowed: false, code: 'NODE_NOT_FOUND', detail: `${nodeId} is not a ${agent} node in the current task graph` };
       }
-      return admissibleNode(state, chosen, agent, now);
+      return admissibleNode(state, chosen, agent, now, checkDeps);
     }
 
     // Concurrent reservations for the same role must not collide on one node:
@@ -327,7 +508,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       : Array.isArray(excludeNodeIds) ? new Set(excludeNodeIds) : null;
     const ready = mine
       .filter((node) => ELIGIBLE_STATES.has(node.state) && !(exclude?.has(node.spec.id) ?? false))
-      .map((node) => ({ node, deps: depsSatisfied(state, node) }))
+      .map((node) => ({ node, deps: checkDeps(node) }))
       .filter((entry) => entry.deps.ok)
       .sort((a, b) => a.node.attempt - b.node.attempt || a.node.spec.id.localeCompare(b.node.spec.id));
     if (!ready.length) {
@@ -337,14 +518,14 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       // bound review node, so an inadmissible review is rejected up front
       // instead of stranding a child that could never submit.
       if (READ_ONLY_AGENTS.has(agent) && agent !== 'graph-plan-critic') return { allowed: true, nodeId: null, free: true };
-      const waiting = mine.filter((node) => ELIGIBLE_STATES.has(node.state)).map((node) => `${node.spec.id}(${depsSatisfied(state, node).missing.join(', ') || 'no attempts left'})`);
+      const waiting = mine.filter((node) => ELIGIBLE_STATES.has(node.state)).map((node) => `${node.spec.id}(${checkDeps(node).missing.join(', ') || 'no attempts left'})`);
       return {
         allowed: false,
         code: 'NO_READY_NODE',
         detail: waiting.length ? `not yet admissible: ${waiting.join('; ')}${artifactNameHint(waiting)}` : `no admissible ${agent} node exists in the current task graph`,
       };
     }
-    return admissibleNode(state, ready[0].node, agent, now);
+    return admissibleNode(state, ready[0].node, agent, now, checkDeps);
   }
 
   function beginNode(state, nodeId, { now, sessionId = null, dispatchId = null }) {
@@ -376,18 +557,20 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     if (!(nodes instanceof Map) || nodes.size < 1) return { ok: false, code: 'INVALID_GRAPH', detail: 'nodes must be a non-empty validated graph' };
     const previous = state.artifacts.plan;
     const version = previous ? previous.version + 1 : 1;
-    if (previous && previous.status === 'valid') previous.status = 'superseded';
-    // Baseline evidence is plan-specific: a replaced plan must not let stale
-    // pre-change records tolerate failures under the new graph.
-    for (const artifact of Object.values(state.artifacts)) {
-      if (artifact.kind === 'baseline' && artifact.status === 'valid') artifact.status = 'superseded';
-    }
+    const graph = validateTaskGraph([...nodes.values()], { planOnly: intent === 'plan-only', light: intent === 'light' });
+    if (!graph.ok) return { ok: false, code: 'INVALID_GRAPH', detail: graph.errors.join('; ') };
+    if ([...nodes].some(([id, spec]) => id !== spec.id)) return { ok: false, code: 'INVALID_GRAPH', detail: 'Map keys must match TaskSpec node ids' };
+    if (!Array.isArray(basedOn)) return { ok: false, code: 'INVALID_GRAPH', detail: 'plan.basedOn must be an array of artifact references' };
+    const normalized = normalizePlanInputs(graph.nodes, version);
+    const plan = { kind: 'plan', nodeId: 'plan', version, basedOn, payload: { intent, specs: [...normalized.values()], parallel }, status: 'valid', createdAt: now };
+    const artifacts = planArtifacts(state, plan);
+    const liveness = validatePlanLiveness(normalized, artifacts, basedOn);
+    if (!liveness.ok) return { ok: false, code: 'INVALID_GRAPH', detail: liveness.errors.join('; ') };
     state.mode = intent;
     state.status = 'RUNNING';
     state.blockedReason = null;
 
     const preservedNodes = new Map(Object.values(state.nodes).map((node) => [node.spec.id, { attempt: node.attempt, sessionId: node.sessionId ?? null }]));
-    const normalized = normalizePlanInputs(nodes, version);
     state.nodes = {};
     for (const [id, spec] of normalized) {
       const preserved = preservedNodes.get(id);
@@ -415,7 +598,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         node.finishedAt = now;
       }
     }
-    state.artifacts.plan = { kind: 'plan', nodeId: 'plan', version, basedOn, payload: { intent, specs: [...normalized.values()], parallel }, status: 'valid', createdAt: now };
+    state.artifacts = artifacts;
     state.updatedAt = now;
     return { ok: true, version, mode: intent };
   }
@@ -571,7 +754,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     const previous = state.artifacts[name];
     const version = previous ? previous.version + 1 : 1;
     if (previous && previous.status === 'valid') previous.status = 'superseded';
-    const basedOn = state.artifacts.review
+    const basedOn = state.artifacts.review?.status === 'valid'
       ? [`review@${state.artifacts.review.version}`]
       : [`plan@${state.artifacts.plan?.version ?? 1}`];
     state.artifacts[name] = { kind: 'change', nodeId, version, basedOn, payload: { filesTouched: checked.claimed, filesDeleted: [...new Set(filesDeleted)], summary, checksRun, unresolved, risks }, snapshot, status: 'valid', createdAt: now };
@@ -841,8 +1024,9 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   }
 
   function inspect(state) {
+    const checkDeps = dependencyChecker(state);
     const nodes = Object.values(state.nodes).map((node) => {
-      const deps = depsSatisfied(state, node);
+      const deps = checkDeps(node);
       return {
         id: node.spec.id, kind: node.spec.kind, agent: node.spec.agent, state: node.state,
         attempt: node.attempt, maxAttempts: nodeMaxAttempts(node, maxAttempts),

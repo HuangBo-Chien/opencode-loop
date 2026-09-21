@@ -13,9 +13,13 @@ export const KIND_AGENTS = Object.freeze({
   implement: Object.freeze(['graph-implementer']),
   verify: Object.freeze(['graph-verifier']),
 });
-export const ARTIFACT_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}(@[0-9]+)?$/;
-const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const ID_SOURCE = '[A-Za-z0-9][A-Za-z0-9._:-]{0,127}';
+// Canonical prefixes are outside the node-id budget. Arbitrary names keep
+// their original bound; graph validation still enforces runner-owned names.
+const ARTIFACT_NAME_SOURCE = `(?:${ID_SOURCE}|(?:change|verification|baseline):${ID_SOURCE})`;
+export const ARTIFACT_REF_PATTERN = new RegExp(`^${ARTIFACT_NAME_SOURCE}(@[0-9]+)?$`);
+const ID_PATTERN = new RegExp(`^${ID_SOURCE}$`);
+const NAME_PATTERN = new RegExp(`^${ARTIFACT_NAME_SOURCE}$`);
 const MAX_TEXT = 2000;
 const MAX_SPECS = 64;
 
@@ -182,6 +186,50 @@ export function validateTaskSpec(spec, { maxAttemptsCeiling = 20 } = {}) {
   return { ok: errors.length === 0, errors, spec: { ...spec } };
 }
 
+export const canonicalOutput = (spec) => spec.kind === 'implement' ? `change:${spec.id}`
+  : spec.kind === 'verify' ? (spec.baseline === true ? `baseline:${spec.id}` : `verification:${spec.id}`)
+  : spec.kind === 'plan' ? 'plan' : spec.kind === 'review' ? 'review' : 'findings';
+
+// Structural and state-aware callers share the same labeled dependency walk.
+// getDeps must describe prerequisites the scheduler actually waits for; an
+// available historical input is not automatically an edge to its old producer.
+export function validateDependencies(nodes, getDeps = (spec) => spec.dependsOn.map((id) => ({ id, via: 'dependsOn' }))) {
+  const edges = new Map([...nodes].map(([id, spec]) => [id, getDeps(spec)]));
+  const visited = new Set();
+  const active = new Set();
+  const path = [];
+  function visit(id) {
+    if (visited.has(id)) return null;
+    active.add(id);
+    for (const edge of edges.get(id)) {
+      const step = `${id} --${edge.via}--> ${edge.id}`;
+      if (!nodes.has(edge.id)) return `${step}: unknown dependency`;
+      if (active.has(edge.id)) return `task graph contains a dependency cycle: ${[...path, step].join('; ')}; remove or correct the problematic input/dependency`;
+      path.push(step);
+      const error = visit(edge.id);
+      path.pop();
+      if (error) return error;
+    }
+    active.delete(id);
+    visited.add(id);
+    return null;
+  }
+  for (const id of nodes.keys()) {
+    const error = visit(id);
+    if (error) return { ok: false, errors: [error], order: null };
+  }
+  const order = [];
+  const pending = new Set(nodes.keys());
+  while (pending.size) {
+    const id = [...pending].sort().find((id) => edges.get(id).every((edge) => !pending.has(edge.id)));
+    pending.delete(id);
+    order.push(id);
+  }
+  return { ok: true, errors: [], order };
+}
+
+// This layer knows shapes, names and explicit dependencies, not run evidence
+// or runner-assigned versions. submitPlan performs effective liveness next.
 export function validateTaskGraph(specs, { planOnly = false, light = false, maxAttemptsCeiling = 20 } = {}) {
   const errors = [];
   if (!Array.isArray(specs) || specs.length < 1 || specs.length > MAX_SPECS) {
@@ -210,9 +258,6 @@ export function validateTaskGraph(specs, { planOnly = false, light = false, maxA
   // baseline:<id>); declared `outputs` must match them and `inputs` may only
   // reference them, so an input can never chase a name that nothing produces
   // and strand a node.
-  const canonicalOutput = (spec) => spec.kind === 'implement' ? `change:${spec.id}`
-    : spec.kind === 'verify' ? (spec.baseline === true ? `baseline:${spec.id}` : `verification:${spec.id}`)
-    : spec.kind === 'plan' ? 'plan' : spec.kind === 'review' ? 'review' : 'findings';
   for (const [id, spec] of byId) {
     const canonical = canonicalOutput(spec);
     for (const entry of spec.outputs ?? []) {
@@ -226,8 +271,9 @@ export function validateTaskGraph(specs, { planOnly = false, light = false, maxA
       const verificationTarget = name.startsWith('verification:') ? byId.get(name.slice('verification:'.length)) : null;
       const baselineTarget = name.startsWith('baseline:') ? byId.get(name.slice('baseline:'.length)) : null;
       const producible = name === 'findings' || name === 'plan' || name === 'review'
-        || changeTarget?.kind === 'implement' || verificationTarget?.kind === 'verify'
-        || (baselineTarget?.kind === 'verify' && baselineTarget.baseline === true);
+        || (name.startsWith('change:') && name.length > 7 && (!changeTarget || canonicalOutput(changeTarget) === name))
+        || (name.startsWith('verification:') && name.length > 13 && (!verificationTarget || canonicalOutput(verificationTarget) === name))
+        || (name.startsWith('baseline:') && name.length > 9 && (!baselineTarget || canonicalOutput(baselineTarget) === name));
       if (!producible) {
         errors.push(`${id}: inputs reference ${ref}, which no runner-managed artifact can satisfy; allowed names are findings, plan, review, change:<implement node id>, verification:<verify node id>, baseline:<baseline verify node id> (optional @version)`);
       }
@@ -235,32 +281,9 @@ export function validateTaskGraph(specs, { planOnly = false, light = false, maxA
   }
   if (errors.length) return { ok: false, errors, order: null, nodes: null };
 
-  // Kahn topological sort rejects cycles and yields a deterministic order.
-  const indegree = new Map([...byId.keys()].map((id) => [id, 0]));
-  const dependents = new Map([...byId.keys()].map((id) => [id, []]));
-  for (const [id, spec] of byId) {
-    for (const dep of spec.dependsOn) {
-      indegree.set(id, indegree.get(id) + 1);
-      dependents.get(dep).push(id);
-    }
-  }
-  const ready = [...byId.keys()].filter((id) => indegree.get(id) === 0).sort();
-  const order = [];
-  while (ready.length) {
-    const id = ready.shift();
-    order.push(id);
-    for (const next of dependents.get(id)) {
-      indegree.set(next, indegree.get(next) - 1);
-      if (indegree.get(next) === 0) {
-        ready.push(next);
-        ready.sort();
-      }
-    }
-  }
-  if (order.length !== byId.size) {
-    errors.push('task graph contains a dependency cycle');
-    return { ok: false, errors, order: null, nodes: null };
-  }
+  const dependencies = validateDependencies(byId);
+  if (!dependencies.ok) return { ...dependencies, nodes: null };
+  const { order } = dependencies;
 
   const kindCount = (kind) => [...byId.values()].filter((spec) => spec.kind === kind);
   const planNodes = kindCount('plan');

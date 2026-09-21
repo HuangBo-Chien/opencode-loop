@@ -63,6 +63,36 @@ async function bindChild(h, sessionId, agent, callID) {
   h.hostMessages.set(sessionId, messages);
   await h.enforcement.onChatMessage({ sessionID: sessionId, agent }, { message, parts });
 }
+
+test('A2 public invalid replacement preserves accepted run, disk and dispatch bindings', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-a2-atomic-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'planner', 'graph-planner');
+  let context = ctx(h, 'planner', 'graph-planner');
+  assert.equal(JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs: SPECS }, context)).ok, true);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'replanner', 'graph-planner');
+  context = ctx(h, 'replanner', 'graph-planner');
+  const state = h.store.getRun('root');
+  const before = structuredClone(state);
+  const bindings = structuredClone(h.bindings);
+  const dispatches = structuredClone(h.enforcement.dispatches.inspect('root'));
+  const path = join(dir, '.opencode-loop', 'runs', 'root.json');
+  const disk = await readFile(path, 'utf8');
+  for (const input of ['verification:verify-1', 'findings@99']) {
+    const specs = SPECS.map((s) => s.id === 'review-1' ? { ...s, inputs: [input] } : s);
+    const result = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs }, context));
+    assert.equal(result.code, 'INVALID_GRAPH', JSON.stringify(result));
+    assert.ok(result.detail.includes(input), result.detail);
+    assert.deepEqual(state, before);
+    assert.deepEqual(h.bindings, bindings);
+    assert.deepEqual(h.enforcement.dispatches.inspect('root'), dispatches);
+    assert.equal(await readFile(path, 'utf8'), disk);
+  }
+});
 async function childIdle(h, sessionId) {
   const messages = h.hostMessages.get(sessionId) ?? [];
   for (const user of messages.filter((m) => m.info.role === 'user')) {
@@ -1289,7 +1319,7 @@ test('custom artifact names are rejected at plan submission, not stranded at dis
   assert.equal(Object.keys(state.nodes).length, 0);
 });
 
-test('critic dispatch before findings exist is rejected up front with NO_READY_NODE', async (t) => {
+test('plan before required findings exist rejects early and a corrected resubmission completes', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'loop-critic-notready-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const h = harness(dir);
@@ -1297,19 +1327,23 @@ test('critic dispatch before findings exist is rejected up front with NO_READY_N
 
   await dispatch(h, 'graph-planner');
   await bindChild(h, 'child-planner', 'graph-planner');
+  const before = structuredClone(h.store.getRun('root'));
   const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS(['findings']) }, ctx(h, 'child-planner', 'graph-planner')));
-  assert.equal(plan.ok, true, JSON.stringify(plan));
+  assert.equal(plan.code, 'INVALID_GRAPH', JSON.stringify(plan));
+  assert.match(plan.detail, /findings/);
+  assert.deepEqual(h.store.getRun('root'), before);
 
   const blocked = await dispatch(h, 'graph-plan-critic');
   assert.match(blocked.args.prompt, /RUNNER_REJECTED/);
   assert.match(blocked.args.prompt, /NO_READY_NODE/);
-  assert.match(blocked.args.prompt, /resubmit a corrected plan/);
 
   // Registering findings unblocks the same dispatch path to completion.
   await dispatch(h, 'graph-explorer');
   await bindChild(h, 'child-explore', 'graph-explorer');
   await h.tools.graph_submit_findings.execute({ summary: 'late evidence', evidence: [] }, ctx(h, 'child-explore', 'graph-explorer'));
   await childIdle(h, 'child-explore');
+  const corrected = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS(['findings']) }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(corrected.ok, true, JSON.stringify(corrected));
   const admitted = await dispatch(h, 'graph-plan-critic');
   assert.ok(!admitted.args.prompt.includes('RUNNER_REJECTED'));
   await bindChild(h, 'child-critic', 'graph-plan-critic');
@@ -1417,7 +1451,8 @@ test('graph_run_decide preconditions: role, root, in-flight nodes and dispatches
 
   await dispatch(h, 'graph-planner');
   await bindChild(h, 'child-planner', 'graph-planner');
-  await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: DECIDE_SPECS }, ctx(h, 'child-planner', 'graph-planner'));
+  const accepted = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: DECIDE_SPECS.map((s) => ({ ...s, inputs: [] })) }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(accepted.ok, true, JSON.stringify(accepted));
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   const paused = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['wrong'] }, ctx(h, 'child-critic', 'graph-plan-critic')));
@@ -2201,7 +2236,8 @@ test('reset carry-over digest aggregates recent findings versions', async (t) =>
   await childIdle(h, 'child-explore');
   await dispatch(h, 'graph-planner');
   await bindChild(h, 'child-planner', 'graph-planner');
-  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'child-planner', 'graph-planner')));
+  const specs = PLAN_ONLY_SPECS().map((s) => s.kind === 'plan' ? { ...s, inputs: ['findings@2'] } : s);
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs }, ctx(h, 'child-planner', 'graph-planner')));
   assert.equal(plan.ok, true, JSON.stringify(plan));
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
@@ -2229,7 +2265,8 @@ test('reset carry-over learnings aggregate across versions, newest first', async
   await childIdle(h, 'child-explore');
   await dispatch(h, 'graph-planner');
   await bindChild(h, 'child-planner', 'graph-planner');
-  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'child-planner', 'graph-planner')));
+  const specs = PLAN_ONLY_SPECS().map((s) => s.kind === 'plan' ? { ...s, inputs: ['findings@2'] } : s);
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs }, ctx(h, 'child-planner', 'graph-planner')));
   assert.equal(plan.ok, true, JSON.stringify(plan));
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
@@ -2262,7 +2299,8 @@ test('reset carry-over learnings cap at 8 with the newest version draining first
   await childIdle(h, 'child-explore');
   await dispatch(h, 'graph-planner');
   await bindChild(h, 'child-planner', 'graph-planner');
-  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'child-planner', 'graph-planner')));
+  const specs = PLAN_ONLY_SPECS().map((s) => s.kind === 'plan' ? { ...s, inputs: ['findings@2'] } : s);
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs }, ctx(h, 'child-planner', 'graph-planner')));
   assert.equal(plan.ok, true, JSON.stringify(plan));
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
