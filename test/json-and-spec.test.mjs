@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { cleanJson, stableHash } from '../src/json-safe.mjs';
-import { validateTaskGraph, validateTaskSpec, matchScopePath, normalizeScopePath, runToken, expandRunTokens, KIND_AGENTS } from '../src/task-spec.mjs';
+import { validateTaskGraph, validateTaskSpec, validateDependencies, matchScopePath, normalizeScopePath, runToken, expandRunTokens, KIND_AGENTS } from '../src/task-spec.mjs';
 
 test('cleanJson freezes, sorts keys and rejects unsafe shapes', () => {
   const cleaned = cleanJson({ b: 1, a: { c: [1, 'x', null, true] } });
@@ -95,6 +95,37 @@ test('graph validation: order, cycles, unknown deps, mandatory gates', () => {
   const twoPlans = validateTaskGraph([baseSpec(), plan(), plan({ id: 'plan-2' }), review(), implement(), verify()]);
   assert.equal(twoPlans.ok, false);
   assert.match(twoPlans.errors.join('; '), /exactly one plan/);
+});
+
+test('A2 effective dependency walk uses getDeps for both ordering and cycle detection', () => {
+  const nodes = new Map([['a', { id: 'a' }], ['b', { id: 'b' }]]);
+  const good = validateDependencies(nodes, (s) => s.id === 'a' ? [{ id: 'b', via: 'verification:b' }] : []);
+  assert.deepEqual(good.order, ['b', 'a']);
+  const cycle = validateDependencies(nodes, (s) => [{ id: s.id === 'a' ? 'b' : 'a', via: `verification:${s.id === 'a' ? 'b' : 'a'}` }]);
+  assert.equal(cycle.ok, false);
+  assert.match(cycle.errors.join('; '), /a --verification:b--> b.*b --verification:a--> a/);
+});
+
+test('A2 structural naming distinguishes baseline from PASS and defers historical evidence to the runner', () => {
+  const specs = [plan(), review(), implement({ dependsOn: ['review-1', 'base'] }), verify(),
+    baseSpec({ id: 'base', kind: 'verify', agent: 'graph-verifier', baseline: true, dependsOn: ['review-1'], outputs: ['baseline:base'] })];
+  assert.equal(validateTaskGraph(specs.map((s) => s.id === 'impl-1' ? { ...s, inputs: ['verification:base'] } : s)).ok, false);
+  assert.equal(validateTaskGraph(specs.map((s) => s.id === 'review-1' ? { ...s, inputs: ['verification:historical@3'] } : s)).ok, true);
+});
+
+test('A2 quality M2: canonical name bounds include prefixes without expanding arbitrary names or ids', () => {
+  for (const [kind, prefix, baseline] of [['implement', 'change:', false], ['verify', 'verification:', false], ['verify', 'baseline:', true]]) {
+    const id = 'x'.repeat(128);
+    const producer = kind === 'implement' ? implement({ id, outputs: [`${prefix}${id}`] })
+      : verify({ id, baseline, outputs: [`${prefix}${id}`] });
+    assert.equal(validateTaskSpec(producer).ok, true, prefix);
+    assert.equal(validateTaskSpec(review({ inputs: [`${prefix}${id}@1`] })).ok, true, prefix);
+    assert.equal(validateTaskSpec({ ...producer, id: `${id}x` }).ok, false);
+    for (const bad of [`${prefix}${id}x`, `${prefix}${id}@bad`, `${prefix}${id}/x`, `custom:${id}`, 'z'.repeat(129)]) {
+      assert.equal(validateTaskSpec(review({ inputs: [bad] })).ok, false, bad);
+      assert.equal(validateTaskSpec({ ...producer, outputs: [bad] }).ok, false, bad);
+    }
+  }
 });
 
 test('plan-only graphs reject write nodes; write scopes must be pairwise disjoint', () => {

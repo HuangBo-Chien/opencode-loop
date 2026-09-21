@@ -10,6 +10,7 @@ import { firstOutOfScopeShellWrite } from './shell-scope.mjs';
 import { createDispatchBindings } from './dispatch-bindings.mjs';
 import { parseNodeIdHint, TARGET_REQUIRED_AGENTS } from './dispatch-target.mjs';
 import { formatLessonsBlock } from './lessons.mjs';
+import { assertSettlementCapacity, isUncertainEffect } from './runner.mjs';
 
 const READ_ONLY_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-multimodal']);
 // Tools that never mutate run state or the workspace stay available to graph
@@ -27,7 +28,8 @@ function rejectionPrompt(decision) {
 }
 
 function reconcilePrompt(state, nodeId) {
-  const effects = state.sideEffects.filter((effect) => effect.nodeId === nodeId).map((effect) => `${effect.tool}: ${effect.target}`);
+  const effects = state.sideEffects.filter((effect) => effect.nodeId === nodeId).map((effect) => `${effect.tool}: ${effect.target}${isUncertainEffect(effect) ? ' (uncertain error outcome; inspect actual effects)' : ''}`);
+  effects.push(...(state.pendingEffects ?? []).filter((effect) => effect.nodeId === nodeId).map((effect) => `${effect.tool}: ${effect.target} (outcome unknown; do not replay blindly)`));
   return [
     '[RUNNER 資訊] 此節點先前中斷且已有副作用紀錄;不可盲目重做。',
     `已紀錄的副作用:${effects.join('; ') || '(無)'}`,
@@ -93,6 +95,25 @@ function learningsPrompt(state) {
 
 export function createEnforcement({ settings, store, runner, bindings, client, dispatches = createDispatchBindings({ store, runner, bindings, client }), lessons = null }) {
   const deniedCalls = new Map();
+  const startedCalls = new Map();
+  const observedToolParts = new Map();
+  const recordedCalls = new Set();
+  const callKey = (sessionID, callID) => JSON.stringify([sessionID, callID]);
+  const settlementTools = new Set(['graph_submit_plan', 'graph_submit_review', 'graph_submit_change', 'graph_submit_verification', 'graph_submit_findings']);
+  const denialKinds = new Set(['out-of-scope-edit', 'out-of-scope-write', 'out-of-scope-bash', 'blocked-bash']);
+  function recorded(identity) {
+    recordedCalls.add(identity);
+    if (recordedCalls.size > 256) recordedCalls.delete(recordedCalls.values().next().value);
+  }
+
+  function canCloseout(binding, tool) {
+    return settlementTools.has(tool) && store.getRun(binding?.runId)?.status === 'AWAITING_USER_DECISION'
+      && !binding?.settlementOnly && dispatches.owns(binding, { settled: true });
+  }
+
+  function pausedEffect(binding, tool) {
+    return ['edit', 'write', 'bash'].includes(tool) && store.getRun(binding?.runId)?.status === 'AWAITING_USER_DECISION';
+  }
 
   // Known project lessons ride into explorer/planner/implementer dispatches.
   // The hot path stays embedding-free (ranking is mechanical: path overlap,
@@ -124,9 +145,19 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
   async function mutate(runId, mutation) {
     const state = store.getRun(runId);
     if (!state) return null;
-    const result = mutation(state);
-    await store.saveRun(state);
+    const saved = structuredClone(state);
+    const result = mutation(saved);
+    await store.saveRun(saved);
+    Object.assign(state, saved);
     return { state, result };
+  }
+
+  function rememberDenied(sessionId, callID, tool, target) {
+    const binding = bindings.get(sessionId);
+    const identity = { runId: binding.runId, nodeId: binding.nodeId ?? null,
+      dispatchId: binding.dispatchId, sessionId, callID, tool, target };
+    deniedCalls.set(callKey(sessionId, callID), identity);
+    return identity;
   }
 
   async function onChatMessage(input, output) {
@@ -163,6 +194,35 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
           }
           state.status = 'RECOVERY_REQUIRED';
           await store.saveRun(state);
+        }
+        if (state.status === 'AWAITING_USER_DECISION' || state.dispatchReservations?.some((r) => r.settlementOnly)) {
+          await dispatches.recoverPaused(state);
+        }
+        const pendingEffectsBeforeRecovery = state.pendingEffects?.length ?? 0;
+        for (const effect of (state.pendingEffects ?? []).slice(0, 128)) {
+          if (effect.runId === state.runId && typeof effect.sessionId === 'string' && typeof effect.callID === 'string') {
+            startedCalls.set(callKey(effect.sessionId, effect.callID), { ...effect });
+          }
+        }
+        await recoverEffectOutcomes(state);
+        // A durable tool outcome can remove the last blocker from a turn already
+        // witnessed above. Reconcile once in this same serialized restart rather
+        // than requiring another host event (which may never be delivered).
+        if (state.status === 'AWAITING_USER_DECISION' && (state.pendingEffects?.length ?? 0) < pendingEffectsBeforeRecovery) {
+          await dispatches.recoverPaused(state);
+        }
+        // The authoritative violation ledger already persists denied-call
+        // provenance. Rebuild only those identities, never execution authority.
+        for (const entry of state.violations) {
+          if (typeof entry.dispatchId !== 'string' || typeof entry.sessionId !== 'string' || typeof entry.callID !== 'string') continue;
+          const identity = callKey(entry.sessionId, entry.callID);
+          if (entry.kind === 'executed-despite-deny') {
+            deniedCalls.delete(identity);
+            recorded(identity);
+          } else if (denialKinds.has(entry.kind)) {
+            deniedCalls.set(identity, { runId: state.runId, nodeId: entry.nodeId, dispatchId: entry.dispatchId,
+              sessionId: entry.sessionId, callID: entry.callID, tool: entry.tool, target: entry.target });
+          }
         }
         bindings.set(sessionID, { runId: state.runId, agent, nodeId: null, root: true });
       } else {
@@ -239,7 +299,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       if (!binding?.root) return;
       const state = store.getRun(binding.runId);
       if (!state) return;
-      const args = output.args ?? {};
+      const args = output.args ??= {};
       const subagentType = typeof args.subagent_type === 'string' ? args.subagent_type : null;
       const target = parseNodeIdHint(args, { strict: TARGET_REQUIRED_AGENTS.has(subagentType) });
       const decision = target.allowed ? await dispatches.admit(sessionID, callID, args, target.nodeId) : target;
@@ -248,8 +308,9 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
           runner.recordViolation(state, { nodeId: null, kind: 'gate-blocked-dispatch', detail: `${subagentType}: ${decision.code} — ${decision.detail}`, now: NOW() });
           await store.saveRun(state);
         });
-        const { task_id: _oldSession, nodeId: _nodeId, ...freshArgs } = args;
-        output.args = { ...freshArgs, description: args.description ?? 'runner-rejected dispatch', prompt: rejectionPrompt(decision), subagent_type: subagentType ?? 'graph-explorer' };
+        delete args.task_id;
+        delete args.nodeId;
+        Object.assign(args, { description: args.description ?? 'runner-rejected dispatch', prompt: rejectionPrompt(decision), subagent_type: subagentType ?? 'graph-explorer' });
         return;
       }
       let prompt = typeof args.prompt === 'string' ? args.prompt : '';
@@ -266,6 +327,13 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
           // verifier probes them first instead of trusting green commands.
           const risks = [...new Set((spec.dependsOn ?? []).flatMap((dep) => state.artifacts[`change:${dep}`]?.payload?.risks ?? []))].slice(0, 16).map(String);
           if (risks.length) authoritative.push(`[RUNNER] implementer-reported risks (probe these first): ${risks.join(' | ')}`);
+          const dependencies = new Set(spec.dependsOn ?? []);
+          const uncertain = state.sideEffects.filter((effect) => dependencies.has(effect.nodeId) && isUncertainEffect(effect));
+          if (uncertain.length) {
+            const allTargets = [...new Set(uncertain.map((effect) => `${effect.nodeId} ${effect.tool}: ${String(effect.target).slice(0, 512)}`))];
+            const targets = allTargets.slice(0, 8);
+            authoritative.push(`[RUNNER] ${uncertain.length} uncertain tool outcome(s) across ${allTargets.length} target(s), ${targets.length} shown: ${targets.join(' | ')}. Full details remain in the run side-effect ledger. Errors may have no or partial effects; independently inspect these targets, including unclaimed paths, before PASS.`);
+          }
         }
         if (spec && spec.kind === 'plan') {
           const learnings = learningsPrompt(state);
@@ -289,14 +357,37 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
         const block = await dispatchLessonsBlock([], args.prompt);
         if (block) prompt = `${block}\n\n${prompt}`;
       }
-      output.args = { ...args, prompt };
+      prompt = prompt.replace(/\[RUNNER_TASK_CALL:[^\]\r\n]*\]/g, '');
+      // Native task execution retains the original args object across the hook.
+      args.prompt = `${prompt}\n[RUNNER_TASK_CALL:${decision.turnToken}]`;
       return;
     }
     if (tool === 'edit' || tool === 'write' || tool === 'bash') {
       const decision = decideWriteBinding(sessionID, tool, output.args);
-      if (!decision || decision.allowed) return;
-      deniedCalls.set(`${sessionID}:${callID}`, { tool, target: decision.target, callID });
-      runner.recordViolation(decision.state, { nodeId: decision.nodeId, kind: decision.kind, detail: decision.reason, now: NOW() });
+      if (!decision || decision.allowed) {
+        const binding = bindings.get(sessionID);
+        if (dispatches.current(binding) && binding.nodeId) {
+          const key = callKey(sessionID, callID);
+          const state = store.getRun(binding.runId);
+          if ((state.pendingEffects?.length ?? 0) >= 128 || startedCalls.has(key) || recordedCalls.has(key)
+            || state.sideEffects.some((effect) => effect.sessionId === sessionID && effect.callID === callID)) throw new Error('CALL_LEDGER_UNAVAILABLE: a fresh bounded host call identity is required');
+          const args = output.args ?? {};
+          const target = tool === 'bash' ? (typeof args.command === 'string' ? args.command.slice(0, 200) : null) : toWorkspaceRelative(args.filePath ?? args.path);
+          const observed = observedToolParts.get(key);
+          const started = { runId: binding.runId, nodeId: binding.nodeId, sessionId: sessionID, dispatchId: binding.dispatchId, tool, target, callID,
+            messageId: observed?.tool === tool ? observed.messageId : null,
+            partId: observed?.tool === tool ? observed.partId : null };
+          const saved = { ...state, pendingEffects: [...(state.pendingEffects ?? []), started] };
+          assertSettlementCapacity(saved);
+          await store.saveRun(saved);
+          state.pendingEffects = saved.pendingEffects;
+          state.updatedAt = saved.updatedAt;
+          startedCalls.set(key, started);
+        }
+        return;
+      }
+      const identity = rememberDenied(sessionID, callID, tool, decision.target);
+      runner.recordViolation(decision.state, { ...identity, kind: decision.kind, detail: decision.reason, now: NOW() });
       await store.saveRun(decision.state);
       // Hard block: the host's permission flow may auto-allow this call
       // (config defaults or manual approval at the native prompt), so the
@@ -324,7 +415,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     const { type, sessionID, callID } = input ?? {};
     const tool = type;
     if (tool !== 'edit' && tool !== 'write' && tool !== 'bash') return;
-    const key = `${sessionID}:${callID}`;
+    const key = callKey(sessionID, callID);
     const preDecided = deniedCalls.get(key);
     if (preDecided) {
       output.status = 'deny';
@@ -335,7 +426,8 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     const decision = decideWriteBinding(sessionID, tool, tool === 'bash' ? {} : args);
     if (decision && !decision.allowed) {
       output.status = 'deny';
-      runner.recordViolation(decision.state, { nodeId: decision.nodeId, kind: decision.kind, detail: `${decision.reason} (denied at permission prompt)`, now: NOW() });
+      const identity = rememberDenied(sessionID, callID, tool, decision.target);
+      runner.recordViolation(decision.state, { ...identity, kind: decision.kind, detail: `${decision.reason} (denied at permission prompt)`, now: NOW() });
       await store.saveRun(decision.state);
     }
   }
@@ -350,27 +442,78 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       return;
     }
     if (tool !== 'edit' && tool !== 'write' && tool !== 'bash') return;
-    const binding = bindings.get(sessionID);
-    if (!binding || binding.root || !binding.nodeId) return;
-    const key = `${sessionID}:${callID}`;
-    if (deniedCalls.has(key)) {
-      deniedCalls.delete(key);
-      await mutate(binding.runId, (state) => {
-        runner.recordViolation(state, { nodeId: binding.nodeId, kind: 'executed-despite-deny', detail: `${tool} ran even though the runner denied it`, now: NOW() });
-        // A denied call that ran anyway taints the attempt: strict failure,
-        // the same class as out-of-scope claims. Recovery is a fresh
-        // attempt (or a plan revision), never a resubmission of this one,
-        // so tainted work can never reach SUCCEEDED.
-        runner.taintAttempt(state, { nodeId: binding.nodeId, detail: `${tool} executed despite runner denial`, now: NOW() });
+    const evidenceKey = callKey(sessionID, callID);
+    if (recordedCalls.has(evidenceKey)) return;
+    const denied = deniedCalls.get(evidenceKey);
+    if (denied) {
+      if (denied.tool !== tool) return;
+      const saved = await mutate(denied.runId, (state) => {
+        runner.recordViolation(state, { ...denied, kind: 'executed-despite-deny', detail: `${tool} ran even though the runner denied it`, now: NOW() });
+        // Preserve late evidence on its original run/dispatch. Only that exact
+        // still-running attempt can be tainted, never a newer session reuse.
+        runner.taintAttempt(state, { ...denied, detail: `${tool} executed despite runner denial`, now: NOW() });
       });
+      if (saved) {
+        deniedCalls.delete(evidenceKey);
+        recorded(evidenceKey);
+      }
       return;
     }
-    const args = input.args ?? {};
-    const target = tool === 'bash'
-      ? (typeof args.command === 'string' ? args.command.slice(0, 200) : null)
-      : toWorkspaceRelative(args.filePath ?? args.path);
+    const started = startedCalls.get(evidenceKey);
+    // The current session binding cannot authenticate a callback from an old
+    // attempt. Missing before-hook provenance stays uncorrelated, even RUNNING.
+    if (!started || started.tool !== tool) return;
+    const binding = started;
+    if (!binding || binding.root || !binding.nodeId) return;
+    const target = started.target;
     if (target === null && tool !== 'bash') return;
-    await mutate(binding.runId, (state) => runner.recordSideEffect(state, { nodeId: binding.nodeId, tool, target, now: NOW() }));
+    const state = store.getRun(binding.runId);
+    if (!state) return;
+    if (state.sideEffects.some((effect) => effect.sessionId === sessionID && effect.callID === callID)) return;
+    const saved = { ...state, sideEffects: [...state.sideEffects],
+      pendingEffects: (state.pendingEffects ?? []).filter((effect) => callKey(effect.sessionId, effect.callID) !== evidenceKey) };
+    runner.recordSideEffect(saved, { nodeId: binding.nodeId, tool, target, now: NOW(), dispatchId: binding.dispatchId, callID, sessionId: sessionID,
+      messageId: started.messageId, partId: started.partId });
+    await store.saveRun(saved);
+    state.sideEffects = saved.sideEffects;
+    state.pendingEffects = saved.pendingEffects;
+    state.updatedAt = saved.updatedAt;
+    startedCalls.delete(evidenceKey);
+    recorded(evidenceKey);
+  }
+
+  async function settleEffectPart(part) {
+    const identity = callKey(part?.sessionID, part?.callID);
+    const effect = startedCalls.get(identity);
+    if (!effect || effect.tool !== part.tool || !['completed', 'error'].includes(part.state?.status)
+      || !Number.isFinite(part.state.time?.end) || typeof part.id !== 'string' || typeof part.messageID !== 'string'
+      || part.id.length > 256 || part.messageID.length > 256
+      || effect.messageId && effect.messageId !== part.messageID || effect.partId && effect.partId !== part.id) return;
+    const state = store.getRun(effect.runId);
+    const saved = { ...state, sideEffects: [...state.sideEffects],
+      pendingEffects: (state.pendingEffects ?? []).filter((p) => callKey(p.sessionId, p.callID) !== identity) };
+    runner.recordSideEffect(saved, { ...effect, now: NOW(), messageId: part.messageID, partId: part.id,
+      outcome: part.state.status, uncertain: part.state.status === 'error' });
+    await store.saveRun(saved);
+    Object.assign(state, { sideEffects: saved.sideEffects, pendingEffects: saved.pendingEffects, updatedAt: saved.updatedAt });
+    startedCalls.delete(identity);
+    recorded(identity);
+  }
+
+  async function recoverEffectOutcomes(state) {
+    if (!client?.session?.messages) return;
+    const signal = AbortSignal.timeout(2000);
+    for (const sessionId of new Set((state.pendingEffects ?? []).map((effect) => effect.sessionId))) {
+      let messages;
+      try { messages = (await client.session.messages({ path: { id: sessionId }, query: { limit: 64 }, signal })).data; }
+      catch { continue; }
+      for (const message of Array.isArray(messages) ? messages.slice(-64) : []) {
+        if (message.info?.sessionID !== sessionId || !Array.isArray(message.parts) || message.parts.length > 256) continue;
+        for (const part of message.parts) {
+          if (part.type === 'tool' && part.sessionID === sessionId && part.messageID === message.info.id) await settleEffectPart(part);
+        }
+      }
+    }
   }
 
   async function onEvent(input) {
@@ -379,7 +522,25 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     const { type, properties } = event;
 
     if (type === 'session.created' || type === 'session.updated') return dispatches.onSession(properties?.info);
-    if (type === 'message.part.updated') return dispatches.onPart(properties?.part);
+    if (type === 'message.updated') return dispatches.onMessage(properties?.info);
+    if (type === 'message.part.updated') {
+      const part = properties?.part;
+      if (part?.tool === 'task') return dispatches.onPart(part);
+      if (part?.type === 'tool' && ['edit', 'write', 'bash'].includes(part.tool)
+        && ['pending', 'running'].includes(part.state?.status) && typeof part.sessionID === 'string'
+        && typeof part.callID === 'string' && typeof part.messageID === 'string' && part.messageID.length <= 256
+        && typeof part.id === 'string' && part.id.length <= 256) {
+        const identity = callKey(part.sessionID, part.callID);
+        if (!observedToolParts.has(identity)) observedToolParts.set(identity, { tool: part.tool, messageId: part.messageID, partId: part.id });
+        if (observedToolParts.size > 256) observedToolParts.delete(observedToolParts.keys().next().value);
+      }
+      const effect = startedCalls.get(callKey(part?.sessionID, part?.callID));
+      if (effect && part?.type === 'tool') {
+        await dispatches.exclusive(effect.runId, () => settleEffectPart(part));
+        await dispatches.onMessage({ id: part.messageID, sessionID: part.sessionID });
+      }
+      return;
+    }
     // Pinned host emits both status(idle) and idle for one transition. Consume
     // only the latter or a continuation would be completed twice.
     if (type === 'session.idle') return dispatches.onIdle(properties?.sessionID, event.id);
@@ -390,7 +551,8 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     await dispatches.ensureSession(sessionID);
     const binding = bindings.get(sessionID);
     const work = () => {
-      if (requireActive && !binding?.root && dispatches.managed(sessionID) && !dispatches.current(binding)) {
+      if (requireActive && pausedEffect(binding, input?.tool)) throw new Error('BINDING_UNAVAILABLE: the run is paused; only settlement of already-started work is permitted');
+      if (requireActive && !binding?.root && dispatches.managed(sessionID) && !dispatches.current(binding) && !canCloseout(binding, input?.tool)) {
         throw new Error('BINDING_UNAVAILABLE: this session has no active, verified dispatch (its previous dispatch finished, was rejected, or was revoked); stop working, report this reason back, and let the coordinator re-dispatch');
       }
       return operation(input, output);
@@ -399,11 +561,22 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
   }
 
   return Object.freeze({
-    onChatMessage: (input, output) => dispatches.exclusive(bindings.get(input?.sessionID)?.runId ?? input?.sessionID, () => onChatMessage(input, output)),
+    onChatMessage: (input, output) => (input?.agent ?? output?.message?.agent) === 'graph-orchestrator'
+      ? dispatches.exclusive(bindings.get(input?.sessionID)?.runId ?? input?.sessionID, () => onChatMessage(input, output))
+      : dispatches.onUserPrompt(output?.message, output?.parts),
     onToolBefore: (input, output) => input?.tool === 'task' ? onToolBefore(input, output) : childOperation(input, output, onToolBefore, !READ_ONLY_TOOLS.has(input?.tool)),
-    onToolAfter: (input, output) => input?.tool === 'task' ? onToolAfter(input, output) : childOperation(input, output, onToolAfter),
+    onToolAfter: async (input, output) => {
+      if (input?.tool === 'task') return onToolAfter(input, output);
+      const identity = callKey(input?.sessionID, input?.callID);
+      const captured = deniedCalls.get(identity) ?? startedCalls.get(identity);
+      const result = await (captured ? dispatches.exclusive(captured.runId, () => onToolAfter(input, output)) : childOperation(input, output, onToolAfter));
+      const state = store.getRun(captured?.runId ?? bindings.get(input?.sessionID)?.runId);
+      if (state?.status === 'AWAITING_USER_DECISION' || state?.pendingIdleEvidence?.length) await dispatches.reconcileSession(input?.sessionID);
+      return result;
+    },
     onPermissionAsk: (input, output) => childOperation(input, output, async (i, o) => {
-      if (!READ_ONLY_TOOLS.has(i?.type) && dispatches.managed(i?.sessionID) && !bindings.get(i.sessionID)?.root && !dispatches.current(bindings.get(i.sessionID))) { o.status = 'deny'; return; }
+      if (pausedEffect(bindings.get(i?.sessionID), i?.type)) { o.status = 'deny'; return; }
+      if (!READ_ONLY_TOOLS.has(i?.type) && dispatches.managed(i?.sessionID) && !bindings.get(i.sessionID)?.root && !dispatches.current(bindings.get(i.sessionID)) && !canCloseout(bindings.get(i.sessionID), i?.type)) { o.status = 'deny'; return; }
       return onPermissionAsk(i, o);
     }),
     onEvent, dispatches,

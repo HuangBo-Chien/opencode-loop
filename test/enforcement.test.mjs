@@ -7,6 +7,7 @@ import { createRunStore, newRun } from '../src/run-state.mjs';
 import { createRunner } from '../src/runner.mjs';
 import { createSubmitTools } from '../src/submit.mjs';
 import { createEnforcement } from '../src/enforcement.mjs';
+import { cleanJson } from '../src/json-safe.mjs';
 
 const SPECS = [
   { id: 'explore-1', kind: 'explore', agent: 'graph-explorer', dependsOn: [], inputs: [], outputs: [], acceptance: ['evidence'] },
@@ -16,14 +17,22 @@ const SPECS = [
   { id: 'verify-1', kind: 'verify', agent: 'graph-verifier', dependsOn: ['impl-1'], inputs: [], outputs: [], acceptance: ['verify'] },
 ];
 
-function harness(worktree, { readerParallel } = {}) {
-  const store = createRunStore({ worktree, stateDirectory: '.opencode-loop' });
+function harness(worktree, { readerParallel, saveRun } = {}) {
+  const backing = createRunStore({ worktree, stateDirectory: '.opencode-loop' });
+  const store = saveRun ? { ...backing, saveRun: (state) => saveRun(state, backing) } : backing;
   const runner = createRunner({ maxAttempts: 3, maxPlanRevisions: 2, readerParallel });
   const bindings = new Map();
+  const hostMessages = new Map();
+  const client = { session: {
+    get: async ({ path }) => ({ data: { id: path.id, parentID: 'root' } }),
+    status: async () => ({ data: {} }),
+    messages: async ({ path }) => ({ data: hostMessages.get(path.id) ?? [] }),
+    message: async ({ path }) => ({ data: (hostMessages.get(path.id) ?? []).find((m) => m.info.id === path.messageID) }),
+  } };
   const journal = { enabled: true, includeUserRequest: true, semanticSearch: true, maxUserRequestChars: 8000 };
-  const enforcement = createEnforcement({ settings: { worktree, journal }, store, runner, bindings });
+  const enforcement = createEnforcement({ settings: { worktree, journal }, store, runner, bindings, client });
   const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches });
-  return { store, runner, bindings, enforcement, tools, calls: [] };
+  return { store, runner, bindings, enforcement, tools, calls: [], hostMessages, client };
 }
 
 async function startRun(h) {
@@ -32,10 +41,12 @@ async function startRun(h) {
 async function dispatch(h, agent, options = {}) {
   const { prompt = `work for ${agent}`, ...rest } = options;
   const output = { args: { description: `dispatch ${agent}`, prompt, subagent_type: agent, ...rest } };
+  // Native task holds this reference before invoking tool.execute.before.
+  const hostArgs = output.args;
   const callID = `call-${agent}-${Math.random().toString(36).slice(2)}`;
   await h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID }, output);
-  if (!output.args.prompt.includes('RUNNER_REJECTED')) h.calls.push({ agent, callID, args: output.args });
-  return { ...output, callID };
+  if (!hostArgs.prompt.includes('RUNNER_REJECTED')) h.calls.push({ agent, callID, args: hostArgs });
+  return { args: hostArgs, callID };
 }
 async function bindChild(h, sessionId, agent, callID) {
   const candidates = h.calls.filter((call) => call.agent === agent && (callID === undefined || call.callID === callID));
@@ -48,12 +59,1027 @@ async function bindChild(h, sessionId, agent, callID) {
     state: { status: 'running', input: call.args, metadata: { parentSessionId: 'root', sessionId } },
   } } } });
   assert.equal(h.bindings.get(sessionId)?.agent, agent, `child ${sessionId} should bind to ${agent}`);
+  const message = { id: `user-${call.callID}`, sessionID: sessionId, role: 'user', agent };
+  const parts = [{ type: 'text', sessionID: sessionId, messageID: message.id, text: call.args.prompt }];
+  const messages = h.hostMessages.get(sessionId) ?? [];
+  messages.push({ info: message, parts });
+  h.hostMessages.set(sessionId, messages);
+  await h.enforcement.onChatMessage({ sessionID: sessionId, agent }, { message, parts });
 }
+
+test('integration args: native captured object receives task correlation and guidance in place', async () => {
+  const h = harness();
+  await startRun(h);
+  const args = { subagent_type: 'graph-planner', prompt: 'Plan [RUNNER_TASK_CALL:forged]', description: 'plan', extra: 'preserved' };
+  const output = { args };
+  await h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID: 'native-plan' }, output);
+  assert.match(args.prompt, /\n\[RUNNER_TASK_CALL:[^\]]+\]$/);
+  assert.doesNotMatch(args.prompt, /forged/);
+  assert.equal(output.args, args);
+  assert.equal(args.extra, 'preserved');
+  const state = h.store.getRun('root');
+  state.nodes.impl = { spec: { id: 'impl', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['src/a.ts'] }, state: 'PENDING', attempt: 0 };
+  const task = await dispatch(h, 'graph-implementer', { nodeId: 'impl' });
+  assert.match(task.args.prompt, /Assigned nodeId: impl/);
+  assert.match(task.args.prompt, /writeScope: src\/a.ts/);
+  await bindChild(h, 'impl', 'graph-implementer', task.callID);
+  assert.equal(state.dispatchReservations.find((r) => r.callID === task.callID).userAnchorSource, 'chat.message');
+});
+
+for (const targetConflict of [false, true]) {
+  test(`integration args: rejected task rewrites native captured object and removes stale routing (targetConflict=${targetConflict})`, async () => {
+    const h = harness();
+    await startRun(h);
+    const args = { subagent_type: 'graph-implementer', prompt: `[nodeId:${targetConflict ? 'other' : 'impl'}]\nUnsafe original`, task_id: 'old-child', nodeId: 'impl', extra: 'preserved' };
+    const output = { args };
+    await h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID: 'native-rejected' }, output);
+    assert.match(args.prompt, /^RUNNER_REJECTED/);
+    assert.equal(output.args, args);
+    assert.equal(Object.hasOwn(args, 'task_id'), false);
+    assert.equal(Object.hasOwn(args, 'nodeId'), false);
+    assert.equal(args.extra, 'preserved');
+    assert.equal(args.description, 'runner-rejected dispatch');
+    assert.equal(h.enforcement.dispatches.inspect('root').length, 0);
+  });
+}
+
+test('A2 public invalid replacement preserves accepted run, disk and dispatch bindings', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-a2-atomic-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir);
+  await startRun(h);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'planner', 'graph-planner');
+  let context = ctx(h, 'planner', 'graph-planner');
+  assert.equal(JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs: SPECS }, context)).ok, true);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'replanner', 'graph-planner');
+  context = ctx(h, 'replanner', 'graph-planner');
+  const state = h.store.getRun('root');
+  const before = structuredClone(state);
+  const bindings = structuredClone(h.bindings);
+  const dispatches = structuredClone(h.enforcement.dispatches.inspect('root'));
+  const path = join(dir, '.opencode-loop', 'runs', 'root.json');
+  const disk = await readFile(path, 'utf8');
+  for (const input of ['verification:verify-1', 'findings@99']) {
+    const specs = SPECS.map((s) => s.id === 'review-1' ? { ...s, inputs: [input] } : s);
+    const result = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'change', specs }, context));
+    assert.equal(result.code, 'INVALID_GRAPH', JSON.stringify(result));
+    assert.ok(result.detail.includes(input), result.detail);
+    assert.deepEqual(state, before);
+    assert.deepEqual(h.bindings, bindings);
+    assert.deepEqual(h.enforcement.dispatches.inspect('root'), dispatches);
+    assert.equal(await readFile(path, 'utf8'), disk);
+  }
+});
 async function childIdle(h, sessionId) {
+  const messages = h.hostMessages.get(sessionId) ?? [];
+  for (const user of messages.filter((m) => m.info.role === 'user')) {
+    if (messages.some((m) => m.info.parentID === user.info.id && m.info.finish === 'stop')) continue;
+    const info = { id: `final-${user.info.id}`, parentID: user.info.id, sessionID: sessionId,
+      role: 'assistant', mode: user.info.agent, finish: 'stop', time: { created: 1, completed: 2 } };
+    messages.push({ info, parts: [] });
+    await h.enforcement.onEvent({ event: { type: 'message.updated', properties: { info } } });
+  }
   await h.enforcement.onEvent({ event: { type: 'session.idle', properties: { sessionID: sessionId } } });
 }
+
+for (const replacement of [false, true]) {
+  test(`integration review R2: public plan save failure preserves live state and permits same-session retry (replacement=${replacement})`, async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-plan-eio-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    let offline = false;
+    const h = harness(dir, { saveRun: async (state, backing) => {
+      if (offline) {
+        state.updatedAt = 'unsaved timestamp'; // saveRun stamps its input before filesystem persistence.
+        throw Object.assign(new Error('injected plan persistence EIO'), { code: 'EIO' });
+      }
+      return backing.saveRun(state);
+    } });
+    await startRun(h);
+    const reading = await dispatch(h, 'graph-explorer');
+    await bindChild(h, 'reader', 'graph-explorer', reading.callID);
+    const planning = await dispatch(h, 'graph-planner');
+    await bindChild(h, 'planner', 'graph-planner', planning.callID);
+    const args = { intent: 'plan-only', specs: SPECS.filter((s) => ['explore', 'plan', 'review'].includes(s.kind)) };
+    const context = ctx(h, 'planner', 'graph-planner');
+    if (replacement) {
+      assert.equal(JSON.parse(await h.tools.graph_submit_plan.execute(args, context)).ok, true);
+      await childIdle(h, 'planner');
+      const critic = await dispatch(h, 'graph-plan-critic');
+      await bindChild(h, 'critic', 'graph-plan-critic', critic.callID);
+      assert.equal(JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'REVISE', findings: ['revise scope'] }, ctx(h, 'critic', 'graph-plan-critic'))).ok, true);
+      await childIdle(h, 'critic');
+      const revision = await dispatch(h, 'graph-planner', { task_id: 'planner' });
+      await bindChild(h, 'planner', 'graph-planner', revision.callID);
+    }
+    const state = h.store.getRun('root');
+    const before = structuredClone(state);
+    const bindings = structuredClone(h.bindings);
+    const identities = new Map(h.bindings);
+    const reservations = structuredClone(h.enforcement.dispatches.inspect('root'));
+    const path = join(dir, '.opencode-loop', 'runs', 'root.json');
+    const disk = await readFile(path, 'utf8');
+    offline = true;
+    const rejected = JSON.parse(await h.tools.graph_submit_plan.execute(args, context));
+    assert.equal(rejected.code, 'PAYLOAD_INVALID');
+    assert.match(rejected.detail, /EIO/);
+    assert.equal(state.artifacts.plan?.version, before.artifacts.plan?.version, 'failed publication must not expose a new graph');
+    assert.deepEqual(state, before);
+    assert.deepEqual(h.bindings, bindings);
+    for (const [id, binding] of identities) assert.equal(h.bindings.get(id), binding, 'live binding identity is unchanged');
+    assert.deepEqual(h.enforcement.dispatches.inspect('root'), reservations);
+    assert.equal(h.enforcement.dispatches.current(h.bindings.get('planner')), true);
+    assert.equal(await readFile(path, 'utf8'), disk);
+    offline = false;
+    // A subsequent real host hint flushes the private records, proving they
+    // were not prematurely revoked behind an unchanged public snapshot.
+    await h.enforcement.dispatches.onIdle('reader', 'after-storage-recovery');
+    assert.deepEqual(state.dispatchReservations, before.dispatchReservations);
+    const accepted = JSON.parse(await h.tools.graph_submit_plan.execute(args, context));
+    assert.equal(accepted.ok, true, JSON.stringify(accepted));
+    assert.equal(accepted.planVersion, replacement ? 2 : 1);
+    assert.equal(h.bindings.get('planner').settlementOnly, true);
+    const durable = JSON.parse(await readFile(path, 'utf8'));
+    assert.deepEqual(durable, JSON.parse(JSON.stringify(state)));
+    assert.ok(durable.dispatchReservations.every((r) => r.settlementOnly));
+    await childIdle(h, 'planner');
+    await childIdle(h, 'reader');
+    assert.equal(h.enforcement.dispatches.inspect('root').length, 0);
+  });
+}
+
 function ctx(h, sessionId, agent) {
   return { sessionID: sessionId, messageID: 'm1', agent, directory: '/w', worktree: '/w', abort: new AbortController().signal, metadata() {}, ask: async () => {} };
+}
+
+async function pausedWriters() {
+  const h = harness();
+  await startRun(h);
+  const state = h.store.getRun('root');
+  for (const id of ['a', 'b']) state.nodes[id] = {
+    spec: { id, kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: [`${id}/**`], allowShell: true, maxAttempts: 1 },
+    state: 'PENDING', attempt: 0,
+  };
+  for (const id of ['a', 'b']) {
+    const d = await dispatch(h, 'graph-implementer', { prompt: `[nodeId:${id}]\nWork` });
+    await bindChild(h, `child-${id}`, 'graph-implementer', d.callID);
+  }
+  return { ...h, state };
+}
+
+async function backgroundAck(h, task, sessionId) {
+  await h.enforcement.onToolAfter({ tool: 'task', sessionID: 'root', callID: task.callID, args: task.args },
+    { metadata: { parentSessionId: 'root', sessionId, background: true } });
+}
+
+async function terminalTurn(h, sessionId, callID) {
+  const info = { id: `final-${callID}`, parentID: `user-${callID}`, sessionID: sessionId,
+    role: 'assistant', mode: h.hostMessages.get(sessionId).find((m) => m.info.id === `user-${callID}`).info.agent,
+    finish: 'stop', time: { created: 1, completed: 2 } };
+  h.hostMessages.get(sessionId).push({ info, parts: [] });
+  await h.enforcement.onEvent({ event: { type: 'message.updated', properties: { info } } });
+  return info;
+}
+
+for (const reverseHistory of [false, true]) {
+  test(`integration review R1: restart selects exact latest settled retry for delayed closeout (reverseHistory=${reverseHistory})`, async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-settled-retry-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const old = harness(dir);
+    await startRun(old);
+    const state = old.store.getRun('root');
+    state.nodes.impl = { spec: { id: 'impl', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['src/a.ts'], maxAttempts: 2 }, state: 'PENDING', attempt: 0 };
+    const first = await dispatch(old, 'graph-implementer', { nodeId: 'impl' });
+    await bindChild(old, 'writer', 'graph-implementer', first.callID);
+    const firstDispatch = state.nodes.impl.dispatchId;
+    await childIdle(old, 'writer');
+    assert.equal(state.nodes.impl.state, 'INCOMPLETE');
+    const retry = await dispatch(old, 'graph-implementer', { nodeId: 'impl', task_id: 'writer' });
+    await bindChild(old, 'writer', 'graph-implementer', retry.callID);
+    const latestDispatch = state.nodes.impl.dispatchId;
+    await childIdle(old, 'writer');
+    assert.equal(state.status, 'AWAITING_USER_DECISION');
+    assert.equal(state.nodes.impl.state, 'FAILED');
+    assert.equal(state.dispatchReservations.length, 0);
+    assert.deepEqual(state.settledDispatches.map((r) => r.dispatchId), [firstDispatch, latestDispatch]);
+    if (reverseHistory) { state.settledDispatches.reverse(); await old.store.saveRun(state); }
+    const pause = structuredClone(state.pendingDecision);
+    const h = harness(dir); // Disk JSON roundtrip; no old in-memory identities.
+    await startRun(h);
+    const recovered = h.store.getRun('root');
+    const closeout = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl', filesTouched: [], summary: 'late honest report', unresolved: ['no implementation delivered'] }, ctx(h, 'writer', 'graph-implementer')));
+    assert.equal(closeout.effect, 'settlement', JSON.stringify(closeout));
+    assert.equal(h.bindings.get('writer').dispatchId, latestDispatch);
+    assert.equal(recovered.closeouts[0].dispatchId, latestDispatch);
+    assert.equal(recovered.settledDispatches.length, 2, 'older witnesses remain retained');
+    assert.deepEqual(recovered.pendingDecision, pause);
+    assert.equal(recovered.nodes.impl.attempt, 2);
+    assert.equal(recovered.nodes.impl.state, 'FAILED');
+    assert.equal(recovered.dispatchReservations.length, 0);
+  });
+}
+
+for (const oldActive of [false, true]) {
+  for (const reverseHistory of [false, true]) {
+    test(`integration review free recovery: admission order owns delayed closeout (oldActive=${oldActive}, reverseHistory=${reverseHistory})`, async (t) => {
+      const dir = await mkdtemp(join(tmpdir(), 'loop-free-recovery-'));
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      let h = harness(dir);
+      await startRun(h);
+      const first = await dispatch(h, 'graph-explorer');
+      await bindChild(h, 'reader', 'graph-explorer', first.callID);
+      const firstDispatch = h.bindings.get('reader').dispatchId;
+      await dispatch(h, 'graph-planner');
+      await bindChild(h, 'planner', 'graph-planner');
+      const specs = SPECS.filter((s) => ['explore', 'plan', 'review'].includes(s.kind));
+      assert.equal(JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs }, ctx(h, 'planner', 'graph-planner'))).ok, true);
+      await childIdle(h, 'planner');
+      const latest = await dispatch(h, 'graph-explorer', { task_id: 'reader' });
+      await bindChild(h, 'reader', 'graph-explorer', latest.callID);
+      const latestDispatch = h.bindings.get('reader').dispatchId;
+      assert.notEqual(latestDispatch, firstDispatch);
+      assert.equal(h.bindings.get('reader').nodeId, null);
+      const finish = (task, sessionId) => h.enforcement.onToolAfter({ tool: 'task', sessionID: 'root', callID: task.callID, args: task.args },
+        { metadata: { parentSessionId: 'root', sessionId } });
+      await finish(latest, 'reader');
+      const critic = await dispatch(h, 'graph-plan-critic');
+      await bindChild(h, 'critic', 'graph-plan-critic', critic.callID);
+      assert.equal(JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['scope rejected'] }, ctx(h, 'critic', 'graph-plan-critic'))).ok, true);
+      await finish(critic, 'critic');
+      if (!oldActive) await finish(first, 'reader'); // The older admission settles LAST.
+      assert.equal(h.bindings.get('reader').dispatchId, latestDispatch);
+      assert.equal(h.bindings.get('reader').settlementOnly, false);
+      assert.equal(h.enforcement.dispatches.owns(h.bindings.get('reader'), { settled: true }), true);
+      const pause = structuredClone(h.store.getRun('root').pendingDecision);
+      const artifacts = structuredClone(h.store.getRun('root').artifacts);
+      const restart = async () => {
+        const state = h.store.getRun('root');
+        if (reverseHistory) {
+          state.settledDispatches.reverse();
+          state.dispatchReservations.reverse();
+          await h.store.saveRun(state);
+        }
+        const old = h;
+        h = harness(dir);
+        for (const [id, messages] of old.hostMessages) h.hostMessages.set(id, messages);
+        await startRun(h);
+      };
+      for (let pass = 0; pass < 2; pass++) {
+        await restart();
+        assert.equal(h.bindings.get('reader').dispatchId, latestDispatch, 'settlement arrival or active-old status must not select the binding');
+        assert.equal(h.bindings.get('reader').active, false);
+        assert.equal(h.bindings.get('reader').settlementOnly, false);
+        assert.equal(h.enforcement.dispatches.owns(h.bindings.get('reader'), { settled: true }), true);
+        assert.equal(h.enforcement.dispatches.inspect('root').length, oldActive ? 1 : 0);
+        if (oldActive) {
+          await h.enforcement.dispatches.onIdle('reader', `old-still-active-${pass}`);
+          assert.equal(JSON.parse(await h.tools.graph_run_decide.execute({ action: 'reset', reason: 'wait for all lifetimes' }, ctx(h, 'root', 'graph-orchestrator'))).code, 'DISPATCH_PENDING');
+        }
+      }
+      const payload = { summary: 'delayed findings from the newest free consultation' };
+      const closeout = JSON.parse(await h.tools.graph_submit_findings.execute(payload, ctx(h, 'reader', 'graph-explorer')));
+      assert.equal(closeout.effect, 'settlement', JSON.stringify(closeout));
+      assert.equal(h.store.getRun('root').closeouts[0].dispatchId, latestDispatch);
+      await restart();
+      assert.equal(JSON.parse(await h.tools.graph_submit_findings.execute(payload, ctx(h, 'reader', 'graph-explorer'))).code, 'CLOSEOUT_ALREADY_RECORDED');
+      await finish(first, 'reader'); // Also exercises a stale duplicate in the settled-later case.
+      const state = h.store.getRun('root');
+      assert.equal(h.bindings.get('reader').dispatchId, latestDispatch);
+      assert.equal(state.settledDispatches.filter((r) => r.sessionId === 'reader').length, 2);
+      assert.equal(state.dispatchReservations.length, 0);
+      assert.deepEqual(state.pendingDecision, pause);
+      assert.deepEqual(state.artifacts, artifacts);
+      assert.equal(JSON.parse(await h.tools.graph_run_decide.execute({ action: 'reset', reason: 'all lifetimes ended' }, ctx(h, 'root', 'graph-orchestrator'))).ok, true);
+    });
+  }
+}
+
+for (const agent of ['graph-explorer', 'graph-multimodal']) {
+  test(`integration review R3: revoked node-bound ${agent} continues by identity after plan publication`, async () => {
+    const h = harness();
+    await startRun(h);
+    const state = h.store.getRun('root');
+    const spec = { ...SPECS[0], agent, kind: agent === 'graph-explorer' ? 'explore' : 'analyze' };
+    state.nodes[spec.id] = { spec, state: 'PENDING', attempt: 0 };
+    const reading = await dispatch(h, agent, { nodeId: spec.id });
+    await bindChild(h, 'reader', agent, reading.callID);
+    const originalDispatch = h.bindings.get('reader').dispatchId;
+    await dispatch(h, 'graph-planner');
+    await bindChild(h, 'planner', 'graph-planner');
+    const specs = SPECS.filter((s) => ['explore', 'plan', 'review'].includes(s.kind)).map((s) => s.id === spec.id ? spec : s);
+    assert.equal(JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs }, ctx(h, 'planner', 'graph-planner'))).ok, true);
+    await childIdle(h, 'planner');
+    await childIdle(h, 'reader');
+    assert.equal(h.bindings.get('reader').settlementOnly, true);
+    assert.equal(h.bindings.get('reader').nodeId, spec.id);
+    const nodes = structuredClone(state.nodes);
+    assert.equal((await h.enforcement.dispatches.admit('root', 'wrong-target', { subagent_type: agent, task_id: 'reader' }, 'other')).code, 'TASK_NODE_MISMATCH');
+    assert.equal((await h.enforcement.dispatches.admit('root', 'wrong-role', { subagent_type: 'graph-planner', task_id: 'reader' })).code, 'FRESH_SESSION_REQUIRED');
+    const continued = await dispatch(h, agent, { task_id: 'reader' });
+    assert.doesNotMatch(continued.args.prompt, /RUNNER_REJECTED/, 'completed documentary node must not prevent a fresh read-only consultation');
+    await h.enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part: {
+      type: 'tool', tool: 'task', sessionID: 'root', callID: continued.callID,
+      state: { status: 'running', input: continued.args, metadata: { parentSessionId: 'foreign', sessionId: 'reader' } },
+    } } } });
+    assert.equal(h.bindings.has('reader'), false, 'identity continuation must re-verify host parentage');
+    await bindChild(h, 'reader', agent, continued.callID);
+    assert.equal(h.bindings.get('reader').nodeId, null);
+    assert.equal(h.bindings.get('reader').settlementOnly, false);
+    assert.notEqual(h.bindings.get('reader').dispatchId, originalDispatch);
+    assert.equal(h.enforcement.dispatches.current(h.bindings.get('reader')), true);
+    assert.deepEqual(state.nodes, nodes, 'free consultation does not charge or revive the old node');
+    assert.equal(JSON.parse(await h.tools.graph_submit_findings.execute({ summary: 'new consultation evidence' }, ctx(h, 'reader', agent))).ok, true);
+  });
+}
+
+test('integration review R3: revoked writer cannot fall back to a free identity continuation', async () => {
+  const h = harness();
+  await startRun(h);
+  const state = h.store.getRun('root');
+  state.nodes.impl = { spec: { id: 'impl', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['src/a.ts'] }, state: 'PENDING', attempt: 0 };
+  const writing = await dispatch(h, 'graph-implementer', { nodeId: 'impl' });
+  await bindChild(h, 'writer', 'graph-implementer', writing.callID);
+  assert.equal(JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl', filesTouched: [], summary: 'no changes needed' }, ctx(h, 'writer', 'graph-implementer'))).ok, true);
+  await dispatch(h, 'graph-planner');
+  await bindChild(h, 'planner', 'graph-planner');
+  assert.equal(JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: SPECS.filter((s) => ['explore', 'plan', 'review'].includes(s.kind)) }, ctx(h, 'planner', 'graph-planner'))).ok, true);
+  await childIdle(h, 'writer');
+  assert.equal(h.bindings.get('writer').settlementOnly, true);
+  const before = structuredClone(state);
+  assert.equal((await h.enforcement.dispatches.admit('root', 'writer-free-fallback', { subagent_type: 'graph-implementer', task_id: 'writer' }, 'impl')).code, 'FRESH_SESSION_REQUIRED');
+  assert.deepEqual(state, before);
+});
+
+for (const restart of [false, true]) {
+  test(`integration retry: overlapping verifier repair/retry retires original lifetime (restart=${restart})`, async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-overlap-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    let h = harness(dir);
+    await startRun(h);
+    await dispatch(h, 'graph-planner');
+    await bindChild(h, 'planner', 'graph-planner');
+    const specs = SPECS.filter((s) => s.kind !== 'review').map((s) => s.kind === 'implement' ? { ...s, dependsOn: ['plan-1'] } : s);
+    assert.equal(JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'light', specs }, ctx(h, 'planner', 'graph-planner'))).ok, true);
+    await childIdle(h, 'planner');
+    const change = async (session) => {
+      const task = await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
+      await bindChild(h, session, 'graph-implementer', task.callID);
+      const result = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'impl-1', filesTouched: [], summary: 'repair' }, ctx(h, session, 'graph-implementer')));
+      assert.equal(result.ok, true, JSON.stringify(result));
+      await childIdle(h, session);
+    };
+    await change('impl-v1');
+    const first = await dispatch(h, 'graph-verifier', { nodeId: 'verify-1' });
+    await bindChild(h, 'verifier', 'graph-verifier', first.callID);
+    await backgroundAck(h, first, 'verifier');
+    const firstDispatch = h.bindings.get('verifier').dispatchId;
+    assert.equal(JSON.parse(await h.tools.graph_submit_verification.execute({ nodeId: 'verify-1', verdict: 'FAIL', summary: 'needs repair' }, ctx(h, 'verifier', 'graph-verifier'))).effect, 'repair');
+    await change('impl-v2');
+    // v1's structured FAIL is not its host turn end. Admit the retry first.
+    h.client.session.status = async () => ({ data: { verifier: { type: 'busy' } } });
+    const second = await dispatch(h, 'graph-verifier', { nodeId: 'verify-1', task_id: 'verifier' });
+    assert.doesNotMatch(second.args.prompt, /RUNNER_REJECTED/);
+    const oldTerminal = await terminalTurn(h, 'verifier', first.callID);
+    await bindChild(h, 'verifier', 'graph-verifier', second.callID);
+    await backgroundAck(h, second, 'verifier');
+    let state = h.store.getRun('root');
+    const currentDispatch = state.nodes['verify-1'].dispatchId;
+    const currentAttempt = state.nodes['verify-1'].attempt;
+    assert.notEqual(currentDispatch, firstDispatch);
+    // Even an idle hint and authenticated old terminal cannot end v2.
+    if (!restart) h.client.session.status = async () => ({ data: {} });
+    await h.enforcement.onEvent({ event: { type: 'session.idle', id: 'old-idle', properties: { sessionID: 'verifier' } } });
+    assert.equal(state.nodes['verify-1'].state, 'RUNNING');
+    assert.equal(state.nodes['verify-1'].dispatchId, currentDispatch);
+    assert.equal(JSON.parse(await h.tools.graph_submit_verification.execute({ nodeId: 'verify-1', verdict: 'UNVERIFIED', summary: 'unresolved external proof' }, ctx(h, 'verifier', 'graph-verifier'))).effect, 'await-decision');
+    const pause = structuredClone(state.pendingDecision);
+    if (restart) {
+      const old = h;
+      h = harness(dir);
+      for (const [id, messages] of old.hostMessages) h.hostMessages.set(id, messages);
+      h.client.session.status = async () => ({ data: { verifier: { type: 'busy' } } });
+      await startRun(h);
+      state = h.store.getRun('root');
+    }
+    for (const action of ['abort', 'reset']) {
+      assert.equal(JSON.parse(await h.tools.graph_run_decide.execute({ action, reason: 'still waiting' }, ctx(h, 'root', 'graph-orchestrator'))).code, 'DISPATCH_PENDING');
+    }
+    h.client.session.status = async () => ({ data: {} });
+    // The old lifetime can now settle, but its stale terminal must not touch v2.
+    await h.enforcement.onEvent({ event: { type: 'message.updated', properties: { info: oldTerminal } } });
+    const retryNode = structuredClone(state.nodes['verify-1']);
+    await terminalTurn(h, 'verifier', second.callID);
+    await h.enforcement.onEvent({ event: { type: 'session.idle', id: 'retry-idle', properties: { sessionID: 'verifier' } } });
+    assert.equal(h.enforcement.dispatches.inspect('root').length, 0, 'both original and retry host lifetimes must retire');
+    assert.deepEqual(state.pendingDecision, pause);
+    assert.equal(state.nodes['verify-1'].attempt, currentAttempt);
+    assert.equal(state.nodes['verify-1'].dispatchId, currentDispatch);
+    assert.deepEqual(state.nodes['verify-1'], retryNode);
+    assert.ok(state.settledDispatches.some((r) => r.dispatchId === firstDispatch && r.terminalMessageId === oldTerminal.id));
+    const nodes = structuredClone(state.nodes);
+    await h.enforcement.onEvent({ event: { type: 'message.updated', properties: { info: oldTerminal } } });
+    await backgroundAck(h, first, 'verifier');
+    assert.deepEqual(state.nodes, nodes, 'stale old events cannot mutate the retry');
+    assert.equal(JSON.parse(await h.tools.graph_run_decide.execute({ action: 'reset', reason: 'proof remains unavailable' }, ctx(h, 'root', 'graph-orchestrator'))).ok, true);
+    assert.equal(h.enforcement.dispatches.inspect('root:2').length, 0);
+  });
+}
+
+for (const reader of ['free', 'node', 'unbound']) {
+  for (const restart of [false, true]) {
+    test(`integration plan: accepted public plan preserves active planner and ${reader} reader lifetimes (restart=${restart})`, async (t) => {
+      const dir = await mkdtemp(join(tmpdir(), 'loop-plan-lifetime-'));
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      let h = harness(dir, { readerParallel: 1 });
+      await startRun(h);
+      if (reader === 'node') h.store.getRun('root').nodes['explore-1'] = {
+        spec: SPECS[0], state: 'PENDING', attempt: 0,
+      };
+      const reading = await dispatch(h, 'graph-explorer', reader === 'node' ? { nodeId: 'explore-1' } : {});
+      if (reader !== 'unbound') {
+        await bindChild(h, 'reader', 'graph-explorer', reading.callID);
+        await backgroundAck(h, reading, 'reader');
+      }
+      const planning = await dispatch(h, 'graph-planner');
+      await bindChild(h, 'planner', 'graph-planner', planning.callID);
+      await backgroundAck(h, planning, 'planner');
+      const specs = SPECS.filter((s) => ['explore', 'plan', 'review'].includes(s.kind));
+      const planArgs = { intent: 'plan-only', specs };
+      assert.equal(JSON.parse(await h.tools.graph_submit_plan.execute(planArgs, ctx(h, 'planner', 'graph-planner'))).ok, true);
+      const published = structuredClone(h.store.getRun('root').artifacts);
+      assert.equal(JSON.parse(await h.tools.graph_submit_plan.execute(planArgs, ctx(h, 'planner', 'graph-planner'))).code, 'NOT_DISPATCHED_NODE');
+      if (reader !== 'unbound') {
+        assert.equal(JSON.parse(await h.tools.graph_submit_findings.execute({ summary: 'revoked work' }, ctx(h, 'reader', 'graph-explorer'))).code, 'NOT_DISPATCHED_NODE');
+        await assert.rejects(() => h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'reader', callID: 'revoked-running' }, { args: { command: 'node --version' } }), /BINDING_UNAVAILABLE/);
+      }
+      assert.deepEqual(h.store.getRun('root').artifacts, published, 'old calls cannot publish under the new RUNNING plan');
+      assert.match((await dispatch(h, 'graph-explorer')).args.prompt, /READER_CAPACITY/, 'active old readers still occupy host capacity');
+      const critic = await dispatch(h, 'graph-plan-critic');
+      await bindChild(h, 'critic', 'graph-plan-critic', critic.callID);
+      assert.equal(JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['revise scope'] }, ctx(h, 'critic', 'graph-plan-critic'))).ok, true);
+      // Exact foreground completion discharges only the critic's host call.
+      await h.enforcement.onToolAfter({ tool: 'task', sessionID: 'root', callID: critic.callID, args: critic.args },
+        { metadata: { parentSessionId: 'root', sessionId: 'critic' } });
+      const decide = (action) => h.tools.graph_run_decide.execute({ action, reason: 'controller decision' }, ctx(h, 'root', 'graph-orchestrator')).then(JSON.parse);
+      for (const action of ['abort', 'reset']) assert.equal((await decide(action)).code, 'DISPATCH_PENDING', 'published plan must not erase active host calls');
+      let state = h.store.getRun('root');
+      assert.equal(state.dispatchReservations.length, 2);
+      const pause = structuredClone(state.pendingDecision);
+      if (restart) {
+        const old = h;
+        h = harness(dir, { readerParallel: 1 });
+        h.calls.push(...old.calls);
+        for (const [id, messages] of old.hostMessages) h.hostMessages.set(id, messages);
+        await startRun(h);
+        state = h.store.getRun('root');
+        assert.equal((await decide('reset')).code, 'DISPATCH_PENDING');
+      }
+      if (reader === 'unbound') {
+        await bindChild(h, 'reader', 'graph-explorer', reading.callID);
+        await backgroundAck(h, reading, 'reader');
+      }
+      const nodes = structuredClone(state.nodes);
+      const artifacts = structuredClone(state.artifacts);
+      for (const [session, agent, tool, args] of [
+        ['planner', 'graph-planner', 'graph_submit_plan', planArgs],
+        ['reader', 'graph-explorer', 'graph_submit_findings', { summary: 'old plan work' }],
+      ]) {
+        assert.equal(h.enforcement.dispatches.current(h.bindings.get(session)), false);
+        await assert.rejects(() => h.enforcement.onToolBefore({ tool: 'bash', sessionID: session, callID: `revoked-${session}` }, { args: { command: 'node --version' } }), /BINDING_UNAVAILABLE/);
+        assert.equal(JSON.parse(await h.tools[tool].execute(args, ctx(h, session, agent))).code, 'NOT_DISPATCHED_NODE');
+        await h.enforcement.onEvent({ event: { type: 'session.idle', id: `premature-${session}`, properties: { sessionID: session } } });
+      }
+      assert.equal((await decide('reset')).code, 'DISPATCH_PENDING', 'idle alone is not host completion');
+      await terminalTurn(h, 'reader', reading.callID);
+      assert.equal(state.dispatchReservations.length, 1);
+      assert.equal((await decide('reset')).code, 'DISPATCH_PENDING', 'submitting background planner is still active');
+      const final = await terminalTurn(h, 'planner', planning.callID);
+      assert.equal(state.dispatchReservations.length, 0);
+      assert.deepEqual(state.nodes, nodes);
+      assert.deepEqual(state.artifacts, artifacts);
+      assert.deepEqual(state.pendingDecision, pause);
+      assert.equal((await decide('reset')).ok, true);
+      await h.enforcement.onEvent({ event: { type: 'message.updated', properties: { info: final } } });
+      await backgroundAck(h, planning, 'planner');
+      assert.equal(h.enforcement.dispatches.inspect('root:2').length, 0);
+      assert.deepEqual(h.store.getRun('root:2').nodes, {});
+    });
+  }
+}
+
+for (const laterReader of [false, true]) {
+  test(`integration plan: restart before critique restores lifetimes on a RUNNING graph (laterReader=${laterReader})`, async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-plan-before-pause-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const old = harness(dir);
+    await startRun(old);
+    const planning = await dispatch(old, 'graph-planner');
+    await bindChild(old, 'planner', 'graph-planner', planning.callID);
+    await backgroundAck(old, planning, 'planner');
+    const planArgs = { intent: 'plan-only', specs: SPECS.filter((s) => ['explore', 'plan', 'review'].includes(s.kind)) };
+    assert.equal(JSON.parse(await old.tools.graph_submit_plan.execute(planArgs, ctx(old, 'planner', 'graph-planner'))).ok, true);
+    let reading;
+    if (laterReader) {
+      reading = await dispatch(old, 'graph-explorer');
+      await bindChild(old, 'later-reader', 'graph-explorer', reading.callID);
+      await backgroundAck(old, reading, 'later-reader');
+    }
+    const h = harness(dir);
+    for (const [id, messages] of old.hostMessages) h.hostMessages.set(id, messages);
+    await startRun(h);
+    const state = h.store.getRun('root');
+    assert.equal(state.status, 'RUNNING');
+    const decision = { action: 'reset', reason: 'controller decision' };
+    assert.equal(JSON.parse(await h.tools.graph_run_decide.execute(decision, ctx(h, 'root', 'graph-orchestrator'))).code, 'DISPATCH_PENDING');
+    assert.equal(h.enforcement.dispatches.current(h.bindings.get('planner')), false);
+    assert.equal(JSON.parse(await h.tools.graph_submit_plan.execute(planArgs, ctx(h, 'planner', 'graph-planner'))).code, 'NOT_DISPATCHED_NODE');
+    const critic = await dispatch(h, 'graph-plan-critic');
+    await bindChild(h, 'critic', 'graph-plan-critic', critic.callID);
+    assert.equal(JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL' }, ctx(h, 'critic', 'graph-plan-critic'))).ok, true);
+    await h.enforcement.onToolAfter({ tool: 'task', sessionID: 'root', callID: critic.callID, args: critic.args }, {});
+    assert.equal(JSON.parse(await h.tools.graph_run_decide.execute(decision, ctx(h, 'root', 'graph-orchestrator'))).code, 'DISPATCH_PENDING');
+    await terminalTurn(h, 'planner', planning.callID);
+    if (reading) {
+      assert.equal(JSON.parse(await h.tools.graph_run_decide.execute(decision, ctx(h, 'root', 'graph-orchestrator'))).code, 'DISPATCH_PENDING', 'restoring revoked calls must not erase other active readers');
+      assert.equal(h.enforcement.dispatches.current(h.bindings.get('later-reader')), false, 'restart restoration grants settlement only');
+      await terminalTurn(h, 'later-reader', reading.callID);
+    }
+    assert.equal(JSON.parse(await h.tools.graph_run_decide.execute(decision, ctx(h, 'root', 'graph-orchestrator'))).ok, true);
+  });
+}
+
+for (const paused of [false, true]) {
+  for (const partial of [false, true]) {
+    test(`quality Q6: honest error report remains deliverable (paused=${paused}, partial=${partial})`, async (t) => {
+      const dir = await mkdtemp(join(tmpdir(), 'loop-uncertain-edit-'));
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      const h = harness(dir);
+      await startRun(h);
+      const state = h.store.getRun('root');
+      for (const id of ['a', 'b']) state.nodes[id] = {
+        spec: { id, kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: [`${id}/**`], maxAttempts: 1 },
+        state: 'PENDING', attempt: 0,
+      };
+      state.nodes.verify = { spec: { id: 'verify', kind: 'verify', agent: 'graph-verifier', dependsOn: ['b'] }, state: 'PENDING', attempt: 0 };
+      for (const id of ['a', 'b']) {
+        const task = await dispatch(h, 'graph-implementer', { nodeId: id });
+        await bindChild(h, `child-${id}`, 'graph-implementer', task.callID);
+      }
+      const target = partial ? 'b/partial.txt' : 'b/missing.txt';
+      if (partial) { await mkdir(join(dir, 'b')); await writeFile(join(dir, target), 'before'); }
+      await h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: 'failed-edit' }, { args: { filePath: join(dir, target) } });
+      if (partial) await writeFile(join(dir, target), 'partial bytes were written');
+      await h.enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part: {
+        type: 'tool', id: 'failed-part', sessionID: 'child-b', messageID: 'failed-message', callID: 'failed-edit', tool: 'edit',
+        state: { status: 'error', input: { filePath: join(dir, target) }, error: partial ? 'failed after partial write' : 'File does not exist', time: { start: 1, end: 2 } },
+      } } } });
+      if (paused) await childIdle(h, 'child-a');
+      const firstPause = structuredClone(state.pendingDecision);
+      const artifacts = structuredClone(state.artifacts);
+      const result = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'b', filesTouched: partial ? [target] : [],
+        summary: partial ? 'reported the actual partial change' : 'edit failed before writing', unresolved: ['edit failed; inspect actual workspace state'] }, ctx(h, 'child-b', 'graph-implementer')));
+      assert.equal(result.ok, true, JSON.stringify(result));
+      assert.equal(state.nodes.b.lastFailure ?? null, null);
+      assert.equal(state.sideEffects[0].uncertain, true);
+      assert.equal(state.sideEffects[0].outcome, 'error');
+      assert.equal(state.sideEffects[0].target, target);
+      if (paused) {
+        assert.equal(result.effect, 'settlement');
+        assert.equal(state.nodes.b.state, 'RUNNING');
+        assert.deepEqual(state.pendingDecision, firstPause);
+        assert.deepEqual(state.artifacts, artifacts);
+        assert.deepEqual(state.closeouts[0].payload.filesTouched, partial ? [target] : []);
+      } else {
+        assert.deepEqual(state.artifacts['change:b'].payload.filesTouched, partial ? [target] : []);
+        const verification = await dispatch(h, 'graph-verifier', { nodeId: 'verify' });
+        assert.match(verification.args.prompt, /uncertain/i);
+        assert.ok(verification.args.prompt.includes(target));
+      }
+    });
+  }
+}
+
+test('quality Q6: a failed missing-file edit is not confirmed deliverable coverage', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-uncertain-progress-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = await pausedWriters();
+  h.tools = createSubmitTools({ store: h.store, runner: h.runner, bindings: h.bindings, worktree: dir, dispatches: h.enforcement.dispatches }).tools;
+  h.state.nodes.b.spec.deliverables = ['b/missing'];
+  await h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: 'missing' }, { args: { filePath: 'b/missing' } });
+  await h.enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part: {
+    type: 'tool', id: 'missing-part', sessionID: 'child-b', messageID: 'missing-message', callID: 'missing', tool: 'edit',
+    state: { status: 'error', error: 'File does not exist', time: { start: 1, end: 2 } },
+  } } } });
+  assert.equal(h.runner.inspect(h.state).nodes.find((node) => node.id === 'b').deliverables.done, 0);
+  const inspection = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(inspection.nodes.find((node) => node.id === 'b').deliverables.done, 0);
+});
+
+test('quality Q6: confirmed undisclosed edits remain strict despite other uncertain edits', async () => {
+  const h = await pausedWriters();
+  h.runner.recordSideEffect(h.state, { nodeId: 'b', tool: 'edit', target: 'b/missing', outcome: 'error', uncertain: true, now: 'now' });
+  await h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: 'confirmed' }, { args: { filePath: 'b/real' } });
+  await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-b', callID: 'confirmed' }, {});
+  const result = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'b', filesTouched: [], summary: 'omitted a confirmed edit', unresolved: ['another edit failed'] }, ctx(h, 'child-b', 'graph-implementer')));
+  assert.equal(result.code, 'LEDGER_MISMATCH');
+  assert.match(result.detail, /b\/real/);
+  assert.doesNotMatch(result.detail, /b\/missing/);
+  assert.equal(h.state.nodes.b.state, 'FAILED');
+});
+
+test('quality Q2: native tool errors release pending slots and preserve uncertain effects under the real sanitizer', async () => {
+  const base = harness();
+  await startRun(base);
+  const state = base.store.getRun('root');
+  state.nodes.b = { spec: { id: 'b', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['b/**'] }, state: 'PENDING', attempt: 0 };
+  let durable;
+  const store = { ...base.store, saveRun: async (s) => { durable = cleanJson(s, { maxBytes: 1_048_576, maxValues: 20_000, maxDepth: 32 }); } };
+  const enforcement = createEnforcement({ settings: {}, store, runner: base.runner, bindings: base.bindings });
+  const h = { ...base, store, enforcement };
+  const d = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:b]\nEdit' });
+  await bindChild(h, 'child-b', 'graph-implementer', d.callID);
+  for (let i = 0; i < 128; i++) {
+    await enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: `edit-${i}` }, { args: { filePath: 'b/file' } });
+    await enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part: {
+      type: 'tool', id: `part-${i}`, sessionID: 'child-b', messageID: `message-${i}`, callID: `edit-${i}`, tool: 'edit',
+      state: { status: 'error', input: { filePath: 'b/file' }, error: 'oldString not found', time: { start: 1, end: 2 } },
+    } } } });
+  }
+  await assert.doesNotReject(() => enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: 'valid-edit' }, { args: { filePath: 'b/file' } }));
+  assert.equal(durable.pendingEffects.length, 1);
+  assert.equal(durable.sideEffects.filter((effect) => effect.outcome === 'error' && effect.uncertain === true).length, 128);
+  assert.equal(state.nodes.b.state, 'RUNNING');
+  assert.equal(state.nodes.b.attempt, 1);
+});
+
+test('quality Q2: an uncorrelated after-hook cannot be attributed to the current attempt', async () => {
+  const h = await pausedWriters();
+  await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-b', callID: 'unknown-old-call', args: { filePath: 'b/file' } }, {});
+  assert.equal(h.state.sideEffects.length, 0);
+  assert.equal(h.state.nodes.b.state, 'RUNNING');
+});
+
+test('quality Q4: evicting a tool callback dedup entry cannot duplicate its durable effect in a newer attempt', async () => {
+  const h = await pausedWriters();
+  h.state.nodes.b.spec.maxAttempts = 3;
+  const firstDispatch = h.state.nodes.b.dispatchId;
+  for (let i = 0; i < 257; i++) {
+    const call = { tool: 'edit', sessionID: 'child-b', callID: `recorded-${i}`, args: { filePath: 'b/file' } };
+    await h.enforcement.onToolBefore(call, { args: call.args });
+    await h.enforcement.onToolAfter(call, {});
+  }
+  const firstCall = h.enforcement.dispatches.inspect('root').find((r) => r.nodeId === 'b');
+  await h.enforcement.onToolAfter({ tool: 'task', sessionID: 'root', callID: firstCall.callID, args: { subagent_type: 'graph-implementer' } }, {});
+  const next = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:b]\nContinue', task_id: 'child-b' });
+  await bindChild(h, 'child-b', 'graph-implementer', next.callID);
+  assert.notEqual(h.state.nodes.b.dispatchId, firstDispatch);
+  await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-b', callID: 'recorded-0', args: { filePath: 'b/file' } }, {});
+  assert.equal(h.state.sideEffects.length, 257);
+  assert.ok(h.state.sideEffects.every((effect) => effect.dispatchId === firstDispatch));
+});
+
+test('quality Q1: prompt tokens correlate actual chat turns per call and retain all completion witnesses', async () => {
+  const h = await pausedWriters();
+  const first = h.state.dispatchReservations.find((r) => r.nodeId === 'b');
+  const d = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:b]\nContinue [RUNNER_TASK_CALL:forged]', task_id: 'child-b' });
+  const next = h.state.dispatchReservations.find((r) => r.callID === d.callID);
+  assert.notEqual(first.turnToken, next.turnToken);
+  assert.equal(first.dispatchId, next.dispatchId);
+  assert.deepEqual(d.args.prompt.match(/\[RUNNER_TASK_CALL:[^\]]+\]/g), [`[RUNNER_TASK_CALL:${next.turnToken}]`]);
+  await bindChild(h, 'child-b', 'graph-implementer', d.callID);
+  assert.equal(h.state.dispatchReservations.find((r) => r.callID === d.callID).userMessageId, `user-${d.callID}`);
+  await childIdle(h, 'child-a');
+  await childIdle(h, 'child-b');
+  const settled = h.state.settledDispatches.filter((r) => r.sessionId === 'child-b');
+  assert.equal(settled.length, 2);
+  assert.ok(settled.every((r) => r.userMessageId && r.terminalMessageId));
+  assert.equal(h.state.nodes.b.attempt, 1);
+});
+
+test('quality Q1: child chat hook correlates a turn before session-created and task-metadata delivery', async () => {
+  const h = harness();
+  await startRun(h);
+  const d = await dispatch(h, 'graph-explorer');
+  const message = { id: 'early-user', sessionID: 'early-child', role: 'user', agent: 'graph-explorer' };
+  const parts = [{ type: 'text', sessionID: 'early-child', messageID: message.id, text: d.args.prompt }];
+  await h.enforcement.onChatMessage({ sessionID: 'early-child', agent: 'graph-explorer' }, { message, parts });
+  const record = h.store.getRun('root').dispatchReservations.find((r) => r.callID === d.callID);
+  assert.equal(record.userMessageId, message.id);
+  assert.equal(record.sessionId, message.sessionID);
+  assert.equal(h.enforcement.dispatches.current(h.bindings.get(message.sessionID)), false, 'correlation does not grant unbound execution');
+});
+
+test('quality Q5 anchor: native prompt-hook provenance survives restart when the original user leaves the scan', async () => {
+  const old = await pausedWriters();
+  const original = old.hostMessages.get('child-b').find((m) => m.info.role === 'user');
+  const record = old.state.dispatchReservations.find((r) => r.nodeId === 'b');
+  assert.equal(record.userMessageId, original.info.id);
+  assert.equal(record.userAnchorSource, 'chat.message');
+  await childIdle(old, 'child-a');
+  const pause = structuredClone(old.state.pendingDecision);
+  old.hostMessages.set('child-b', [{ info: { id: 'hook-anchored-final', sessionID: 'child-b', role: 'assistant', mode: 'graph-implementer',
+    parentID: original.info.id, finish: 'stop', time: { created: 1, completed: 2 } }, parts: [] }]);
+  const state = structuredClone(old.state);
+  const store = { getRun: () => state, loadRun: async () => state,
+    saveRun: async (s) => { cleanJson(s, { maxBytes: 1_048_576, maxValues: 20_000, maxDepth: 32 }); } };
+  const bindings = new Map();
+  const enforcement = createEnforcement({ settings: {}, store, runner: old.runner, bindings, client: old.client });
+  const tools = createSubmitTools({ store, runner: old.runner, bindings, dispatches: enforcement.dispatches }).tools;
+  await enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });
+  assert.equal(state.nodes.b.state, 'FAILED');
+  assert.equal(state.nodes.b.attempt, 1);
+  assert.deepEqual(state.pendingDecision, pause);
+  assert.equal(state.settledDispatches.find((r) => r.nodeId === 'b').userAnchorSource, 'chat.message');
+  assert.equal(JSON.parse(await tools.graph_run_decide.execute({ action: 'abort', reason: 'user stops' }, { sessionID: 'root', agent: 'graph-orchestrator' })).ok, true);
+});
+
+test('quality Q2: paused restart recovers exact native error outcomes without declaring the child turn complete', async () => {
+  const old = await pausedWriters();
+  const call = { tool: 'edit', sessionID: 'child-b', callID: 'interrupted-edit' };
+  await old.enforcement.onToolBefore(call, { args: { filePath: 'b/file' } });
+  await childIdle(old, 'child-a');
+  const user = old.hostMessages.get('child-b').find((m) => m.info.role === 'user');
+  const part = { type: 'tool', id: 'error-part', sessionID: 'child-b', messageID: 'tool-message', callID: call.callID, tool: 'edit',
+    state: { status: 'error', input: { filePath: 'b/file' }, error: 'permission denied or interrupted', time: { start: 1, end: 2 } } };
+  old.hostMessages.get('child-b').push({ info: { id: 'tool-message', sessionID: 'child-b', role: 'assistant', mode: 'graph-implementer',
+    parentID: user.info.id, finish: 'tool-calls', time: { completed: 2 } }, parts: [part] });
+  const state = structuredClone(old.state);
+  const store = { getRun: () => state, loadRun: async () => state,
+    saveRun: async (s) => { cleanJson(s, { maxBytes: 1_048_576, maxValues: 20_000, maxDepth: 32 }); } };
+  const enforcement = createEnforcement({ settings: {}, store, runner: old.runner, bindings: new Map(), client: old.client });
+  await enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });
+  assert.equal(state.pendingEffects.length, 0);
+  assert.equal(state.sideEffects.length, 1);
+  assert.equal(state.sideEffects[0].outcome, 'error');
+  assert.equal(state.sideEffects[0].uncertain, true);
+  assert.equal(state.sideEffects[0].dispatchId, old.state.nodes.b.dispatchId);
+  assert.equal(state.nodes.b.state, 'RUNNING');
+  assert.equal(state.status, 'AWAITING_USER_DECISION');
+  await enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part } } });
+  assert.equal(state.sideEffects.length, 1);
+});
+
+for (const outcome of ['completed', 'error']) {
+  for (const action of ['abort', 'reset']) {
+    test(`review restart-effects: ${outcome} outcome and final turn settle in one restart before ${action}`, async () => {
+      const old = await pausedWriters();
+      const user = old.hostMessages.get('child-b').find((message) => message.info.role === 'user');
+      const owner = old.state.dispatchReservations.find((record) => record.sessionId === 'child-b');
+      assert.ok(user.parts[0].text.includes(`[RUNNER_TASK_CALL:${owner.turnToken}]`));
+      const part = { type: 'tool', id: 'edit-part-b', sessionID: 'child-b', messageID: 'tool-b', callID: 'pending-edit-b', tool: 'edit',
+        state: { status: 'running', input: { filePath: 'b/file' }, time: { start: 1 } } };
+      const toolMessage = { info: { id: 'tool-b', sessionID: 'child-b', role: 'assistant', mode: 'graph-implementer',
+        parentID: user.info.id, finish: 'tool-calls', time: { created: 1, completed: 2 } }, parts: [part] };
+      old.hostMessages.get('child-b').push(toolMessage);
+      await old.enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part } } });
+      await old.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: part.callID }, { args: { filePath: 'b/file' } });
+      await childIdle(old, 'child-a');
+      const firstPause = structuredClone(old.state.pendingDecision);
+      const attempts = { a: old.state.nodes.a.attempt, b: old.state.nodes.b.attempt };
+      assert.equal(old.state.pendingEffects.length, 1);
+
+      // Native outcomes are now available, but no part/message/idle event or
+      // successful after-hook is delivered to the restarted plugin.
+      part.state = { status: outcome, input: { filePath: 'b/file' }, time: { start: 1, end: 3 },
+        ...(outcome === 'completed' ? { output: 'edited', title: 'edit', metadata: {} } : { error: 'edit may have partially applied' }) };
+      old.hostMessages.get('child-b').push({ info: { id: 'final-b', sessionID: 'child-b', role: 'assistant', mode: 'graph-implementer',
+        parentID: user.info.id, finish: 'stop', time: { created: 4, completed: 5 } }, parts: [] });
+
+      const backing = createRunStore();
+      const state = await backing.createRun({ runId: 'root', rootSessionId: 'root', now: 'restart' });
+      Object.assign(state, structuredClone(old.state));
+      const saves = [];
+      const store = { ...backing, saveRun: async (candidate) => {
+        cleanJson(candidate, { maxBytes: 1_048_576, maxValues: 20_000, maxDepth: 32 });
+        await backing.saveRun(candidate);
+        saves.push(structuredClone(candidate));
+      } };
+      const bindings = new Map();
+      const enforcement = createEnforcement({ settings: {}, store, runner: old.runner, bindings, client: old.client });
+      const tools = createSubmitTools({ store, runner: old.runner, bindings, dispatches: enforcement.dispatches }).tools;
+      await enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });
+
+      assert.equal(state.pendingEffects.length, 0);
+      assert.equal(state.sideEffects.length, 1);
+      assert.equal(state.sideEffects[0].outcome, outcome);
+      assert.equal(state.sideEffects[0].uncertain, outcome === 'error');
+      assert.equal(state.sideEffects[0].dispatchId, owner.dispatchId);
+      const witness = [...state.dispatchReservations, ...(state.settledDispatches ?? [])].find((record) => record.dispatchId === owner.dispatchId);
+      assert.equal(witness.userMessageId, user.info.id);
+      assert.equal(witness.terminalMessageId, 'final-b');
+      assert.equal(state.nodes.b.state, 'FAILED', 'the same restart must retire the fully witnessed host lifetime');
+      assert.equal(state.status, 'AWAITING_USER_DECISION');
+      assert.deepEqual(state.pendingDecision, firstPause);
+      assert.deepEqual({ a: state.nodes.a.attempt, b: state.nodes.b.attempt }, attempts);
+      assert.equal(enforcement.dispatches.inspect('root').length, 0);
+      const effectSave = saves.findIndex((saved) => saved.pendingEffects.length === 0 && saved.sideEffects.length === 1);
+      const lifetimeSave = saves.findIndex((saved) => saved.nodes.b.state === 'FAILED');
+      assert.ok(effectSave >= 0 && lifetimeSave > effectSave, 'effect outcome must be durable before lifetime retirement');
+      assert.equal(saves[lifetimeSave].dispatchReservations.length, 0);
+
+      const result = JSON.parse(await tools.graph_run_decide.execute({ action, reason: 'user decision after completed recovery' }, { sessionID: 'root', agent: 'graph-orchestrator' }));
+      assert.equal(result.ok, true, JSON.stringify(result));
+      assert.equal(result.action, action);
+      assert.deepEqual(state.pendingDecision, firstPause);
+      assert.deepEqual({ a: state.nodes.a.attempt, b: state.nodes.b.attempt }, attempts);
+      assert.equal(state.sideEffects[0].uncertain, outcome === 'error');
+      if (action === 'reset') assert.deepEqual(store.getRun(result.runId).sideEffects, []);
+    });
+  }
+}
+
+test('quality Q2: terminal error identity and persistence boundaries keep the pending effect until a durable exact outcome', async () => {
+  const old = await pausedWriters();
+  const call = { tool: 'edit', sessionID: 'child-b', callID: 'edit-error' };
+  // messageID belongs to native tool parts, not the SDK before-hook input.
+  await old.enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part: {
+    type: 'tool', id: 'part', sessionID: 'child-b', messageID: 'original-message', callID: call.callID, tool: 'edit',
+    state: { status: 'running', input: { filePath: 'b/file' } },
+  } } } });
+  await old.enforcement.onToolBefore(call, { args: { filePath: 'b/file' } });
+  await childIdle(old, 'child-a');
+  const state = structuredClone(old.state);
+  let offline = false;
+  const store = { getRun: () => state, loadRun: async () => state, saveRun: async (s) => {
+    if (offline) throw new Error('outcome disk offline');
+    cleanJson(s, { maxBytes: 1_048_576, maxValues: 20_000, maxDepth: 32 });
+  } };
+  const enforcement = createEnforcement({ settings: {}, store, runner: old.runner, bindings: new Map(), client: old.client });
+  await enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });
+  const part = { type: 'tool', id: 'part', sessionID: 'child-b', messageID: 'original-message', callID: call.callID, tool: 'edit',
+    state: { status: 'error', time: { end: 2 } } };
+  const event = (p) => enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part: p } } });
+  await event({ ...part, messageID: 'foreign-message' });
+  await event({ ...part, tool: 'bash' });
+  assert.equal(state.pendingEffects.length, 1);
+  offline = true;
+  await assert.rejects(() => event(part), /outcome disk offline/);
+  assert.equal(state.pendingEffects.length, 1);
+  assert.equal(state.sideEffects.length, 0);
+  offline = false;
+  await event(part);
+  await event(part);
+  assert.equal(state.pendingEffects.length, 0);
+  assert.equal(state.sideEffects.length, 1);
+  assert.equal(state.sideEffects[0].uncertain, true);
+});
+
+for (const restart of [false, true]) {
+  test(`review R3: late denied-tool after preserves original identity without tainting reused paused attempt (restart=${restart})`, async () => {
+    let h = await pausedWriters();
+    h.state.nodes.b.spec.maxAttempts = 3;
+    const oldDispatchId = h.state.nodes.b.dispatchId;
+    const denied = { tool: 'edit', sessionID: 'child-b', callID: 'old-denied-edit', args: { filePath: 'outside/file' } };
+    await assert.rejects(() => h.enforcement.onToolBefore(denied, { args: denied.args }), /RUNNER_DENIED/);
+    const b1 = h.enforcement.dispatches.inspect('root').find((r) => r.nodeId === 'b');
+    await h.enforcement.onToolAfter({ tool: 'task', sessionID: 'root', callID: b1.callID, args: { subagent_type: 'graph-implementer' } }, {});
+    const b2 = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:b]\nContinue', task_id: 'child-b' });
+    await bindChild(h, 'child-b', 'graph-implementer', b2.callID);
+    await childIdle(h, 'child-a');
+    const before = structuredClone(h.state.nodes.b);
+    const firstPause = structuredClone(h.state.pendingDecision);
+    assert.notEqual(before.dispatchId, oldDispatchId);
+    if (restart) {
+      const state = structuredClone(h.state);
+      const bindings = new Map();
+      const store = { getRun: () => state, loadRun: async () => state, saveRun: async () => {} };
+      const enforcement = createEnforcement({ settings: {}, store, runner: h.runner, bindings });
+      const tools = createSubmitTools({ store, runner: h.runner, bindings, dispatches: enforcement.dispatches }).tools;
+      h = { ...h, state, store, bindings, enforcement, tools };
+      await startRun(h);
+    }
+    await h.enforcement.onToolAfter(denied, {});
+    assert.deepEqual(h.state.nodes.b, before);
+    const violations = h.state.violations.filter((entry) => entry.kind === 'executed-despite-deny');
+    assert.equal(violations.length, 1);
+    assert.equal(violations[0].dispatchId, oldDispatchId);
+    assert.equal(violations[0].sessionId, 'child-b');
+    assert.equal(violations[0].callID, denied.callID);
+    assert.equal(violations[0].target, 'outside/file');
+    await h.enforcement.onToolAfter(denied, {});
+    assert.equal(h.state.violations.filter((entry) => entry.kind === 'executed-despite-deny').length, 1);
+    assert.deepEqual(h.state.pendingDecision, firstPause);
+    const decide = () => h.tools.graph_run_decide.execute({ action: 'abort', reason: 'stop' }, ctx(h, 'root', 'graph-orchestrator')).then(JSON.parse);
+    assert.equal((await decide()).code, 'RUN_BUSY');
+    await h.enforcement.onToolAfter({ tool: 'task', sessionID: 'root', callID: b2.callID, args: b2.args }, {});
+    assert.equal((await decide()).ok, true);
+  });
+}
+
+test('paused before-hook allows owned closeout but refuses every new workspace effect', async () => {
+  const h = await pausedWriters();
+  await childIdle(h, 'child-a');
+  for (const tool of ['edit', 'write', 'bash']) {
+    await assert.rejects(() => h.enforcement.onToolBefore({ tool, sessionID: 'child-b', callID: `new-${tool}` }, { args: { filePath: 'b/file', command: 'node --version' } }), /BINDING_UNAVAILABLE/);
+    const permission = { status: 'ask' };
+    await h.enforcement.onPermissionAsk({ type: tool, sessionID: 'child-b' }, permission);
+    assert.equal(permission.status, 'deny');
+    await assert.rejects(() => h.enforcement.onToolBefore({ tool, sessionID: 'root', callID: `root-${tool}` }, { args: {} }), /BINDING_UNAVAILABLE/);
+  }
+  await assert.doesNotReject(() => h.enforcement.onToolBefore({ tool: 'graph_submit_change', sessionID: 'child-b' }, { args: {} }));
+  const result = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'b', filesTouched: [], summary: 'stopping' }, ctx(h, 'child-b', 'graph-implementer')));
+  assert.equal(result.effect, 'settlement');
+  assert.equal(h.state.nodes.b.state, 'RUNNING');
+  assert.equal(h.state.sideEffects.length, 0);
+});
+
+test('late tool-after records only an already-started call, once, against its original attempt', async () => {
+  const h = await pausedWriters();
+  const call = { tool: 'edit', sessionID: 'child-b', callID: 'edit-before-pause', args: { filePath: 'b/file' } };
+  await h.enforcement.onToolBefore(call, { args: call.args });
+  await childIdle(h, 'child-a');
+  await childIdle(h, 'child-b');
+  await h.enforcement.onToolAfter(call, {});
+  await h.enforcement.onToolAfter(call, {});
+  await h.enforcement.onToolAfter({ ...call, callID: 'forged', args: { filePath: 'b/forged' } }, {});
+  assert.deepEqual(h.state.sideEffects.map(({ nodeId, target }) => ({ nodeId, target })), [{ nodeId: 'b', target: 'b/file' }]);
+  assert.equal(h.state.status, 'AWAITING_USER_DECISION');
+  assert.equal(h.state.nodes.b.attempt, 1);
+});
+
+test('late tool-after persistence retries do not duplicate the ledger or charge attempts', async () => {
+  const base = harness();
+  await startRun(base);
+  const state = base.store.getRun('root');
+  state.nodes.b = { spec: { id: 'b', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['b/**'] }, state: 'PENDING', attempt: 0 };
+  let offline = false;
+  const store = { ...base.store, saveRun: async () => { if (offline) throw new Error('ledger disk offline'); } };
+  const enforcement = createEnforcement({ settings: {}, store, runner: base.runner, bindings: base.bindings });
+  const h = { ...base, store, enforcement };
+  const d = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:b]\nWork' });
+  await bindChild(h, 'child-b', 'graph-implementer', d.callID);
+  const call = { tool: 'edit', sessionID: 'child-b', callID: 'edit', args: { filePath: 'b/file' } };
+  await enforcement.onToolBefore(call, { args: call.args });
+  state.status = 'AWAITING_USER_DECISION';
+  state.pendingDecision = { cause: 'first', detail: 'paused', at: 'now' };
+  offline = true;
+  await assert.rejects(() => enforcement.onToolAfter(call, {}), /disk offline/);
+  offline = false;
+  await enforcement.onToolAfter(call, {});
+  await enforcement.onToolAfter(call, {});
+  assert.equal(state.sideEffects.length, 1);
+  assert.equal(state.sideEffects[0].dispatchId, state.nodes.b.dispatchId);
+  assert.equal(state.nodes.b.attempt, 1);
+});
+
+test('paused restart preserves already-started effect identity for late after-hook evidence', async () => {
+  const old = await pausedWriters();
+  const call = { tool: 'edit', sessionID: 'child-b', callID: 'interrupted-edit', args: { filePath: 'b/file' } };
+  await old.enforcement.onToolBefore(call, { args: call.args });
+  await childIdle(old, 'child-a');
+  const state = structuredClone(old.state);
+  const store = { getRun: () => state, loadRun: async () => state, saveRun: async () => {} };
+  const enforcement = createEnforcement({ settings: {}, store, runner: old.runner, bindings: new Map() });
+  await enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });
+  await enforcement.onToolAfter(call, {});
+  await enforcement.onToolAfter(call, {});
+  assert.equal(state.sideEffects.length, 1);
+  assert.equal(state.sideEffects[0].target, 'b/file');
+  assert.equal(state.sideEffects[0].dispatchId, state.nodes.b.dispatchId);
+  assert.equal(state.status, 'AWAITING_USER_DECISION');
+});
+
+for (const hostStatus of ['busy', 'idle', 'idle-omitted', 'unavailable']) {
+  test(`restart reconciles paused lingering attempts without dispatch capability: host=${hostStatus}`, async () => {
+    const old = await pausedWriters();
+    await childIdle(old, 'child-a');
+    const user = old.hostMessages.get('child-b').find((m) => m.info.role === 'user');
+    old.hostMessages.get('child-b').push({ info: { id: 'b-terminal', sessionID: 'child-b', role: 'assistant',
+      mode: 'graph-implementer', parentID: user.info.id, finish: 'stop', time: { created: 1, completed: 2 } }, parts: [] });
+    const state = structuredClone(old.state);
+    const firstPause = structuredClone(state.pendingDecision);
+    let durable;
+    const store = { getRun: () => state, loadRun: async () => state, saveRun: async (s) => { durable = structuredClone(s); } };
+    const bindings = new Map();
+    let observedStatus = hostStatus;
+    const client = { session: {
+      messages: old.client.session.messages,
+      message: old.client.session.message,
+      get: async ({ path }) => ({ data: { id: path.id, parentID: 'root' } }),
+      status: async () => {
+        if (observedStatus === 'unavailable') throw new Error('host offline');
+        return { data: observedStatus === 'idle-omitted' ? {} : { 'child-b': { type: observedStatus } } };
+      },
+    } };
+    const enforcement = createEnforcement({ settings: {}, store, runner: old.runner, bindings, client });
+    const tools = createSubmitTools({ store, runner: old.runner, bindings, dispatches: enforcement.dispatches }).tools;
+    await enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });
+    assert.equal(state.status, 'AWAITING_USER_DECISION');
+    assert.deepEqual(state.pendingDecision, firstPause);
+    assert.equal(state.nodes.b.attempt, 1);
+    await assert.rejects(() => enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: 'after-restart' }, { args: { filePath: 'b/file' } }), /BINDING_UNAVAILABLE/);
+    const decide = () => tools.graph_run_decide.execute({ action: 'abort', reason: 'user stops' }, { sessionID: 'root', agent: 'graph-orchestrator' }).then(JSON.parse);
+    if (!hostStatus.startsWith('idle')) {
+      assert.equal((await decide()).code, 'RUN_BUSY');
+      observedStatus = 'idle';
+      await enforcement.onEvent({ event: { id: 'ended', type: 'session.idle', properties: { sessionID: 'child-b' } } });
+    }
+    assert.equal(state.nodes.b.state, 'FAILED');
+    assert.equal(durable.nodes.b.state, 'FAILED');
+    assert.deepEqual(durable.pendingDecision, firstPause);
+    assert.equal((await decide()).ok, true);
+  });
 }
 
 test('only the first graph-orchestrator root request is captured', async (t) => {
@@ -312,6 +1338,7 @@ test('full gated flow: plan → FAIL pauses for decision; abort closes the run; 
   assert.match(smuggler.args.prompt, /RUNNER_REJECTED/);
   assert.match(smuggler.args.prompt, /AWAITING_DECISION/);
   await childIdle(h, 'child-critic');
+  await childIdle(h, 'child-planner');
 
   // The user's abort decision is irreversible and preserves the evidence.
   const aborted = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'abort', reason: 'requirements changed' }, ctx(h, 'root', 'graph-orchestrator')));
@@ -425,6 +1452,7 @@ test('crash window: side effects lead to RECOVERY_REQUIRED; resume preserves att
   await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
   await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
+  await h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-impl', callID: 'e1' }, { args: { filePath: join(dir, 'src', 'a.ts') } });
   await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-impl', callID: 'e1', args: { filePath: join(dir, 'src', 'a.ts') } }, { title: 'edit', output: 'ok' });
   assert.equal(h.store.getRun('root').nodes['impl-1'].attempt, 1);
 
@@ -587,6 +1615,7 @@ test('write tool is scope-gated exactly like edit and enters the side-effect led
   assert.ok(h.store.getRun('root').violations.some((entry) => entry.kind === 'out-of-scope-write'));
 
   await mkdir(join(dir, 'pkg-b'), { recursive: true });
+  await h.enforcement.onToolBefore({ tool: 'write', sessionID: 'child-b', callID: 'w2' }, { args: { filePath: join(dir, 'pkg-b', 'new.ts'), content: 'y' } });
   await h.enforcement.onToolAfter({ tool: 'write', sessionID: 'child-b', callID: 'w2', args: { filePath: join(dir, 'pkg-b', 'new.ts'), content: 'y' } }, { title: 'write', output: 'ok' });
   const state = h.store.getRun('root');
   assert.ok(state.sideEffects.some((effect) => effect.nodeId === 'impl-b' && effect.tool === 'write' && effect.target === 'pkg-b/new.ts'));
@@ -777,7 +1806,7 @@ test('custom artifact names are rejected at plan submission, not stranded at dis
   assert.equal(Object.keys(state.nodes).length, 0);
 });
 
-test('critic dispatch before findings exist is rejected up front with NO_READY_NODE', async (t) => {
+test('plan before required findings exist rejects early and a corrected resubmission completes', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'loop-critic-notready-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const h = harness(dir);
@@ -785,19 +1814,23 @@ test('critic dispatch before findings exist is rejected up front with NO_READY_N
 
   await dispatch(h, 'graph-planner');
   await bindChild(h, 'child-planner', 'graph-planner');
+  const before = structuredClone(h.store.getRun('root'));
   const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS(['findings']) }, ctx(h, 'child-planner', 'graph-planner')));
-  assert.equal(plan.ok, true, JSON.stringify(plan));
+  assert.equal(plan.code, 'INVALID_GRAPH', JSON.stringify(plan));
+  assert.match(plan.detail, /findings/);
+  assert.deepEqual(h.store.getRun('root'), before);
 
   const blocked = await dispatch(h, 'graph-plan-critic');
   assert.match(blocked.args.prompt, /RUNNER_REJECTED/);
   assert.match(blocked.args.prompt, /NO_READY_NODE/);
-  assert.match(blocked.args.prompt, /resubmit a corrected plan/);
 
   // Registering findings unblocks the same dispatch path to completion.
   await dispatch(h, 'graph-explorer');
   await bindChild(h, 'child-explore', 'graph-explorer');
   await h.tools.graph_submit_findings.execute({ summary: 'late evidence', evidence: [] }, ctx(h, 'child-explore', 'graph-explorer'));
   await childIdle(h, 'child-explore');
+  const corrected = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS(['findings']) }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(corrected.ok, true, JSON.stringify(corrected));
   const admitted = await dispatch(h, 'graph-plan-critic');
   assert.ok(!admitted.args.prompt.includes('RUNNER_REJECTED'));
   await bindChild(h, 'child-critic', 'graph-plan-critic');
@@ -905,7 +1938,8 @@ test('graph_run_decide preconditions: role, root, in-flight nodes and dispatches
 
   await dispatch(h, 'graph-planner');
   await bindChild(h, 'child-planner', 'graph-planner');
-  await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: DECIDE_SPECS }, ctx(h, 'child-planner', 'graph-planner'));
+  const accepted = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: DECIDE_SPECS.map((s) => ({ ...s, inputs: [] })) }, ctx(h, 'child-planner', 'graph-planner')));
+  assert.equal(accepted.ok, true, JSON.stringify(accepted));
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   const paused = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['wrong'] }, ctx(h, 'child-critic', 'graph-plan-critic')));
@@ -916,6 +1950,7 @@ test('graph_run_decide preconditions: role, root, in-flight nodes and dispatches
   assert.equal(busyDispatch.ok, false);
   assert.equal(busyDispatch.code, 'DISPATCH_PENDING');
   await childIdle(h, 'child-critic');
+  await childIdle(h, 'child-planner');
 
   // RUNNING nodes also block: revive one through a bound implementer... this
   // run is plan-only, so abort directly instead and verify terminal guards.
@@ -1094,6 +2129,7 @@ test('crash on the final attempt: refund plus cross-restart task_id continuation
   await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
   await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
+  await h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-impl', callID: 'e1' }, { args: { filePath: join(dir, 'src', 'a.ts') } });
   await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-impl', callID: 'e1', args: { filePath: join(dir, 'src', 'a.ts') } }, { title: 'edit', output: 'ok' });
   // The crash happened on the node's third and final attempt.
   const preCrash = h.store.getRun('root');
@@ -1222,6 +2258,7 @@ test('user reset carries prior rejections and findings into the successor run', 
   const fail = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['misses token rotation entirely'] }, ctx(h, 'child-critic', 'graph-plan-critic')));
   assert.equal(fail.effect, 'await-decision');
   await childIdle(h, 'child-critic');
+  await childIdle(h, 'child-planner');
 
   const reset = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'reset', reason: 'user wants the rotation handled' }, ctx(h, 'root', 'graph-orchestrator')));
   assert.equal(reset.ok, true, JSON.stringify(reset));
@@ -1296,9 +2333,11 @@ test('round-1 planner continues through task_id after REVISE and submits v2 (fie
   const v1 = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'p1', 'graph-planner')));
   assert.equal(v1.ok, true, JSON.stringify(v1));
   await childIdle(h, 'p1');
-  // A successful plan submission invalidates old dispatch bindings: the
-  // round-1 session has neither a binding nor a node sessionId to resume.
-  assert.equal(h.bindings.has('p1'), false);
+  // Publication revokes execution; the completed free lifetime retains only
+  // its conversation identity, with no node sessionId to resume.
+  assert.equal(h.bindings.get('p1').active, false);
+  assert.equal(h.bindings.get('p1').settlementOnly, true);
+  assert.equal(h.bindings.get('p1').nodeId, null);
 
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'c1', 'graph-plan-critic');
@@ -1351,6 +2390,7 @@ test('declared deliverables surface as mechanical progress through graph_inspect
 
   // One of two deliverables exists so far: inspect reports 1/2 mechanically.
   await mkdir(join(dir, 'src'), { recursive: true });
+  await h.enforcement.onToolBefore({ tool: 'write', sessionID: 'child-impl', callID: 'w1' }, { args: { filePath: join(dir, 'src', 'a.ts'), content: 'a' } });
   await writeFile(join(dir, 'src', 'a.ts'), 'a');
   await h.enforcement.onToolAfter({ tool: 'write', sessionID: 'child-impl', callID: 'w1', args: { filePath: join(dir, 'src', 'a.ts'), content: 'a' } }, { title: 'write', output: 'ok' });
   let inspected = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'root', 'graph-orchestrator')));
@@ -1663,6 +2703,7 @@ test('reset carry-over includes explorer learnings', async (t) => {
   const fail = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['misses token rotation entirely'] }, ctx(h, 'child-critic', 'graph-plan-critic')));
   assert.equal(fail.effect, 'await-decision');
   await childIdle(h, 'child-critic');
+  await childIdle(h, 'child-planner');
 
   const reset = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'reset', reason: 'user wants the rotation handled' }, ctx(h, 'root', 'graph-orchestrator')));
   assert.equal(reset.ok, true, JSON.stringify(reset));
@@ -1687,13 +2728,15 @@ test('reset carry-over digest aggregates recent findings versions', async (t) =>
   await childIdle(h, 'child-explore');
   await dispatch(h, 'graph-planner');
   await bindChild(h, 'child-planner', 'graph-planner');
-  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'child-planner', 'graph-planner')));
+  const specs = PLAN_ONLY_SPECS().map((s) => s.kind === 'plan' ? { ...s, inputs: ['findings@2'] } : s);
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs }, ctx(h, 'child-planner', 'graph-planner')));
   assert.equal(plan.ok, true, JSON.stringify(plan));
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   const fail = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['misses token rotation entirely'] }, ctx(h, 'child-critic', 'graph-plan-critic')));
   assert.equal(fail.effect, 'await-decision');
   await childIdle(h, 'child-critic');
+  await childIdle(h, 'child-planner');
 
   const reset = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'reset', reason: 'user wants the rotation handled' }, ctx(h, 'root', 'graph-orchestrator')));
   assert.equal(reset.ok, true, JSON.stringify(reset));
@@ -1715,13 +2758,15 @@ test('reset carry-over learnings aggregate across versions, newest first', async
   await childIdle(h, 'child-explore');
   await dispatch(h, 'graph-planner');
   await bindChild(h, 'child-planner', 'graph-planner');
-  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'child-planner', 'graph-planner')));
+  const specs = PLAN_ONLY_SPECS().map((s) => s.kind === 'plan' ? { ...s, inputs: ['findings@2'] } : s);
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs }, ctx(h, 'child-planner', 'graph-planner')));
   assert.equal(plan.ok, true, JSON.stringify(plan));
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   const fail = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['misses token rotation entirely'] }, ctx(h, 'child-critic', 'graph-plan-critic')));
   assert.equal(fail.effect, 'await-decision');
   await childIdle(h, 'child-critic');
+  await childIdle(h, 'child-planner');
 
   const reset = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'reset', reason: 'user wants the rotation handled' }, ctx(h, 'root', 'graph-orchestrator')));
   assert.equal(reset.ok, true, JSON.stringify(reset));
@@ -1748,13 +2793,15 @@ test('reset carry-over learnings cap at 8 with the newest version draining first
   await childIdle(h, 'child-explore');
   await dispatch(h, 'graph-planner');
   await bindChild(h, 'child-planner', 'graph-planner');
-  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs: PLAN_ONLY_SPECS() }, ctx(h, 'child-planner', 'graph-planner')));
+  const specs = PLAN_ONLY_SPECS().map((s) => s.kind === 'plan' ? { ...s, inputs: ['findings@2'] } : s);
+  const plan = JSON.parse(await h.tools.graph_submit_plan.execute({ intent: 'plan-only', specs }, ctx(h, 'child-planner', 'graph-planner')));
   assert.equal(plan.ok, true, JSON.stringify(plan));
   await dispatch(h, 'graph-plan-critic');
   await bindChild(h, 'child-critic', 'graph-plan-critic');
   const fail = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['misses token rotation entirely'] }, ctx(h, 'child-critic', 'graph-plan-critic')));
   assert.equal(fail.effect, 'await-decision');
   await childIdle(h, 'child-critic');
+  await childIdle(h, 'child-planner');
 
   const reset = JSON.parse(await h.tools.graph_run_decide.execute({ action: 'reset', reason: 'user wants the rotation handled' }, ctx(h, 'root', 'graph-orchestrator')));
   assert.equal(reset.ok, true, JSON.stringify(reset));
@@ -1793,6 +2840,7 @@ test('reset carry-over falls back to the latest artifact without findings histor
   const fail = JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['misses token rotation entirely'] }, ctx(h, 'child-critic', 'graph-plan-critic')));
   assert.equal(fail.effect, 'await-decision');
   await childIdle(h, 'child-critic');
+  await childIdle(h, 'child-planner');
 
   // Simulate a pre-retention run file: history is absent, artifact remains.
   delete h.store.getRun('root').findingsLog;

@@ -5,7 +5,8 @@ import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRunStore, newRun, SCHEMA_VERSION } from '../src/run-state.mjs';
-import { createRunner } from '../src/runner.mjs';
+import { createRunner, depsSatisfied } from '../src/runner.mjs';
+import { cleanJson } from '../src/json-safe.mjs';
 import { validateTaskGraph } from '../src/task-spec.mjs';
 
 const NOW = '2026-09-07T00:00:00.000Z';
@@ -30,6 +31,544 @@ function freshRun(graph = changeGraph()) {
   assert.equal(submission.ok, true, JSON.stringify(submission));
   return state;
 }
+
+for (const [id, input] of [
+  ['review-1', 'review'],
+  ['review-1', 'verification:verify-1'],
+  ['impl-1', 'verification:verify-1@1'],
+]) {
+  test(`A2 rejects effective artifact cycle ${id} -> ${input} atomically`, () => {
+    const state = freshRun();
+    const nodes = changeGraph().nodes;
+    nodes.get(id).inputs = [input];
+    const before = structuredClone(state);
+    const result = runner.submitPlan(state, { intent: 'change', nodes, now: 'later' });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.code, 'INVALID_GRAPH');
+    assert.match(result.detail, /cycle/);
+    assert.ok(result.detail.includes(id) && result.detail.includes(input), result.detail);
+    assert.deepEqual(state, before);
+  });
+}
+
+for (const input of ['findings', 'findings@2', 'change:impl-1@2', 'change:impl-1@0', 'review']) {
+  test(`A2 rejects missing or impossible future ref ${input} atomically`, () => {
+    const state = freshRun();
+    const nodes = changeGraph().nodes;
+    if (input === 'review') nodes.delete('review-1');
+    nodes.get('impl-1').dependsOn = ['plan-1'];
+    nodes.get(input.startsWith('change:') ? 'verify-1' : 'impl-1').inputs = [input];
+    const before = structuredClone(state);
+    const result = runner.submitPlan(state, { intent: 'light', nodes, now: 'later' });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.ok(result.detail.includes(input), result.detail);
+    assert.deepEqual(state, before);
+  });
+}
+
+test('A2 runner Map callers cannot bypass structural validation', () => {
+  const state = freshRun();
+  const nodes = changeGraph().nodes;
+  nodes.get('impl-1').dependsOn = ['plan-1'];
+  const before = structuredClone(state);
+  assert.equal(runner.submitPlan(state, { intent: 'change', nodes, now: NOW }).ok, false);
+  assert.deepEqual(state, before);
+});
+
+test('A2 raw Map and basedOn shape rejection is structured and atomic', () => {
+  const state = freshRun();
+  const before = structuredClone(state);
+  for (const payload of [{ nodes: new Map([['bad', null]]) }, { nodes: changeGraph().nodes, basedOn: null }]) {
+    const result = runner.submitPlan(state, { intent: 'change', now: NOW, ...payload });
+    assert.equal(result.code, 'INVALID_GRAPH');
+    assert.deepEqual(state, before);
+  }
+});
+
+function evidence(kind, version = 1, basedOn = []) {
+  return { kind, nodeId: 'historical', version, basedOn, payload: {}, status: 'valid', createdAt: NOW };
+}
+
+function publicationWorkFixture(chainLength, repeated) {
+  const state = newRun({ runId: 'publication-work', rootSessionId: 'root', now: NOW });
+  state.artifacts['change:writer-00'] = evidence('change');
+  const history = [];
+  let previous = 'change:writer-00@1';
+  for (let index = 0; index < chainLength; index++) {
+    const name = `verification:history-${String(index).padStart(3, '0')}`;
+    state.artifacts[name] = evidence('verification', 1, [previous]);
+    previous = `${name}@1`;
+    history.push(previous);
+  }
+  const inputs = repeated ? Array(32).fill(previous) : history.slice(-32);
+  const specs = [spec('p', 'plan', 'graph-planner'), spec('r', 'review', 'graph-plan-critic', { dependsOn: ['p'] })];
+  for (let index = 0; index < 60; index++) {
+    const id = `writer-${String(index).padStart(2, '0')}`;
+    specs.push(spec(id, 'implement', 'graph-implementer', { dependsOn: ['r'], inputs, writeScope: [`${id}/file`] }));
+  }
+  const accepted = runner.submitPlan(state, { intent: 'change', nodes: new Map(specs.map((s) => [s.id, s])), now: NOW });
+  assert.equal(accepted.ok, true, JSON.stringify(accepted));
+  return state;
+}
+
+for (const [chainLength, repeated] of [[150, false], [300, true]]) {
+  test(`A2 quality I1: one bounded publication calculation per scan (${chainLength}, repeated=${repeated})`, async (t) => {
+    const state = publicationWorkFixture(chainLength, repeated);
+    await dispatchCriticAndPass(state);
+    const bytes = Buffer.byteLength(JSON.stringify(cleanJson(state, { maxBytes: 1_048_576, maxValues: 20_000, maxDepth: 32 })));
+    // One untimed-by-assertion measurement of the reviewer's large distinct-ref
+    // shape records before/after performance without a flaky wall-clock gate.
+    if (!repeated) {
+      const start = performance.now();
+      runner.inspect(state);
+      t.diagnostic(`plain inspect: ${(performance.now() - start).toFixed(2)} ms; cleanJson bytes=${bytes}`);
+    }
+    let reads = 0;
+    const artifactCount = Object.keys(state.artifacts).length;
+    for (const artifact of Object.values(state.artifacts)) {
+      const basedOn = artifact.basedOn;
+      Object.defineProperty(artifact, 'basedOn', { configurable: true, get() {
+        // Inspection also reads each artifact once for its public report.
+        assert.ok(++reads <= 2 * artifactCount, `provenance revisited ${reads} times for ${artifactCount} artifacts`);
+        return basedOn;
+      } });
+    }
+    let start = performance.now();
+    const report = runner.inspect(state);
+    t.diagnostic(`instrumented inspect: ${(performance.now() - start).toFixed(2)} ms; provenance reads=${reads}`);
+    assert.equal(report.nodes.find((n) => n.id === 'writer-00').waitingOn.length, 59, 'one barrier per publisher/reader pair, not per repeated or overlapping ref');
+    for (const target of [null, 'writer-00', 'writer-01']) {
+      reads = 0;
+      start = performance.now();
+      const admitted = runner.admitDispatch(state, { agent: 'graph-implementer', nodeId: target, now: NOW });
+      assert.equal(admitted.allowed, target !== 'writer-00');
+      assert.ok(reads <= artifactCount, 'admission must compute provenance once, including the chosen-node recheck');
+      t.diagnostic(`admit ${target ?? 'sorted'}: ${(performance.now() - start).toFixed(2)} ms; provenance reads=${reads}`);
+    }
+    reads = 0;
+    assert.equal(depsSatisfied(state, state.nodes['writer-00']).missing.length, 59);
+    assert.ok(reads <= artifactCount, 'standalone dependency checks are also bounded');
+    // No-ready dispatch must share the calculation with its waiting diagnostics.
+    state.nodes.r.state = 'PENDING';
+    reads = 0;
+    assert.equal(runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW }).code, 'NO_READY_NODE');
+    assert.ok(reads <= artifactCount);
+  });
+}
+
+test('A2 quality I1: duplicate historical refs produce one barrier and calculations refresh after mutations', async () => {
+  const state = freshRun();
+  state.artifacts['change:impl-1'] = evidence('change');
+  const nodes = changeGraph().nodes;
+  nodes.set('impl-2', spec('impl-2', 'implement', 'graph-implementer', { dependsOn: ['review-1'], inputs: Array(32).fill('change:impl-1@1'), writeScope: ['docs/b.md'] }));
+  assert.equal(runner.submitPlan(state, { intent: 'change', nodes, now: NOW }).ok, true);
+  await dispatchCriticAndPass(state, 2);
+  assert.equal(depsSatisfied(state, state.nodes['impl-1']).missing.length, 1);
+  assert.equal(runner.inspect(state).nodes.find((n) => n.id === 'impl-1').waitingOn.length, 1);
+  assert.equal(runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW }).nodeId, 'impl-2');
+  runner.beginNode(state, 'impl-2', { now: NOW });
+  assert.equal(runner.submitChange(state, { nodeId: 'impl-2', filesTouched: [], summary: 'read prior evidence', now: NOW }).ok, true);
+  assert.equal(depsSatisfied(state, state.nodes['impl-1']).ok, true);
+  assert.equal(runner.inspect(state).nodes.find((n) => n.id === 'impl-1').ready, true);
+  assert.equal(runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW }).nodeId, 'impl-1');
+  await dispatchImplementerAndSucceed(state);
+  state.nodes['impl-2'].state = 'PENDING';
+  assert.equal(depsSatisfied(state, state.nodes['impl-2']).ok, false, 'v1 pin must not use a cached success after v2 publication');
+  assert.equal(runner.admitDispatch(state, { agent: 'graph-implementer', nodeId: 'impl-2', now: NOW }).allowed, false);
+  assert.equal(runner.inspect(state).nodes.find((n) => n.id === 'impl-2').ready, false);
+});
+
+test('A2 quality M1: plan.basedOn is a legal node id, not the plan provenance context', () => {
+  const state = newRun({ runId: 'sentinel', rootSessionId: 'root', now: NOW });
+  const graph = validateTaskGraph([spec('p', 'plan', 'graph-planner'), spec('plan.basedOn', 'review', 'graph-plan-critic', { dependsOn: ['p'], inputs: ['plan'] })], { planOnly: true });
+  assert.equal(graph.ok, true, graph.errors.join('; '));
+  const accepted = runner.submitPlan(state, { intent: 'plan-only', nodes: graph.nodes, now: NOW });
+  assert.equal(accepted.ok, true, JSON.stringify(accepted));
+  const before = structuredClone(state);
+  assert.equal(runner.submitPlan(state, { intent: 'plan-only', nodes: graph.nodes, basedOn: ['plan@2'], now: NOW }).code, 'INVALID_GRAPH');
+  assert.deepEqual(state, before, 'real self-referential plan provenance still rejects atomically');
+  const admitted = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
+  assert.equal(admitted.nodeId, 'plan.basedOn');
+  runner.beginNode(state, admitted.nodeId, { now: NOW });
+  assert.equal(runner.submitReview(state, { planVersion: 1, verdict: 'PASS', now: NOW }).ok, true);
+  assert.equal(state.status, 'SUCCEEDED');
+});
+
+for (const explicit of [false, true]) {
+  test(`A2 quality M2: full flow supports 128-character producer ids (explicit=${explicit})`, () => {
+    const implementation = 'a'.repeat(128);
+    const verification = 'v'.repeat(128);
+    const specs = [spec('p', 'plan', 'graph-planner'), spec('r', 'review', 'graph-plan-critic', { dependsOn: ['p'] }),
+      spec(implementation, 'implement', 'graph-implementer', { dependsOn: ['r'], writeScope: ['src/a.ts'], ...(explicit ? { outputs: [`change:${implementation}`] } : {}) }),
+      spec(verification, 'verify', 'graph-verifier', { dependsOn: [implementation], ...(explicit ? { inputs: [`change:${implementation}@1`], outputs: [`verification:${verification}`] } : {}) })];
+    const graph = validateTaskGraph(specs);
+    assert.equal(graph.ok, true, graph.errors.join('; '));
+    const state = newRun({ runId: 'long-ids', rootSessionId: 'root', now: NOW });
+    const accepted = runner.submitPlan(state, { intent: 'change', nodes: graph.nodes, now: NOW });
+    assert.equal(accepted.ok, true, JSON.stringify(accepted));
+    for (const id of ['r', implementation, verification]) {
+      const admitted = runner.admitDispatch(state, { agent: state.nodes[id].spec.agent, nodeId: id, now: NOW });
+      assert.equal(admitted.allowed, true, JSON.stringify(admitted));
+      runner.beginNode(state, id, { now: NOW });
+      const result = id === 'r' ? runner.submitReview(state, { planVersion: 1, verdict: 'PASS', now: NOW })
+        : id === implementation ? runner.submitChange(state, { nodeId: id, filesTouched: [], summary: 'done', now: NOW })
+          : runner.submitVerification(state, { nodeId: id, verdict: 'PASS', commands: [{ command: 'test', exitCode: 0 }], now: NOW });
+      assert.equal(result.ok, true, JSON.stringify(result));
+    }
+    assert.deepEqual(state.artifacts[`verification:${verification}`].basedOn, [`change:${implementation}@1`]);
+    assert.equal(state.status, 'SUCCEEDED');
+  });
+}
+
+test('A2 existing evidence needs no cosmetic producers and findingsLog does not satisfy old pins', () => {
+  const state = freshRun();
+  state.artifacts.findings = evidence('findings', 3);
+  state.artifacts['verification:old'] = evidence('verification', 2, ['findings@3']);
+  state.findingsLog = [{ version: 1, summary: 'old' }];
+  const nodes = changeGraph().nodes;
+  nodes.delete('explore-1');
+  nodes.get('plan-1').dependsOn = [];
+  nodes.get('plan-1').inputs = ['findings@3'];
+  nodes.get('review-1').inputs = ['verification:old@2', 'plan@999'];
+  assert.equal(runner.submitPlan(state, { intent: 'change', nodes, basedOn: ['findings@3'], now: NOW }).ok, true);
+  assert.equal(runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW }).allowed, true);
+  for (const input of ['findings@1', 'findings@4', 'verification:ghost', 'verification:old@1']) {
+    nodes.get('review-1').inputs = [input];
+    const before = structuredClone(state);
+    const result = runner.submitPlan(state, { intent: 'change', nodes, now: NOW });
+    assert.equal(result.ok, false, input);
+    assert.ok(result.detail.includes(input), result.detail);
+    assert.deepEqual(state, before);
+  }
+});
+
+test('A2 replacement review, baseline and transitive old PASS cannot mask new cycles', async () => {
+  const state = freshRun();
+  await dispatchCriticAndPass(state);
+  await dispatchImplementerAndSucceed(state);
+  state.artifacts['verification:verify-1'] = evidence('verification', 1, ['change:impl-1@1']);
+  state.artifacts['baseline:base-1'] = evidence('baseline');
+  for (const [nodeId, input] of [['review-1', 'review'], ['review-1', 'verification:verify-1'], ['review-1', 'baseline:base-1']]) {
+    const nodes = baselineGraph().nodes;
+    nodes.get(nodeId).inputs = [input];
+    const before = structuredClone(state);
+    const result = runner.submitPlan(state, { intent: 'change', nodes, now: NOW });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.match(result.detail, /cycle/);
+    assert.ok(result.detail.includes(input), result.detail);
+    assert.deepEqual(state, before);
+  }
+  assert.equal(runner.submitPlan(state, { intent: 'change', nodes: changeGraph().nodes, now: NOW }).ok, true);
+  assert.equal(state.artifacts.review.status, 'superseded');
+  assert.equal(state.artifacts['change:impl-1'].status, 'stale');
+  assert.equal(state.artifacts['verification:verify-1'].status, 'stale');
+});
+
+test('A2 replacement cannot rebind historical plan provenance to the new plan', () => {
+  for (const source of ['plan', 'plan@2']) {
+    const state = freshRun();
+    state.artifacts['change:impl-1'] = evidence('change', 1, [source]);
+    state.artifacts['verification:verify-1'] = evidence('verification', 1, ['change:impl-1@1']);
+    const nodes = changeGraph().nodes;
+    nodes.get('review-1').inputs = ['verification:verify-1'];
+    const before = structuredClone(state);
+    const result = runner.submitPlan(state, { intent: 'change', nodes, now: NOW });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.match(result.detail, /cycle/);
+    assert.deepEqual(state, before);
+  }
+});
+
+test('A2 artifact-only prerequisites actually gate independent packages at dispatch', async () => {
+  const nodes = changeGraph().nodes;
+  nodes.set('impl-2', spec('impl-2', 'implement', 'graph-implementer', { dependsOn: ['review-1'], inputs: ['verification:verify-1@1'], writeScope: ['docs/b.md'] }));
+  nodes.set('verify-2', spec('verify-2', 'verify', 'graph-verifier', { dependsOn: ['impl-2'] }));
+  const state = freshRun({ nodes });
+  await dispatchCriticAndPass(state);
+  assert.equal(runner.admitDispatch(state, { agent: 'graph-implementer', nodeId: 'impl-2', now: NOW }).allowed, false);
+  await dispatchImplementerAndSucceed(state);
+  assert.equal((await dispatchVerifier(state, 'PASS')).ok, true);
+  assert.equal(runner.admitDispatch(state, { agent: 'graph-implementer', nodeId: 'impl-2', now: NOW }).allowed, true);
+});
+
+test('A2 a current pin cannot be stranded by its planned replacement', async () => {
+  const state = freshRun();
+  state.artifacts['change:impl-1'] = evidence('change');
+  const nodes = changeGraph().nodes;
+  nodes.get('verify-1').inputs = ['change:impl-1@1'];
+  const before = structuredClone(state);
+  const result = runner.submitPlan(state, { intent: 'change', nodes, now: NOW });
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.ok(result.detail.includes('change:impl-1@1'), result.detail);
+  assert.deepEqual(state, before);
+});
+
+test('A2 available historical pins are consumed before an independent replacement can publish', async () => {
+  const state = freshRun();
+  state.artifacts['change:impl-1'] = evidence('change');
+  const nodes = changeGraph().nodes;
+  nodes.set('impl-2', spec('impl-2', 'implement', 'graph-implementer', { dependsOn: ['review-1'], inputs: ['change:impl-1@1'], writeScope: ['docs/b.md'] }));
+  assert.equal(runner.submitPlan(state, { intent: 'change', nodes, now: NOW }).ok, true);
+  await dispatchCriticAndPass(state, 2);
+  assert.equal(runner.admitDispatch(state, { agent: 'graph-implementer', nodeId: 'impl-1', now: NOW }).allowed, false);
+  const admit = runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW });
+  assert.equal(admit.nodeId, 'impl-2');
+  runner.beginNode(state, 'impl-2', { now: NOW });
+  assert.equal(runner.submitChange(state, { nodeId: 'impl-2', filesTouched: [], summary: 'consumed historical evidence', now: NOW }).ok, true);
+  assert.equal(runner.admitDispatch(state, { agent: 'graph-implementer', nodeId: 'impl-1', now: NOW }).allowed, true);
+});
+
+test('A2 completed plan cannot consume its own output or evidence from future work', () => {
+  for (const ref of ['plan', 'verification:verify-1']) {
+    const state = freshRun();
+    const nodes = changeGraph().nodes;
+    nodes.get('plan-1').inputs = [ref];
+    const before = structuredClone(state);
+    assert.equal(runner.submitPlan(state, { intent: 'change', nodes, now: NOW }).ok, false, ref);
+    assert.deepEqual(state, before);
+  }
+});
+
+test('A2 stale evidence and unsatisfied plan basedOn reject before mutation', () => {
+  const state = freshRun();
+  state.artifacts.findings = { ...evidence('findings'), status: 'stale' };
+  for (const basedOn of [['findings@1'], ['plan@2'], ['verification:verify-1'], ['bad ref']]) {
+    const before = structuredClone(state);
+    assert.equal(runner.submitPlan(state, { intent: 'change', nodes: changeGraph().nodes, basedOn, now: NOW }).ok, false);
+    assert.deepEqual(state, before);
+  }
+});
+
+test('A2 implicit verification evidence dependencies cannot require an unproduced artifact', () => {
+  const state = freshRun();
+  const nodes = changeGraph().nodes;
+  nodes.get('verify-1').dependsOn.push('review-1');
+  const before = structuredClone(state);
+  const result = runner.submitPlan(state, { intent: 'change', nodes, now: NOW });
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.match(result.detail, /verify-1.*change:review-1/);
+  assert.deepEqual(state, before);
+});
+
+test('A2 full-to-light replan creates evidence bound to the new plan, not the superseded review', async () => {
+  const state = freshRun();
+  await dispatchCriticAndPass(state);
+  assert.equal(runner.submitPlan(state, { intent: 'light', nodes: lightGraph().nodes, now: NOW }).ok, true);
+  await dispatchImplementerAndSucceed(state);
+  assert.deepEqual(state.artifacts['change:impl-1'].basedOn, ['plan@2']);
+  assert.equal((await dispatchVerifier(state, 'PASS')).ok, true);
+});
+
+test('A2 multiple documentary findings producers do not invent future versions', () => {
+  const state = freshRun();
+  state.artifacts.findings = evidence('findings', 3);
+  const nodes = changeGraph().nodes;
+  nodes.set('analyze-1', spec('analyze-1', 'analyze', 'graph-multimodal', { inputs: ['findings@3'] }));
+  nodes.get('review-1').inputs = ['findings@3'];
+  assert.equal(runner.submitPlan(state, { intent: 'change', nodes, now: NOW }).ok, true);
+  assert.equal(state.artifacts.findings.version, 3);
+  nodes.get('review-1').inputs = ['findings@4'];
+  assert.equal(runner.submitPlan(state, { intent: 'change', nodes, now: NOW }).ok, false);
+});
+
+test('A2 preserved independent evidence can satisfy a review without waiting for its later replacement', () => {
+  const state = freshRun();
+  state.artifacts.findings = evidence('findings');
+  state.artifacts['verification:verify-1'] = evidence('verification', 4, ['findings@1']);
+  const nodes = changeGraph().nodes;
+  nodes.get('review-1').inputs = ['verification:verify-1@4'];
+  assert.equal(runner.submitPlan(state, { intent: 'change', nodes, now: NOW }).ok, true);
+  assert.equal(runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW }).nodeId, 'review-1');
+  assert.deepEqual(state.nodes['review-1'].spec.inputs, ['verification:verify-1@4']);
+});
+
+test('A2 indirect historical provenance pins are read before their source is replaced', async () => {
+  const state = freshRun();
+  state.artifacts['change:impl-1'] = evidence('change');
+  state.artifacts['verification:old'] = evidence('verification', 1, ['change:impl-1@1']);
+  const nodes = changeGraph().nodes;
+  nodes.set('impl-2', spec('impl-2', 'implement', 'graph-implementer', { dependsOn: ['review-1'], inputs: ['verification:old'], writeScope: ['docs/b.md'] }));
+  assert.equal(runner.submitPlan(state, { intent: 'change', nodes, now: NOW }).ok, true);
+  await dispatchCriticAndPass(state, 2);
+  assert.equal(runner.admitDispatch(state, { agent: 'graph-implementer', now: NOW }).nodeId, 'impl-2');
+});
+
+for (const minted of [false, true]) {
+  test(`A2 review fix: consumed plan provenance cannot grow a verifier self-edge (minted=${minted})`, async () => {
+    const initial = changeGraph().nodes;
+    initial.set('pending', spec('pending', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['docs/pending.md'] }));
+    const state = freshRun({ nodes: initial });
+    state.artifacts.findings = evidence('findings');
+    if (minted) {
+      await dispatchCriticAndPass(state);
+      await dispatchImplementerAndSucceed(state);
+      const admitted = runner.admitDispatch(state, { agent: 'graph-verifier', nodeId: 'verify-1', now: NOW });
+      assert.equal(admitted.allowed, true, JSON.stringify(admitted));
+      runner.beginNode(state, 'verify-1', { now: NOW });
+      const verified = runner.submitVerification(state, { nodeId: 'verify-1', verdict: 'PASS', changeRefs: ['findings@1'], commands: [{ command: 'test', exitCode: 0 }], now: NOW });
+      assert.equal(verified.ok, true, JSON.stringify(verified));
+      assert.equal(state.status, 'RUNNING', 'the other pending node keeps this run replannable');
+    } else {
+      state.artifacts['verification:verify-1'] = evidence('verification', 1, ['findings@1']);
+    }
+    const nodes = changeGraph().nodes;
+    nodes.get('review-1').inputs = ['plan'];
+    nodes.get('impl-1').inputs = ['review'];
+    nodes.get('verify-1').inputs = ['change:impl-1'];
+    const accepted = runner.submitPlan(state, { intent: 'change', nodes, basedOn: ['verification:verify-1@1'], now: NOW });
+    assert.equal(accepted.ok, true, JSON.stringify(accepted));
+    await dispatchCriticAndPass(state, 2);
+    await dispatchImplementerAndSucceed(state);
+    assert.equal((await dispatchVerifier(state, 'PASS')).ok, true);
+    assert.equal(state.artifacts['verification:verify-1'].version, 2);
+    assert.equal(state.status, 'SUCCEEDED');
+  });
+}
+
+for (const [input, artifactOrdered] of [
+  ['verification:verify-1', false], ['verification:verify-1@2', false], ['verification:verify-1@1', false],
+  ['verification:verify-1', true], ['verification:verify-1@1', true],
+]) {
+  test(`A2 review fix: ordered replacement satisfies ${input} without preserving unrelated old provenance (artifactOrdered=${artifactOrdered})`, async () => {
+    const state = freshRun();
+    state.artifacts['change:impl-1'] = evidence('change');
+    state.artifacts['verification:verify-1'] = evidence('verification', 1, ['change:impl-1@1']);
+    const nodes = changeGraph().nodes;
+    // The replacement ordering can also be transitive through an unresolved
+    // artifact input, rather than a direct dependsOn on the verifier.
+    const inputs = artifactOrdered ? [input, 'change:bridge@1'] : [input];
+    if (artifactOrdered) nodes.set('bridge', spec('bridge', 'implement', 'graph-implementer', { dependsOn: ['review-1', 'verify-1'], writeScope: ['bridge/output'] }));
+    nodes.set('impl-2', spec('impl-2', 'implement', 'graph-implementer', { dependsOn: artifactOrdered ? ['review-1'] : ['review-1', 'verify-1'], inputs, writeScope: ['docs/b.md'] }));
+    nodes.set('verify-2', spec('verify-2', 'verify', 'graph-verifier', { dependsOn: ['impl-2'] }));
+    const before = structuredClone(state);
+    const accepted = runner.submitPlan(state, { intent: 'change', nodes, now: NOW });
+    if (input.endsWith('@1')) {
+      assert.equal(accepted.ok, false, JSON.stringify(accepted));
+      assert.match(accepted.detail, /cycle/);
+      assert.deepEqual(state, before);
+      return;
+    }
+    assert.equal(accepted.ok, true, JSON.stringify(accepted));
+    assert.deepEqual(state.nodes['impl-2'].spec.inputs, inputs, 'evidence pins and latest-version inputs remain authored');
+    await dispatchCriticAndPass(state, 2);
+    assert.equal(runner.admitDispatch(state, { agent: 'graph-implementer', nodeId: 'impl-2', now: NOW }).allowed, false);
+    await dispatchImplementerAndSucceed(state);
+    assert.equal(state.artifacts['change:impl-1'].version, 2);
+    assert.equal((await dispatchVerifier(state, 'PASS')).ok, true);
+    assert.equal(state.artifacts['verification:verify-1'].version, 2);
+    if (artifactOrdered) {
+      assert.equal(runner.admitDispatch(state, { agent: 'graph-implementer', nodeId: 'impl-2', now: NOW }).allowed, false);
+      const bridge = runner.admitDispatch(state, { agent: 'graph-implementer', nodeId: 'bridge', now: NOW });
+      assert.equal(bridge.allowed, true, JSON.stringify(bridge));
+      runner.beginNode(state, 'bridge', { now: NOW });
+      assert.equal(runner.submitChange(state, { nodeId: 'bridge', filesTouched: [], summary: 'ordered after new verification', now: NOW }).ok, true);
+    }
+    const admitted = runner.admitDispatch(state, { agent: 'graph-implementer', nodeId: 'impl-2', now: NOW });
+    assert.equal(admitted.allowed, true, JSON.stringify(admitted));
+    runner.beginNode(state, 'impl-2', { now: NOW });
+    assert.equal(runner.submitChange(state, { nodeId: 'impl-2', filesTouched: [], summary: 'consumed latest verification', now: NOW }).ok, true);
+    assert.equal((await dispatchVerifier(state, 'PASS')).ok, true);
+    assert.equal(state.status, 'SUCCEEDED');
+  });
+}
+
+for (const scenario of ['prior', 'latest', 'renamed', 'missing', 'future', 'superseded', 'stale', 'source-overwritten', 'source-overwritten-latest', 'structural-self']) {
+  test(`A2 own-slot review: ${scenario} evidence respects read-before-own-publication`, async () => {
+    const initial = changeGraph().nodes;
+    initial.set('pending', spec('pending', 'implement', 'graph-implementer', { dependsOn: ['review-1'], writeScope: ['docs/pending.md'] }));
+    const state = freshRun({ nodes: initial });
+    state.artifacts.findings = evidence('findings');
+    await dispatchCriticAndPass(state);
+    await dispatchImplementerAndSucceed(state);
+    const admitted = runner.admitDispatch(state, { agent: 'graph-verifier', nodeId: 'verify-1', now: NOW });
+    assert.equal(admitted.allowed, true, JSON.stringify(admitted));
+    runner.beginNode(state, 'verify-1', { now: NOW });
+    assert.equal(runner.submitVerification(state, { nodeId: 'verify-1', verdict: 'PASS', changeRefs: ['findings@1'], commands: [{ command: 'test', exitCode: 0 }], now: NOW }).ok, true);
+    assert.equal(state.status, 'RUNNING', 'another pending node keeps the run replannable');
+
+    const name = 'verification:verify-1';
+    const input = scenario.endsWith('latest') ? name : `${name}@${scenario === 'future' ? 2 : 1}`;
+    const nodes = changeGraph().nodes;
+    nodes.get('verify-1').inputs = [input];
+    if (scenario === 'missing') delete state.artifacts[name];
+    if (['superseded', 'stale'].includes(scenario)) state.artifacts[name].status = scenario;
+    if (scenario.startsWith('source-overwritten')) {
+      state.artifacts['change:impl-1'] = evidence('change');
+      state.artifacts[name].basedOn = ['change:impl-1@1'];
+    }
+    if (scenario === 'structural-self') nodes.get('verify-1').dependsOn.push('verify-1');
+    const verifierId = scenario === 'renamed' ? 'verify-2' : 'verify-1';
+    if (scenario === 'renamed') {
+      nodes.set(verifierId, { ...nodes.get('verify-1'), id: verifierId, outputs: [`verification:${verifierId}`] });
+      nodes.delete('verify-1');
+    }
+    const before = structuredClone(state);
+    const accepted = runner.submitPlan(state, { intent: 'change', nodes, now: NOW });
+    if (!['prior', 'latest', 'renamed'].includes(scenario)) {
+      assert.equal(accepted.code, 'INVALID_GRAPH', JSON.stringify(accepted));
+      assert.ok(accepted.detail.includes('verify-1'), accepted.detail);
+      assert.deepEqual(state, before);
+      return;
+    }
+    assert.equal(accepted.ok, true, JSON.stringify(accepted));
+    assert.deepEqual(state.nodes[verifierId].spec.inputs, [input]);
+    assert.equal(state.artifacts[name].version, 1);
+    assert.equal(state.artifacts[name].status, 'valid');
+    await dispatchCriticAndPass(state, 2);
+    await dispatchImplementerAndSucceed(state);
+    const ready = runner.admitDispatch(state, { agent: 'graph-verifier', nodeId: verifierId, now: NOW });
+    assert.equal(ready.allowed, true, JSON.stringify(ready));
+    assert.equal(state.artifacts[name].version, 1, 'the prior version remains readable before this verifier publishes');
+    runner.beginNode(state, verifierId, { now: NOW });
+    assert.equal(runner.submitVerification(state, { nodeId: verifierId, verdict: 'PASS', commands: [{ command: 'test', exitCode: 0 }], now: NOW }).ok, true);
+    assert.equal(state.artifacts[`verification:${verifierId}`].version, scenario === 'renamed' ? 1 : 2);
+    assert.equal(state.status, 'SUCCEEDED');
+  });
+}
+
+test('A2 historical impossible graphs still load and inspect without plan revalidation', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-a2-history-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const state = freshRun();
+  state.nodes['review-1'].spec.inputs = ['verification:verify-1'];
+  const store = createRunStore({ worktree: dir });
+  await store.createRun({ runId: state.runId, rootSessionId: state.rootSessionId, now: NOW });
+  await store.saveRun(state);
+  const loaded = await createRunStore({ worktree: dir }).loadRun(state.runId);
+  assert.deepEqual(loaded.nodes['review-1'].spec.inputs, ['verification:verify-1']);
+  const before = structuredClone(loaded);
+  assert.equal(runner.inspect(loaded).nodes.find((n) => n.id === 'review-1').ready, false);
+  assert.deepEqual(loaded, before);
+});
+
+test('quality Q2: interrupted effects without a terminal outcome require reconciliation rather than imply no effects', async () => {
+  const state = freshRun();
+  await dispatchCriticAndPass(state);
+  runner.beginNode(state, 'impl-1', { now: NOW, sessionId: 'child', dispatchId: 'old-dispatch' });
+  state.pendingEffects = [{ runId: state.runId, nodeId: 'impl-1', sessionId: 'child', dispatchId: 'old-dispatch', callID: 'interrupted', tool: 'edit', target: 'src/a.ts' }];
+  const result = runner.resumeRun(state, { now: NOW });
+  assert.deepEqual(result.report.recoveryRequired, ['impl-1']);
+  runner.reconcileNode(state, 'impl-1', { now: NOW });
+  assert.equal(runner.admitDispatch(state, { agent: 'graph-implementer', nodeId: 'impl-1', now: NOW }).reconcile, true);
+  assert.equal(state.pendingEffects.length, 1, 'missing host outcome does not erase uncertainty');
+});
+
+test('paused runner rejects gating submissions and beginNode without altering accepted artifacts', () => {
+  const state = freshRun();
+  state.nodes['review-1'].state = 'RUNNING';
+  state.nodes['impl-1'].state = 'RUNNING';
+  state.nodes['verify-1'].state = 'RUNNING';
+  state.status = 'AWAITING_USER_DECISION';
+  state.pendingDecision = { cause: 'first', detail: 'original', at: NOW };
+  const before = structuredClone(state);
+  assert.equal(runner.submitReview(state, { planVersion: 1, verdict: 'PASS', now: NOW }).code, 'AWAITING_DECISION');
+  assert.equal(runner.submitChange(state, { nodeId: 'impl-1', filesTouched: [], summary: 'late', now: NOW }).code, 'AWAITING_DECISION');
+  assert.equal(runner.submitVerification(state, { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'test', exitCode: 0 }], now: NOW }).code, 'AWAITING_DECISION');
+  assert.deepEqual(state, before);
+  state.nodes['impl-1'].state = 'PENDING';
+  assert.throws(() => runner.beginNode(state, 'impl-1', { now: NOW }), /paused|RUNNING/);
+  assert.equal(state.nodes['impl-1'].attempt, 0);
+});
 async function dispatchCriticAndPass(state, planVersion = 1, approvedParallel = null) {
   const admit = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
   assert.equal(admit.allowed, true, JSON.stringify(admit));
@@ -486,6 +1025,9 @@ test('revision re-pins stale plan@N inputs so the review node stays admissible',
 
 test('unpinned plan inputs are pinned to the submitted version, and foreign pins are untouched', () => {
   const state = newRun({ runId: 'run-1', rootSessionId: 'sess-root', now: NOW });
+  state.artifacts.findings = evidence('findings', 3);
+  // Exactly one planned publication can advance this retained slot to v2.
+  state.artifacts['change:impl-1'] = { ...evidence('change'), status: 'superseded' };
   const graph = validateTaskGraph([
     spec('explore-1', 'explore', 'graph-explorer', { outputs: ['findings'] }),
     spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'], inputs: ['findings@3'], outputs: ['plan'] }),
@@ -1035,7 +1577,7 @@ test('an accepted verdict resets the rejection streak', async () => {
   assert.equal(state.pendingDecision, undefined);
 });
 
-test('the rejection streak persists with the run document and across re-dispatch', async (t) => {
+test('the rejection streak and pause persist with the run document and prohibit re-dispatch', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'loop-rejection-streak-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const store = createRunStore({ worktree: dir });
@@ -1053,13 +1595,11 @@ test('the rejection streak persists with the run document and across re-dispatch
   assert.equal(reloaded.status, 'AWAITING_USER_DECISION');
   assert.equal(reloaded.nodes['verify-1'].rejectionStreak.code, 'STALE_CHANGE');
   assert.equal(reloaded.nodes['verify-1'].rejectionStreak.count, 2);
-  // A fresh session resubmitting the same broken payload is still the same
-  // loop: the continued count fires immediately without another free pass.
-  runner.beginNode(reloaded, 'verify-1', { now: NOW, sessionId: 'sess-verify-2' });
+  // Reload cannot turn the paused loop into permission for another attempt.
+  assert.throws(() => runner.beginNode(reloaded, 'verify-1', { now: NOW, sessionId: 'sess-verify-2' }), /RUNNING/);
   const repeat = runner.submitVerification(reloaded, ghost);
-  assert.equal(repeat.code, 'REJECTION_LOOP');
-  assert.match(repeat.detail, /3 consecutive identical STALE_CHANGE rejections/);
-  assert.equal(reloaded.nodes['verify-1'].rejectionStreak.count, 3);
+  assert.equal(repeat.code, 'AWAITING_DECISION');
+  assert.equal(reloaded.nodes['verify-1'].rejectionStreak.count, 2);
 });
 
 test('change submission cross-checks the side-effect ledger and writeScope', async () => {
@@ -1519,20 +2059,23 @@ test('recorded side effects mark redispatches as reconcile work', async () => {
   assert.equal(redispatch.reconcile, true);
 });
 
-test('critics are never freely admitted; a not-ready review rejects dispatch up front', () => {
+test('missing findings reject the plan early; critics are never freely admitted', () => {
   const state = newRun({ runId: 'critic-free', rootSessionId: 'critic-free', now: NOW });
   const graph = validateTaskGraph([
     spec('explore-1', 'explore', 'graph-explorer'),
     spec('plan-1', 'plan', 'graph-planner', { dependsOn: ['explore-1'], inputs: ['findings'] }),
     spec('review-1', 'review', 'graph-plan-critic', { dependsOn: ['plan-1'], inputs: ['findings'] }),
   ]);
-  runner.submitPlan(state, { intent: 'plan-only', nodes: graph.nodes, now: NOW });
+  const before = structuredClone(state);
+  const rejected = runner.submitPlan(state, { intent: 'plan-only', nodes: graph.nodes, now: NOW });
+  assert.equal(rejected.code, 'INVALID_GRAPH');
+  assert.match(rejected.detail, /findings/);
+  assert.deepEqual(state, before);
 
-  // The review node waits on findings that were never registered.
+  // No impossible review was installed, and the critic cannot consult freely.
   const denied = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
   assert.equal(denied.code, 'NO_READY_NODE');
-  assert.match(denied.detail, /review-1\(.*findings/);
-  assert.match(denied.detail, /resubmit a corrected plan/);
+  assert.match(denied.detail, /no admissible/);
 
   // Other read-only roles keep free consultation.
   const explorer = runner.admitDispatch(state, { agent: 'graph-explorer', now: NOW });
@@ -1542,6 +2085,7 @@ test('critics are never freely admitted; a not-ready review rejects dispatch up 
 
   // Once findings exist the review becomes admissible and binds.
   state.artifacts.findings = { kind: 'findings', nodeId: 'free', version: 1, basedOn: [], payload: {}, status: 'valid', createdAt: NOW };
+  assert.equal(runner.submitPlan(state, { intent: 'plan-only', nodes: graph.nodes, now: NOW }).ok, true);
   const admitted = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
   assert.equal(admitted.allowed, true);
   assert.equal(admitted.nodeId, 'review-1');
