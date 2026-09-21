@@ -30,6 +30,35 @@ function freshRun(graph = changeGraph()) {
   assert.equal(submission.ok, true, JSON.stringify(submission));
   return state;
 }
+
+test('quality Q2: interrupted effects without a terminal outcome require reconciliation rather than imply no effects', async () => {
+  const state = freshRun();
+  await dispatchCriticAndPass(state);
+  runner.beginNode(state, 'impl-1', { now: NOW, sessionId: 'child', dispatchId: 'old-dispatch' });
+  state.pendingEffects = [{ runId: state.runId, nodeId: 'impl-1', sessionId: 'child', dispatchId: 'old-dispatch', callID: 'interrupted', tool: 'edit', target: 'src/a.ts' }];
+  const result = runner.resumeRun(state, { now: NOW });
+  assert.deepEqual(result.report.recoveryRequired, ['impl-1']);
+  runner.reconcileNode(state, 'impl-1', { now: NOW });
+  assert.equal(runner.admitDispatch(state, { agent: 'graph-implementer', nodeId: 'impl-1', now: NOW }).reconcile, true);
+  assert.equal(state.pendingEffects.length, 1, 'missing host outcome does not erase uncertainty');
+});
+
+test('paused runner rejects gating submissions and beginNode without altering accepted artifacts', () => {
+  const state = freshRun();
+  state.nodes['review-1'].state = 'RUNNING';
+  state.nodes['impl-1'].state = 'RUNNING';
+  state.nodes['verify-1'].state = 'RUNNING';
+  state.status = 'AWAITING_USER_DECISION';
+  state.pendingDecision = { cause: 'first', detail: 'original', at: NOW };
+  const before = structuredClone(state);
+  assert.equal(runner.submitReview(state, { planVersion: 1, verdict: 'PASS', now: NOW }).code, 'AWAITING_DECISION');
+  assert.equal(runner.submitChange(state, { nodeId: 'impl-1', filesTouched: [], summary: 'late', now: NOW }).code, 'AWAITING_DECISION');
+  assert.equal(runner.submitVerification(state, { nodeId: 'verify-1', verdict: 'PASS', commands: [{ command: 'test', exitCode: 0 }], now: NOW }).code, 'AWAITING_DECISION');
+  assert.deepEqual(state, before);
+  state.nodes['impl-1'].state = 'PENDING';
+  assert.throws(() => runner.beginNode(state, 'impl-1', { now: NOW }), /paused|RUNNING/);
+  assert.equal(state.nodes['impl-1'].attempt, 0);
+});
 async function dispatchCriticAndPass(state, planVersion = 1, approvedParallel = null) {
   const admit = runner.admitDispatch(state, { agent: 'graph-plan-critic', now: NOW });
   assert.equal(admit.allowed, true, JSON.stringify(admit));
@@ -1035,7 +1064,7 @@ test('an accepted verdict resets the rejection streak', async () => {
   assert.equal(state.pendingDecision, undefined);
 });
 
-test('the rejection streak persists with the run document and across re-dispatch', async (t) => {
+test('the rejection streak and pause persist with the run document and prohibit re-dispatch', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'loop-rejection-streak-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const store = createRunStore({ worktree: dir });
@@ -1053,13 +1082,11 @@ test('the rejection streak persists with the run document and across re-dispatch
   assert.equal(reloaded.status, 'AWAITING_USER_DECISION');
   assert.equal(reloaded.nodes['verify-1'].rejectionStreak.code, 'STALE_CHANGE');
   assert.equal(reloaded.nodes['verify-1'].rejectionStreak.count, 2);
-  // A fresh session resubmitting the same broken payload is still the same
-  // loop: the continued count fires immediately without another free pass.
-  runner.beginNode(reloaded, 'verify-1', { now: NOW, sessionId: 'sess-verify-2' });
+  // Reload cannot turn the paused loop into permission for another attempt.
+  assert.throws(() => runner.beginNode(reloaded, 'verify-1', { now: NOW, sessionId: 'sess-verify-2' }), /RUNNING/);
   const repeat = runner.submitVerification(reloaded, ghost);
-  assert.equal(repeat.code, 'REJECTION_LOOP');
-  assert.match(repeat.detail, /3 consecutive identical STALE_CHANGE rejections/);
-  assert.equal(reloaded.nodes['verify-1'].rejectionStreak.count, 3);
+  assert.equal(repeat.code, 'AWAITING_DECISION');
+  assert.equal(reloaded.nodes['verify-1'].rejectionStreak.count, 2);
 });
 
 test('change submission cross-checks the side-effect ledger and writeScope', async () => {

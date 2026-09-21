@@ -18,6 +18,21 @@ const WRITE_AGENTS = new Set(['graph-implementer', 'graph-verifier']);
 const ELIGIBLE_STATES = new Set(['PENDING', 'INCOMPLETE', 'STALE']);
 const TERMINAL_RUN = new Set(['FAILED', 'SUCCEEDED', 'ABORTED']);
 
+// A terminal tool error proves the attempt ended, not that a write occurred.
+// Legacy successful after-hook entries have neither field and stay confirmed.
+export function isUncertainEffect(effect) {
+  return effect.uncertain === true || effect.outcome === 'error';
+}
+
+// New ledger admissions leave headroom below sanitizeRun's 1 MiB / 20k values
+// / 1000 array elements for outstanding calls to record witnesses and settle.
+export function assertSettlementCapacity(state) {
+  cleanJson(state, { maxBytes: 524_288, maxValues: 12_000, maxDepth: 32 });
+  if ((state.sideEffects?.length ?? 0) + (state.pendingEffects?.length ?? 0) > 900) {
+    throw new TypeError('side-effect history has no reserved settlement capacity');
+  }
+}
+
 function nodeMaxAttempts(node, fallback) {
   return Number.isInteger(node.spec.maxAttempts) ? node.spec.maxAttempts : fallback;
 }
@@ -114,7 +129,7 @@ export function depsSatisfied(state, node) {
 // counters, artifacts and violations stay exactly as they were for audit.
 function pauseForDecision(state, cause, detail, now) {
   state.status = 'AWAITING_USER_DECISION';
-  state.pendingDecision = { cause, detail, at: now };
+  state.pendingDecision ??= { cause, detail, at: now };
   state.blockedReason = null;
   state.updatedAt = now;
 }
@@ -247,7 +262,9 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       pauseForDecision(state, 'attempt-budget-exhausted', `${chosen.spec.id} exhausted its attempt budget`, now);
       return { allowed: false, code: 'ATTEMPTS_EXHAUSTED', detail: `${chosen.spec.id} has no attempts left` };
     }
-    return { allowed: true, nodeId: chosen.spec.id, reconcile: chosen.reconcile === true || state.sideEffects.some((effect) => effect.nodeId === chosen.spec.id), ...(revisionContext(state, chosen) ?? {}) };
+    return { allowed: true, nodeId: chosen.spec.id, reconcile: chosen.reconcile === true
+      || state.sideEffects.some((effect) => effect.nodeId === chosen.spec.id)
+      || (state.pendingEffects ?? []).some((effect) => effect.nodeId === chosen.spec.id), ...(revisionContext(state, chosen) ?? {}) };
   }
 
   function admitDispatch(state, { agent, now, nodeId = null, excludeNodeIds = null }) {
@@ -331,6 +348,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   }
 
   function beginNode(state, nodeId, { now, sessionId = null, dispatchId = null }) {
+    if (state.status !== 'RUNNING') throw new Error('Node execution requires a RUNNING run; paused runs permit settlement only');
     const node = state.nodes[nodeId];
     if (!node) throw new Error(`Unknown node ${nodeId}`);
     if (node.state !== 'PENDING' && node.state !== 'INCOMPLETE' && node.state !== 'STALE') throw new Error(`Node ${nodeId} is ${node.state} and cannot begin`);
@@ -403,6 +421,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   }
 
   function submitReview(state, { planVersion, verdict, findings = [], approvedParallel = null, now }) {
+    if (state.status === 'AWAITING_USER_DECISION') return { ok: false, code: 'AWAITING_DECISION', detail: 'paused submissions are closeout evidence only' };
     if (TERMINAL_RUN.has(state.status)) return { ok: false, code: 'RUN_TERMINATED', detail: state.failReason ?? 'run already finished' };
     const reviewNode = Object.values(state.nodes).find((node) => node.spec.kind === 'review');
     if (!reviewNode || reviewNode.state !== 'RUNNING') return { ok: false, code: 'NOT_RUNNING', detail: 'review verdict submitted without an in-flight review dispatch' };
@@ -447,8 +466,10 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     return { ok: false, code: 'INVALID_VERDICT', detail: 'verdict must be PASS, REVISE or FAIL' };
   }
 
-  function recordViolation(state, { nodeId = null, kind, detail, now }) {
-    state.violations.push({ nodeId, kind, detail, at: now });
+  function recordViolation(state, { nodeId = null, kind, detail, now, dispatchId, sessionId, callID, tool, target }) {
+    state.violations.push({ nodeId, kind, detail, at: now,
+      ...(dispatchId ? { dispatchId } : {}), ...(sessionId ? { sessionId } : {}),
+      ...(callID ? { callID } : {}), ...(tool ? { tool } : {}), ...(target !== undefined ? { target } : {}) });
     state.updatedAt = now;
   }
 
@@ -493,9 +514,10 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   // Strict failure for an attempt whose denied tool call executed anyway:
   // mirrors the out-of-scope claim semantics (FAILED, not retryable in this
   // attempt); a plan revision or fresh attempt is the only recovery.
-  function taintAttempt(state, { nodeId, detail, now }) {
+  function taintAttempt(state, { nodeId, detail, now, sessionId, dispatchId }) {
     const node = state.nodes[nodeId];
-    if (!node || node.state !== 'RUNNING') return false;
+    if (!node || node.state !== 'RUNNING' || typeof dispatchId !== 'string'
+      || node.dispatchId !== dispatchId || node.sessionId !== sessionId) return false;
     node.lastFailure = { code: 'EXECUTED_DESPITE_DENY', detail, retryable: false };
     node.state = 'FAILED';
     node.finishedAt = now;
@@ -504,6 +526,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   }
 
   function checkChange(state, { nodeId, filesTouched, filesDeleted = [], now }) {
+    if (state.status === 'AWAITING_USER_DECISION') return { ok: false, code: 'AWAITING_DECISION', detail: 'paused submissions are closeout evidence only' };
     if (TERMINAL_RUN.has(state.status)) return { ok: false, code: 'RUN_TERMINATED', detail: state.failReason ?? 'run already finished' };
     const node = state.nodes[nodeId];
     if (!node || node.spec.kind !== 'implement') return { ok: false, code: 'NOT_IMPLEMENT_NODE', detail: `${nodeId} is not an implement node` };
@@ -524,7 +547,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       if (!checked.ok) return rejectClaim(state, nodeId, checked.code, checked.detail, now);
       if (!claimed.has(file)) return rejectClaim(state, nodeId, 'INVALID_FILE_CLAIM', `${file}: filesDeleted must be a subset of filesTouched`, now);
     }
-    const edited = state.sideEffects.filter((effect) => effect.nodeId === nodeId && effect.tool === 'edit').map((effect) => effect.target);
+    const edited = state.sideEffects.filter((effect) => effect.nodeId === nodeId && effect.tool === 'edit' && !isUncertainEffect(effect)).map((effect) => effect.target);
     const undisclosed = edited.filter((target) => !claimed.has(target));
     if (undisclosed.length) {
       return rejectClaim(state, nodeId, 'LEDGER_MISMATCH', `files edited but not disclosed: ${undisclosed.join(', ')}`, now);
@@ -581,6 +604,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   }
 
   function submitVerification(state, { nodeId, verdict, commands = [], artifacts = [], probed = [], skipped = [], changeRefs = null, summary = '', snapshot = {}, now }) {
+    if (state.status === 'AWAITING_USER_DECISION') return { ok: false, code: 'AWAITING_DECISION', detail: 'paused submissions are closeout evidence only' };
     if (TERMINAL_RUN.has(state.status)) return { ok: false, code: 'RUN_TERMINATED', detail: state.failReason ?? 'run already finished' };
     const node = state.nodes[nodeId];
     if (!node || node.spec.kind !== 'verify') return { ok: false, code: 'NOT_VERIFY_NODE', detail: `${nodeId} is not a verify node` };
@@ -700,9 +724,11 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     return trackRejection(state, node, 'INVALID_VERDICT', 'verdict must be PASS, FAIL or UNVERIFIED', now);
   }
 
-  function recordSideEffect(state, { nodeId, tool, target, now }) {
+  function recordSideEffect(state, { nodeId, tool, target, now, dispatchId, callID, sessionId, outcome, uncertain, messageId, partId }) {
     const normalized = normalizeScopePath(target);
-    state.sideEffects.push({ nodeId, tool, target: normalized ?? target, at: now });
+    state.sideEffects.push({ nodeId, tool, target: normalized ?? target, at: now,
+      ...(dispatchId ? { dispatchId } : {}), ...(callID ? { callID } : {}), ...(sessionId ? { sessionId } : {}),
+      ...(outcome ? { outcome, uncertain: uncertain === true } : {}), ...(messageId ? { messageId } : {}), ...(partId ? { partId } : {}) });
     state.updatedAt = now;
   }
 
@@ -727,7 +753,8 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     const report = { recovered: [], recoveryRequired: [] };
     for (const node of Object.values(state.nodes)) {
       if (node.state === 'RUNNING') {
-        const hasEffects = state.sideEffects.some((effect) => effect.nodeId === node.spec.id);
+        const hasEffects = state.sideEffects.some((effect) => effect.nodeId === node.spec.id)
+          || (state.pendingEffects ?? []).some((effect) => effect.nodeId === node.spec.id);
         if (hasEffects) {
           node.state = 'RECOVERY_REQUIRED';
           node.reconcile = true;
@@ -802,7 +829,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         const claimed = state.artifacts[`change:${node.spec.id}`]?.payload?.filesTouched;
         covered = new Set(Array.isArray(claimed) ? claimed : []);
       } else {
-        covered = new Set(effects.filter((effect) => effect.tool === 'edit' || effect.tool === 'write').map((effect) => effect.target));
+        covered = new Set(effects.filter((effect) => (effect.tool === 'edit' || effect.tool === 'write') && !isUncertainEffect(effect)).map((effect) => effect.target));
       }
       progress.deliverables = {
         total: declared.length,
@@ -838,6 +865,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     return {
       runId: state.runId, status: state.status, mode: state.mode, failReason: state.failReason,
       pendingDecision: state.pendingDecision ?? null,
+      closeouts: (state.closeouts ?? []).map(({ nodeId, dispatchId, tool, payload, at }) => ({ nodeId, dispatchId, tool, summary: payload.summary ?? null, at })),
       decision: state.decision ?? null,
       successorRunId: state.successorRunId ?? null,
       carryOver: state.carryOver ?? null,

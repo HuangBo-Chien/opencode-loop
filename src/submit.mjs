@@ -7,6 +7,7 @@ import { tool } from '@opencode-ai/plugin/tool';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { cleanJson } from './json-safe.mjs';
+import { assertSettlementCapacity, isUncertainEffect } from './runner.mjs';
 import { validateTaskGraph, expandRunTokens, runToken, validateFileClaim } from './task-spec.mjs';
 
 const z = tool.schema;
@@ -103,7 +104,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
   });
 
   const graph_submit_review = tool({
-    description: 'Plan critic submits its verdict bound to a plan version. PASS advances to implementation, REVISE returns to the planner (capped), FAIL terminates the run.',
+    description: 'Plan critic submits its verdict bound to a plan version. PASS advances to implementation, REVISE returns to the planner (capped), FAIL pauses the run for a user decision.',
     args: {
       planVersion: z.number().int().min(1),
       verdict: z.enum(['PASS', 'REVISE', 'FAIL']),
@@ -272,7 +273,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
           const claimed = state.artifacts[`change:${node.id}`]?.payload?.filesTouched;
           covered = new Set(Array.isArray(claimed) ? claimed : []);
         } else {
-          covered = new Set(state.sideEffects.filter((effect) => effect.nodeId === node.id && (effect.tool === 'edit' || effect.tool === 'write')).map((effect) => effect.target));
+          covered = new Set(state.sideEffects.filter((effect) => effect.nodeId === node.id && (effect.tool === 'edit' || effect.tool === 'write') && !isUncertainEffect(effect)).map((effect) => effect.target));
         }
         const stillPending = declared.filter((file) => !covered.has(file) && !existsSync(join(worktree, file)));
         node.deliverables = { total: declared.length, done: declared.length - stillPending.length, pending: stillPending.slice(0, 8) };
@@ -313,7 +314,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
   });
 
   const graph_run_resume = tool({
-    description: 'Orchestrator resumes a run after a restart or crash: classifies in-flight nodes (recovery-required nodes keep their side-effect ledger), revalidates artifact snapshots against the workspace, and unblocks dispatch.',
+    description: 'Orchestrator resumes an interrupted execution after a restart or crash: classifies in-flight nodes, keeps their side-effect ledger, revalidates snapshots and unblocks dispatch. AWAITING_USER_DECISION remains paused and retains existing settlement ownership; use graph_run_decide after host lifetimes end.',
     args: {},
     async execute(_args, context) {
       const wrong = requireRole(context, 'graph-orchestrator');
@@ -322,6 +323,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (!binding?.root) return rejected('NOT_GRAPH_SESSION', 'only the orchestrator of this run may resume it');
       const state = store.getRun(binding.runId);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
+      if (state.status === 'AWAITING_USER_DECISION') return rejected('AWAITING_DECISION', 'the run remains paused; existing children must settle before graph_run_decide');
       if (state.status !== 'SUCCEEDED' && state.status !== 'FAILED' && state.status !== 'ABORTED') dispatches?.invalidate(state.runId);
       const resume = runner.resumeRun(state, { now: NOW() });
       if (!resume.ok) return rejected(resume.code, resume.detail);
@@ -359,7 +361,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
       if (state.successorRunId) return rejected('RUN_SUPERSEDED', `this run was already reset; its successor ${state.successorRunId} owns the session now`);
       const running = Object.values(state.nodes).filter((node) => node.state === 'RUNNING');
-      if (running.length) return rejected('RUN_BUSY', `nodes are still in flight: ${running.map((node) => node.spec.id).join(', ')}; let them finish or idle first`);
+      if (running.length) return rejected('RUN_BUSY', `nodes are still in flight: ${running.map((node) => node.spec.id).join(', ')}; wait for correlated terminal turn/task evidence (idle or metadata alone is not completion)`);
       const outstanding = dispatches ? dispatches.inspect(state.runId) : [];
       if (outstanding.length) return rejected('DISPATCH_PENDING', 'task dispatches are still registered for this run; wait for their sessions to finish first');
 
@@ -432,12 +434,59 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       graph_submit_plan, graph_submit_review, graph_submit_change, graph_submit_verification,
       graph_submit_findings, graph_inspect, graph_run_resume, graph_run_new, graph_run_decide,
   };
+  // Paused submissions are validated with the same public schemas and semantic
+  // checks, on an isolated state copy. Only bounded, non-gating closeout evidence
+  // is persisted; the real node and its host lifetime are never completed here.
+  async function settlePaused(name, definition, args, context, binding, state) {
+    if (!dispatches.owns(binding, { settled: true }) || binding.settlementOnly || binding.agent !== context.agent) return rejected('NOT_DISPATCHED_NODE', 'closeout requires the exact owned attempt');
+    let bounded;
+    try { bounded = cleanJson(args, { maxBytes: 8192, maxValues: 1024, maxDepth: 16 }); }
+    catch { return rejected('PAYLOAD_INVALID', 'closeout must be plain JSON within 8 KiB, 1024 values and depth 16'); }
+    const parsed = z.object(definition.args).safeParse(bounded);
+    if (!parsed.success) return rejected('PAYLOAD_INVALID', 'closeout must satisfy the submission schema and bounds');
+    const payload = cleanJson(parsed.data);
+    if (payload.nodeId !== undefined && payload.nodeId !== binding.nodeId) return rejected('NOT_DISPATCHED_NODE', 'closeout nodeId must match the owned dispatch');
+    const previous = (state.closeouts ?? []).find((entry) => entry.dispatchId === binding.dispatchId && entry.tool === name);
+    if (previous) return rejected('CLOSEOUT_ALREADY_RECORDED', 'this dispatch already recorded its closeout');
+    if ((state.closeouts?.length ?? 0) >= 64) return rejected('CLOSEOUT_LIMIT', 'run closeout history reached its bounded limit');
+    const copy = structuredClone(state);
+    copy.status = 'RUNNING';
+    if (binding.nodeId) copy.nodes[binding.nodeId].state = 'RUNNING';
+    // Plan validation must not depend on siblings finishing their host lifetime.
+    if (name === 'graph_submit_plan') {
+      for (const node of Object.values(copy.nodes)) if (node.spec.id !== binding.nodeId && node.state === 'RUNNING') node.state = 'INCOMPLETE';
+    }
+    const validationStore = { getRun: () => copy, saveRun: async () => {}, hashFiles: (files) => store.hashFiles(files) };
+    const validationBindings = new Map(bindings);
+    validationBindings.set(context.sessionID, { ...binding, active: true });
+    const validation = createSubmitTools({ store: validationStore, runner, bindings: validationBindings, worktree }).tools[name];
+    const result = JSON.parse(await validation.execute(payload, context));
+    if (!result.ok) return reply(result);
+    const closeout = { nodeId: binding.nodeId, sessionId: binding.sessionId, dispatchId: binding.dispatchId,
+      tool: name, payload, at: NOW() };
+    // Publish only after a successful save; a failed save remains retryable and
+    // cannot masquerade as a durable duplicate on the next submission.
+    const saved = { ...state, closeouts: [...(state.closeouts ?? []), closeout] };
+    try { assertSettlementCapacity(saved); }
+    catch { return rejected('CLOSEOUT_LIMIT', 'closeout would consume reserved settlement persistence capacity'); }
+    await store.saveRun(saved);
+    state.closeouts = saved.closeouts;
+    state.updatedAt = saved.updatedAt;
+    return reply({ ok: true, effect: 'settlement', next: 'evidence preserved without graph approval; stop work and let the host session end' });
+  }
   const tools = Object.fromEntries(Object.entries(definitions).map(([name, definition]) => [name, !dispatches ? definition : {
     ...definition,
+    description: definition.description + (name.startsWith('graph_submit_') ? ' While paused, an owned attempt may submit one bounded closeout (8 KiB JSON) through this tool: effect="settlement" preserves evidence only, grants no approval, and does not end the host lifetime.' : ''),
     async execute(args, context) {
       await dispatches.ensureSession(context.sessionID);
       const binding = bindings.get(context.sessionID);
-      return binding ? dispatches.exclusive(binding.runId, () => definition.execute(args, context)) : definition.execute(args, context);
+      return binding ? dispatches.exclusive(binding.runId, () => {
+        const state = store.getRun(binding.runId);
+        if (name.startsWith('graph_submit_') && state?.status === 'AWAITING_USER_DECISION') {
+          return settlePaused(name, definition, args, context, binding, state);
+        }
+        return definition.execute(args, context);
+      }) : definition.execute(args, context);
     },
   }]));
   return Object.freeze({ tools: Object.freeze(tools) });

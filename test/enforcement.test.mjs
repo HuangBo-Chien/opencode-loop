@@ -7,6 +7,7 @@ import { createRunStore, newRun } from '../src/run-state.mjs';
 import { createRunner } from '../src/runner.mjs';
 import { createSubmitTools } from '../src/submit.mjs';
 import { createEnforcement } from '../src/enforcement.mjs';
+import { cleanJson } from '../src/json-safe.mjs';
 
 const SPECS = [
   { id: 'explore-1', kind: 'explore', agent: 'graph-explorer', dependsOn: [], inputs: [], outputs: [], acceptance: ['evidence'] },
@@ -20,10 +21,17 @@ function harness(worktree, { readerParallel } = {}) {
   const store = createRunStore({ worktree, stateDirectory: '.opencode-loop' });
   const runner = createRunner({ maxAttempts: 3, maxPlanRevisions: 2, readerParallel });
   const bindings = new Map();
+  const hostMessages = new Map();
+  const client = { session: {
+    get: async ({ path }) => ({ data: { id: path.id, parentID: 'root' } }),
+    status: async () => ({ data: {} }),
+    messages: async ({ path }) => ({ data: hostMessages.get(path.id) ?? [] }),
+    message: async ({ path }) => ({ data: (hostMessages.get(path.id) ?? []).find((m) => m.info.id === path.messageID) }),
+  } };
   const journal = { enabled: true, includeUserRequest: true, semanticSearch: true, maxUserRequestChars: 8000 };
-  const enforcement = createEnforcement({ settings: { worktree, journal }, store, runner, bindings });
+  const enforcement = createEnforcement({ settings: { worktree, journal }, store, runner, bindings, client });
   const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches });
-  return { store, runner, bindings, enforcement, tools, calls: [] };
+  return { store, runner, bindings, enforcement, tools, calls: [], hostMessages, client };
 }
 
 async function startRun(h) {
@@ -48,12 +56,514 @@ async function bindChild(h, sessionId, agent, callID) {
     state: { status: 'running', input: call.args, metadata: { parentSessionId: 'root', sessionId } },
   } } } });
   assert.equal(h.bindings.get(sessionId)?.agent, agent, `child ${sessionId} should bind to ${agent}`);
+  const message = { id: `user-${call.callID}`, sessionID: sessionId, role: 'user', agent };
+  const parts = [{ type: 'text', sessionID: sessionId, messageID: message.id, text: call.args.prompt }];
+  const messages = h.hostMessages.get(sessionId) ?? [];
+  messages.push({ info: message, parts });
+  h.hostMessages.set(sessionId, messages);
+  await h.enforcement.onChatMessage({ sessionID: sessionId, agent }, { message, parts });
 }
 async function childIdle(h, sessionId) {
+  const messages = h.hostMessages.get(sessionId) ?? [];
+  for (const user of messages.filter((m) => m.info.role === 'user')) {
+    if (messages.some((m) => m.info.parentID === user.info.id && m.info.finish === 'stop')) continue;
+    const info = { id: `final-${user.info.id}`, parentID: user.info.id, sessionID: sessionId,
+      role: 'assistant', mode: user.info.agent, finish: 'stop', time: { created: 1, completed: 2 } };
+    messages.push({ info, parts: [] });
+    await h.enforcement.onEvent({ event: { type: 'message.updated', properties: { info } } });
+  }
   await h.enforcement.onEvent({ event: { type: 'session.idle', properties: { sessionID: sessionId } } });
 }
 function ctx(h, sessionId, agent) {
   return { sessionID: sessionId, messageID: 'm1', agent, directory: '/w', worktree: '/w', abort: new AbortController().signal, metadata() {}, ask: async () => {} };
+}
+
+async function pausedWriters() {
+  const h = harness();
+  await startRun(h);
+  const state = h.store.getRun('root');
+  for (const id of ['a', 'b']) state.nodes[id] = {
+    spec: { id, kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: [`${id}/**`], allowShell: true, maxAttempts: 1 },
+    state: 'PENDING', attempt: 0,
+  };
+  for (const id of ['a', 'b']) {
+    const d = await dispatch(h, 'graph-implementer', { prompt: `[nodeId:${id}]\nWork` });
+    await bindChild(h, `child-${id}`, 'graph-implementer', d.callID);
+  }
+  return { ...h, state };
+}
+
+for (const paused of [false, true]) {
+  for (const partial of [false, true]) {
+    test(`quality Q6: honest error report remains deliverable (paused=${paused}, partial=${partial})`, async (t) => {
+      const dir = await mkdtemp(join(tmpdir(), 'loop-uncertain-edit-'));
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      const h = harness(dir);
+      await startRun(h);
+      const state = h.store.getRun('root');
+      for (const id of ['a', 'b']) state.nodes[id] = {
+        spec: { id, kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: [`${id}/**`], maxAttempts: 1 },
+        state: 'PENDING', attempt: 0,
+      };
+      state.nodes.verify = { spec: { id: 'verify', kind: 'verify', agent: 'graph-verifier', dependsOn: ['b'] }, state: 'PENDING', attempt: 0 };
+      for (const id of ['a', 'b']) {
+        const task = await dispatch(h, 'graph-implementer', { nodeId: id });
+        await bindChild(h, `child-${id}`, 'graph-implementer', task.callID);
+      }
+      const target = partial ? 'b/partial.txt' : 'b/missing.txt';
+      if (partial) { await mkdir(join(dir, 'b')); await writeFile(join(dir, target), 'before'); }
+      await h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: 'failed-edit' }, { args: { filePath: join(dir, target) } });
+      if (partial) await writeFile(join(dir, target), 'partial bytes were written');
+      await h.enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part: {
+        type: 'tool', id: 'failed-part', sessionID: 'child-b', messageID: 'failed-message', callID: 'failed-edit', tool: 'edit',
+        state: { status: 'error', input: { filePath: join(dir, target) }, error: partial ? 'failed after partial write' : 'File does not exist', time: { start: 1, end: 2 } },
+      } } } });
+      if (paused) await childIdle(h, 'child-a');
+      const firstPause = structuredClone(state.pendingDecision);
+      const artifacts = structuredClone(state.artifacts);
+      const result = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'b', filesTouched: partial ? [target] : [],
+        summary: partial ? 'reported the actual partial change' : 'edit failed before writing', unresolved: ['edit failed; inspect actual workspace state'] }, ctx(h, 'child-b', 'graph-implementer')));
+      assert.equal(result.ok, true, JSON.stringify(result));
+      assert.equal(state.nodes.b.lastFailure ?? null, null);
+      assert.equal(state.sideEffects[0].uncertain, true);
+      assert.equal(state.sideEffects[0].outcome, 'error');
+      assert.equal(state.sideEffects[0].target, target);
+      if (paused) {
+        assert.equal(result.effect, 'settlement');
+        assert.equal(state.nodes.b.state, 'RUNNING');
+        assert.deepEqual(state.pendingDecision, firstPause);
+        assert.deepEqual(state.artifacts, artifacts);
+        assert.deepEqual(state.closeouts[0].payload.filesTouched, partial ? [target] : []);
+      } else {
+        assert.deepEqual(state.artifacts['change:b'].payload.filesTouched, partial ? [target] : []);
+        const verification = await dispatch(h, 'graph-verifier', { nodeId: 'verify' });
+        assert.match(verification.args.prompt, /uncertain/i);
+        assert.ok(verification.args.prompt.includes(target));
+      }
+    });
+  }
+}
+
+test('quality Q6: a failed missing-file edit is not confirmed deliverable coverage', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-uncertain-progress-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = await pausedWriters();
+  h.tools = createSubmitTools({ store: h.store, runner: h.runner, bindings: h.bindings, worktree: dir, dispatches: h.enforcement.dispatches }).tools;
+  h.state.nodes.b.spec.deliverables = ['b/missing'];
+  await h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: 'missing' }, { args: { filePath: 'b/missing' } });
+  await h.enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part: {
+    type: 'tool', id: 'missing-part', sessionID: 'child-b', messageID: 'missing-message', callID: 'missing', tool: 'edit',
+    state: { status: 'error', error: 'File does not exist', time: { start: 1, end: 2 } },
+  } } } });
+  assert.equal(h.runner.inspect(h.state).nodes.find((node) => node.id === 'b').deliverables.done, 0);
+  const inspection = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'root', 'graph-orchestrator')));
+  assert.equal(inspection.nodes.find((node) => node.id === 'b').deliverables.done, 0);
+});
+
+test('quality Q6: confirmed undisclosed edits remain strict despite other uncertain edits', async () => {
+  const h = await pausedWriters();
+  h.runner.recordSideEffect(h.state, { nodeId: 'b', tool: 'edit', target: 'b/missing', outcome: 'error', uncertain: true, now: 'now' });
+  await h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: 'confirmed' }, { args: { filePath: 'b/real' } });
+  await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-b', callID: 'confirmed' }, {});
+  const result = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'b', filesTouched: [], summary: 'omitted a confirmed edit', unresolved: ['another edit failed'] }, ctx(h, 'child-b', 'graph-implementer')));
+  assert.equal(result.code, 'LEDGER_MISMATCH');
+  assert.match(result.detail, /b\/real/);
+  assert.doesNotMatch(result.detail, /b\/missing/);
+  assert.equal(h.state.nodes.b.state, 'FAILED');
+});
+
+test('quality Q2: native tool errors release pending slots and preserve uncertain effects under the real sanitizer', async () => {
+  const base = harness();
+  await startRun(base);
+  const state = base.store.getRun('root');
+  state.nodes.b = { spec: { id: 'b', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['b/**'] }, state: 'PENDING', attempt: 0 };
+  let durable;
+  const store = { ...base.store, saveRun: async (s) => { durable = cleanJson(s, { maxBytes: 1_048_576, maxValues: 20_000, maxDepth: 32 }); } };
+  const enforcement = createEnforcement({ settings: {}, store, runner: base.runner, bindings: base.bindings });
+  const h = { ...base, store, enforcement };
+  const d = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:b]\nEdit' });
+  await bindChild(h, 'child-b', 'graph-implementer', d.callID);
+  for (let i = 0; i < 128; i++) {
+    await enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: `edit-${i}` }, { args: { filePath: 'b/file' } });
+    await enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part: {
+      type: 'tool', id: `part-${i}`, sessionID: 'child-b', messageID: `message-${i}`, callID: `edit-${i}`, tool: 'edit',
+      state: { status: 'error', input: { filePath: 'b/file' }, error: 'oldString not found', time: { start: 1, end: 2 } },
+    } } } });
+  }
+  await assert.doesNotReject(() => enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: 'valid-edit' }, { args: { filePath: 'b/file' } }));
+  assert.equal(durable.pendingEffects.length, 1);
+  assert.equal(durable.sideEffects.filter((effect) => effect.outcome === 'error' && effect.uncertain === true).length, 128);
+  assert.equal(state.nodes.b.state, 'RUNNING');
+  assert.equal(state.nodes.b.attempt, 1);
+});
+
+test('quality Q2: an uncorrelated after-hook cannot be attributed to the current attempt', async () => {
+  const h = await pausedWriters();
+  await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-b', callID: 'unknown-old-call', args: { filePath: 'b/file' } }, {});
+  assert.equal(h.state.sideEffects.length, 0);
+  assert.equal(h.state.nodes.b.state, 'RUNNING');
+});
+
+test('quality Q4: evicting a tool callback dedup entry cannot duplicate its durable effect in a newer attempt', async () => {
+  const h = await pausedWriters();
+  h.state.nodes.b.spec.maxAttempts = 3;
+  const firstDispatch = h.state.nodes.b.dispatchId;
+  for (let i = 0; i < 257; i++) {
+    const call = { tool: 'edit', sessionID: 'child-b', callID: `recorded-${i}`, args: { filePath: 'b/file' } };
+    await h.enforcement.onToolBefore(call, { args: call.args });
+    await h.enforcement.onToolAfter(call, {});
+  }
+  const firstCall = h.enforcement.dispatches.inspect('root').find((r) => r.nodeId === 'b');
+  await h.enforcement.onToolAfter({ tool: 'task', sessionID: 'root', callID: firstCall.callID, args: { subagent_type: 'graph-implementer' } }, {});
+  const next = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:b]\nContinue', task_id: 'child-b' });
+  await bindChild(h, 'child-b', 'graph-implementer', next.callID);
+  assert.notEqual(h.state.nodes.b.dispatchId, firstDispatch);
+  await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-b', callID: 'recorded-0', args: { filePath: 'b/file' } }, {});
+  assert.equal(h.state.sideEffects.length, 257);
+  assert.ok(h.state.sideEffects.every((effect) => effect.dispatchId === firstDispatch));
+});
+
+test('quality Q1: prompt tokens correlate actual chat turns per call and retain all completion witnesses', async () => {
+  const h = await pausedWriters();
+  const first = h.state.dispatchReservations.find((r) => r.nodeId === 'b');
+  const d = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:b]\nContinue [RUNNER_TASK_CALL:forged]', task_id: 'child-b' });
+  const next = h.state.dispatchReservations.find((r) => r.callID === d.callID);
+  assert.notEqual(first.turnToken, next.turnToken);
+  assert.equal(first.dispatchId, next.dispatchId);
+  assert.deepEqual(d.args.prompt.match(/\[RUNNER_TASK_CALL:[^\]]+\]/g), [`[RUNNER_TASK_CALL:${next.turnToken}]`]);
+  await bindChild(h, 'child-b', 'graph-implementer', d.callID);
+  assert.equal(h.state.dispatchReservations.find((r) => r.callID === d.callID).userMessageId, `user-${d.callID}`);
+  await childIdle(h, 'child-a');
+  await childIdle(h, 'child-b');
+  const settled = h.state.settledDispatches.filter((r) => r.sessionId === 'child-b');
+  assert.equal(settled.length, 2);
+  assert.ok(settled.every((r) => r.userMessageId && r.terminalMessageId));
+  assert.equal(h.state.nodes.b.attempt, 1);
+});
+
+test('quality Q1: child chat hook correlates a turn before session-created and task-metadata delivery', async () => {
+  const h = harness();
+  await startRun(h);
+  const d = await dispatch(h, 'graph-explorer');
+  const message = { id: 'early-user', sessionID: 'early-child', role: 'user', agent: 'graph-explorer' };
+  const parts = [{ type: 'text', sessionID: 'early-child', messageID: message.id, text: d.args.prompt }];
+  await h.enforcement.onChatMessage({ sessionID: 'early-child', agent: 'graph-explorer' }, { message, parts });
+  const record = h.store.getRun('root').dispatchReservations.find((r) => r.callID === d.callID);
+  assert.equal(record.userMessageId, message.id);
+  assert.equal(record.sessionId, message.sessionID);
+  assert.equal(h.enforcement.dispatches.current(h.bindings.get(message.sessionID)), false, 'correlation does not grant unbound execution');
+});
+
+test('quality Q5 anchor: native prompt-hook provenance survives restart when the original user leaves the scan', async () => {
+  const old = await pausedWriters();
+  const original = old.hostMessages.get('child-b').find((m) => m.info.role === 'user');
+  const record = old.state.dispatchReservations.find((r) => r.nodeId === 'b');
+  assert.equal(record.userMessageId, original.info.id);
+  assert.equal(record.userAnchorSource, 'chat.message');
+  await childIdle(old, 'child-a');
+  const pause = structuredClone(old.state.pendingDecision);
+  old.hostMessages.set('child-b', [{ info: { id: 'hook-anchored-final', sessionID: 'child-b', role: 'assistant', mode: 'graph-implementer',
+    parentID: original.info.id, finish: 'stop', time: { created: 1, completed: 2 } }, parts: [] }]);
+  const state = structuredClone(old.state);
+  const store = { getRun: () => state, loadRun: async () => state,
+    saveRun: async (s) => { cleanJson(s, { maxBytes: 1_048_576, maxValues: 20_000, maxDepth: 32 }); } };
+  const bindings = new Map();
+  const enforcement = createEnforcement({ settings: {}, store, runner: old.runner, bindings, client: old.client });
+  const tools = createSubmitTools({ store, runner: old.runner, bindings, dispatches: enforcement.dispatches }).tools;
+  await enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });
+  assert.equal(state.nodes.b.state, 'FAILED');
+  assert.equal(state.nodes.b.attempt, 1);
+  assert.deepEqual(state.pendingDecision, pause);
+  assert.equal(state.settledDispatches.find((r) => r.nodeId === 'b').userAnchorSource, 'chat.message');
+  assert.equal(JSON.parse(await tools.graph_run_decide.execute({ action: 'abort', reason: 'user stops' }, { sessionID: 'root', agent: 'graph-orchestrator' })).ok, true);
+});
+
+test('quality Q2: paused restart recovers exact native error outcomes without declaring the child turn complete', async () => {
+  const old = await pausedWriters();
+  const call = { tool: 'edit', sessionID: 'child-b', callID: 'interrupted-edit' };
+  await old.enforcement.onToolBefore(call, { args: { filePath: 'b/file' } });
+  await childIdle(old, 'child-a');
+  const user = old.hostMessages.get('child-b').find((m) => m.info.role === 'user');
+  const part = { type: 'tool', id: 'error-part', sessionID: 'child-b', messageID: 'tool-message', callID: call.callID, tool: 'edit',
+    state: { status: 'error', input: { filePath: 'b/file' }, error: 'permission denied or interrupted', time: { start: 1, end: 2 } } };
+  old.hostMessages.get('child-b').push({ info: { id: 'tool-message', sessionID: 'child-b', role: 'assistant', mode: 'graph-implementer',
+    parentID: user.info.id, finish: 'tool-calls', time: { completed: 2 } }, parts: [part] });
+  const state = structuredClone(old.state);
+  const store = { getRun: () => state, loadRun: async () => state,
+    saveRun: async (s) => { cleanJson(s, { maxBytes: 1_048_576, maxValues: 20_000, maxDepth: 32 }); } };
+  const enforcement = createEnforcement({ settings: {}, store, runner: old.runner, bindings: new Map(), client: old.client });
+  await enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });
+  assert.equal(state.pendingEffects.length, 0);
+  assert.equal(state.sideEffects.length, 1);
+  assert.equal(state.sideEffects[0].outcome, 'error');
+  assert.equal(state.sideEffects[0].uncertain, true);
+  assert.equal(state.sideEffects[0].dispatchId, old.state.nodes.b.dispatchId);
+  assert.equal(state.nodes.b.state, 'RUNNING');
+  assert.equal(state.status, 'AWAITING_USER_DECISION');
+  await enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part } } });
+  assert.equal(state.sideEffects.length, 1);
+});
+
+for (const outcome of ['completed', 'error']) {
+  for (const action of ['abort', 'reset']) {
+    test(`review restart-effects: ${outcome} outcome and final turn settle in one restart before ${action}`, async () => {
+      const old = await pausedWriters();
+      const user = old.hostMessages.get('child-b').find((message) => message.info.role === 'user');
+      const owner = old.state.dispatchReservations.find((record) => record.sessionId === 'child-b');
+      assert.ok(user.parts[0].text.includes(`[RUNNER_TASK_CALL:${owner.turnToken}]`));
+      const part = { type: 'tool', id: 'edit-part-b', sessionID: 'child-b', messageID: 'tool-b', callID: 'pending-edit-b', tool: 'edit',
+        state: { status: 'running', input: { filePath: 'b/file' }, time: { start: 1 } } };
+      const toolMessage = { info: { id: 'tool-b', sessionID: 'child-b', role: 'assistant', mode: 'graph-implementer',
+        parentID: user.info.id, finish: 'tool-calls', time: { created: 1, completed: 2 } }, parts: [part] };
+      old.hostMessages.get('child-b').push(toolMessage);
+      await old.enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part } } });
+      await old.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: part.callID }, { args: { filePath: 'b/file' } });
+      await childIdle(old, 'child-a');
+      const firstPause = structuredClone(old.state.pendingDecision);
+      const attempts = { a: old.state.nodes.a.attempt, b: old.state.nodes.b.attempt };
+      assert.equal(old.state.pendingEffects.length, 1);
+
+      // Native outcomes are now available, but no part/message/idle event or
+      // successful after-hook is delivered to the restarted plugin.
+      part.state = { status: outcome, input: { filePath: 'b/file' }, time: { start: 1, end: 3 },
+        ...(outcome === 'completed' ? { output: 'edited', title: 'edit', metadata: {} } : { error: 'edit may have partially applied' }) };
+      old.hostMessages.get('child-b').push({ info: { id: 'final-b', sessionID: 'child-b', role: 'assistant', mode: 'graph-implementer',
+        parentID: user.info.id, finish: 'stop', time: { created: 4, completed: 5 } }, parts: [] });
+
+      const backing = createRunStore();
+      const state = await backing.createRun({ runId: 'root', rootSessionId: 'root', now: 'restart' });
+      Object.assign(state, structuredClone(old.state));
+      const saves = [];
+      const store = { ...backing, saveRun: async (candidate) => {
+        cleanJson(candidate, { maxBytes: 1_048_576, maxValues: 20_000, maxDepth: 32 });
+        await backing.saveRun(candidate);
+        saves.push(structuredClone(candidate));
+      } };
+      const bindings = new Map();
+      const enforcement = createEnforcement({ settings: {}, store, runner: old.runner, bindings, client: old.client });
+      const tools = createSubmitTools({ store, runner: old.runner, bindings, dispatches: enforcement.dispatches }).tools;
+      await enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });
+
+      assert.equal(state.pendingEffects.length, 0);
+      assert.equal(state.sideEffects.length, 1);
+      assert.equal(state.sideEffects[0].outcome, outcome);
+      assert.equal(state.sideEffects[0].uncertain, outcome === 'error');
+      assert.equal(state.sideEffects[0].dispatchId, owner.dispatchId);
+      const witness = [...state.dispatchReservations, ...(state.settledDispatches ?? [])].find((record) => record.dispatchId === owner.dispatchId);
+      assert.equal(witness.userMessageId, user.info.id);
+      assert.equal(witness.terminalMessageId, 'final-b');
+      assert.equal(state.nodes.b.state, 'FAILED', 'the same restart must retire the fully witnessed host lifetime');
+      assert.equal(state.status, 'AWAITING_USER_DECISION');
+      assert.deepEqual(state.pendingDecision, firstPause);
+      assert.deepEqual({ a: state.nodes.a.attempt, b: state.nodes.b.attempt }, attempts);
+      assert.equal(enforcement.dispatches.inspect('root').length, 0);
+      const effectSave = saves.findIndex((saved) => saved.pendingEffects.length === 0 && saved.sideEffects.length === 1);
+      const lifetimeSave = saves.findIndex((saved) => saved.nodes.b.state === 'FAILED');
+      assert.ok(effectSave >= 0 && lifetimeSave > effectSave, 'effect outcome must be durable before lifetime retirement');
+      assert.equal(saves[lifetimeSave].dispatchReservations.length, 0);
+
+      const result = JSON.parse(await tools.graph_run_decide.execute({ action, reason: 'user decision after completed recovery' }, { sessionID: 'root', agent: 'graph-orchestrator' }));
+      assert.equal(result.ok, true, JSON.stringify(result));
+      assert.equal(result.action, action);
+      assert.deepEqual(state.pendingDecision, firstPause);
+      assert.deepEqual({ a: state.nodes.a.attempt, b: state.nodes.b.attempt }, attempts);
+      assert.equal(state.sideEffects[0].uncertain, outcome === 'error');
+      if (action === 'reset') assert.deepEqual(store.getRun(result.runId).sideEffects, []);
+    });
+  }
+}
+
+test('quality Q2: terminal error identity and persistence boundaries keep the pending effect until a durable exact outcome', async () => {
+  const old = await pausedWriters();
+  const call = { tool: 'edit', sessionID: 'child-b', callID: 'edit-error' };
+  // messageID belongs to native tool parts, not the SDK before-hook input.
+  await old.enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part: {
+    type: 'tool', id: 'part', sessionID: 'child-b', messageID: 'original-message', callID: call.callID, tool: 'edit',
+    state: { status: 'running', input: { filePath: 'b/file' } },
+  } } } });
+  await old.enforcement.onToolBefore(call, { args: { filePath: 'b/file' } });
+  await childIdle(old, 'child-a');
+  const state = structuredClone(old.state);
+  let offline = false;
+  const store = { getRun: () => state, loadRun: async () => state, saveRun: async (s) => {
+    if (offline) throw new Error('outcome disk offline');
+    cleanJson(s, { maxBytes: 1_048_576, maxValues: 20_000, maxDepth: 32 });
+  } };
+  const enforcement = createEnforcement({ settings: {}, store, runner: old.runner, bindings: new Map(), client: old.client });
+  await enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });
+  const part = { type: 'tool', id: 'part', sessionID: 'child-b', messageID: 'original-message', callID: call.callID, tool: 'edit',
+    state: { status: 'error', time: { end: 2 } } };
+  const event = (p) => enforcement.onEvent({ event: { type: 'message.part.updated', properties: { part: p } } });
+  await event({ ...part, messageID: 'foreign-message' });
+  await event({ ...part, tool: 'bash' });
+  assert.equal(state.pendingEffects.length, 1);
+  offline = true;
+  await assert.rejects(() => event(part), /outcome disk offline/);
+  assert.equal(state.pendingEffects.length, 1);
+  assert.equal(state.sideEffects.length, 0);
+  offline = false;
+  await event(part);
+  await event(part);
+  assert.equal(state.pendingEffects.length, 0);
+  assert.equal(state.sideEffects.length, 1);
+  assert.equal(state.sideEffects[0].uncertain, true);
+});
+
+for (const restart of [false, true]) {
+  test(`review R3: late denied-tool after preserves original identity without tainting reused paused attempt (restart=${restart})`, async () => {
+    let h = await pausedWriters();
+    h.state.nodes.b.spec.maxAttempts = 3;
+    const oldDispatchId = h.state.nodes.b.dispatchId;
+    const denied = { tool: 'edit', sessionID: 'child-b', callID: 'old-denied-edit', args: { filePath: 'outside/file' } };
+    await assert.rejects(() => h.enforcement.onToolBefore(denied, { args: denied.args }), /RUNNER_DENIED/);
+    const b1 = h.enforcement.dispatches.inspect('root').find((r) => r.nodeId === 'b');
+    await h.enforcement.onToolAfter({ tool: 'task', sessionID: 'root', callID: b1.callID, args: { subagent_type: 'graph-implementer' } }, {});
+    const b2 = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:b]\nContinue', task_id: 'child-b' });
+    await bindChild(h, 'child-b', 'graph-implementer', b2.callID);
+    await childIdle(h, 'child-a');
+    const before = structuredClone(h.state.nodes.b);
+    const firstPause = structuredClone(h.state.pendingDecision);
+    assert.notEqual(before.dispatchId, oldDispatchId);
+    if (restart) {
+      const state = structuredClone(h.state);
+      const bindings = new Map();
+      const store = { getRun: () => state, loadRun: async () => state, saveRun: async () => {} };
+      const enforcement = createEnforcement({ settings: {}, store, runner: h.runner, bindings });
+      const tools = createSubmitTools({ store, runner: h.runner, bindings, dispatches: enforcement.dispatches }).tools;
+      h = { ...h, state, store, bindings, enforcement, tools };
+      await startRun(h);
+    }
+    await h.enforcement.onToolAfter(denied, {});
+    assert.deepEqual(h.state.nodes.b, before);
+    const violations = h.state.violations.filter((entry) => entry.kind === 'executed-despite-deny');
+    assert.equal(violations.length, 1);
+    assert.equal(violations[0].dispatchId, oldDispatchId);
+    assert.equal(violations[0].sessionId, 'child-b');
+    assert.equal(violations[0].callID, denied.callID);
+    assert.equal(violations[0].target, 'outside/file');
+    await h.enforcement.onToolAfter(denied, {});
+    assert.equal(h.state.violations.filter((entry) => entry.kind === 'executed-despite-deny').length, 1);
+    assert.deepEqual(h.state.pendingDecision, firstPause);
+    const decide = () => h.tools.graph_run_decide.execute({ action: 'abort', reason: 'stop' }, ctx(h, 'root', 'graph-orchestrator')).then(JSON.parse);
+    assert.equal((await decide()).code, 'RUN_BUSY');
+    await h.enforcement.onToolAfter({ tool: 'task', sessionID: 'root', callID: b2.callID, args: b2.args }, {});
+    assert.equal((await decide()).ok, true);
+  });
+}
+
+test('paused before-hook allows owned closeout but refuses every new workspace effect', async () => {
+  const h = await pausedWriters();
+  await childIdle(h, 'child-a');
+  for (const tool of ['edit', 'write', 'bash']) {
+    await assert.rejects(() => h.enforcement.onToolBefore({ tool, sessionID: 'child-b', callID: `new-${tool}` }, { args: { filePath: 'b/file', command: 'node --version' } }), /BINDING_UNAVAILABLE/);
+    const permission = { status: 'ask' };
+    await h.enforcement.onPermissionAsk({ type: tool, sessionID: 'child-b' }, permission);
+    assert.equal(permission.status, 'deny');
+    await assert.rejects(() => h.enforcement.onToolBefore({ tool, sessionID: 'root', callID: `root-${tool}` }, { args: {} }), /BINDING_UNAVAILABLE/);
+  }
+  await assert.doesNotReject(() => h.enforcement.onToolBefore({ tool: 'graph_submit_change', sessionID: 'child-b' }, { args: {} }));
+  const result = JSON.parse(await h.tools.graph_submit_change.execute({ nodeId: 'b', filesTouched: [], summary: 'stopping' }, ctx(h, 'child-b', 'graph-implementer')));
+  assert.equal(result.effect, 'settlement');
+  assert.equal(h.state.nodes.b.state, 'RUNNING');
+  assert.equal(h.state.sideEffects.length, 0);
+});
+
+test('late tool-after records only an already-started call, once, against its original attempt', async () => {
+  const h = await pausedWriters();
+  const call = { tool: 'edit', sessionID: 'child-b', callID: 'edit-before-pause', args: { filePath: 'b/file' } };
+  await h.enforcement.onToolBefore(call, { args: call.args });
+  await childIdle(h, 'child-a');
+  await childIdle(h, 'child-b');
+  await h.enforcement.onToolAfter(call, {});
+  await h.enforcement.onToolAfter(call, {});
+  await h.enforcement.onToolAfter({ ...call, callID: 'forged', args: { filePath: 'b/forged' } }, {});
+  assert.deepEqual(h.state.sideEffects.map(({ nodeId, target }) => ({ nodeId, target })), [{ nodeId: 'b', target: 'b/file' }]);
+  assert.equal(h.state.status, 'AWAITING_USER_DECISION');
+  assert.equal(h.state.nodes.b.attempt, 1);
+});
+
+test('late tool-after persistence retries do not duplicate the ledger or charge attempts', async () => {
+  const base = harness();
+  await startRun(base);
+  const state = base.store.getRun('root');
+  state.nodes.b = { spec: { id: 'b', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['b/**'] }, state: 'PENDING', attempt: 0 };
+  let offline = false;
+  const store = { ...base.store, saveRun: async () => { if (offline) throw new Error('ledger disk offline'); } };
+  const enforcement = createEnforcement({ settings: {}, store, runner: base.runner, bindings: base.bindings });
+  const h = { ...base, store, enforcement };
+  const d = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:b]\nWork' });
+  await bindChild(h, 'child-b', 'graph-implementer', d.callID);
+  const call = { tool: 'edit', sessionID: 'child-b', callID: 'edit', args: { filePath: 'b/file' } };
+  await enforcement.onToolBefore(call, { args: call.args });
+  state.status = 'AWAITING_USER_DECISION';
+  state.pendingDecision = { cause: 'first', detail: 'paused', at: 'now' };
+  offline = true;
+  await assert.rejects(() => enforcement.onToolAfter(call, {}), /disk offline/);
+  offline = false;
+  await enforcement.onToolAfter(call, {});
+  await enforcement.onToolAfter(call, {});
+  assert.equal(state.sideEffects.length, 1);
+  assert.equal(state.sideEffects[0].dispatchId, state.nodes.b.dispatchId);
+  assert.equal(state.nodes.b.attempt, 1);
+});
+
+test('paused restart preserves already-started effect identity for late after-hook evidence', async () => {
+  const old = await pausedWriters();
+  const call = { tool: 'edit', sessionID: 'child-b', callID: 'interrupted-edit', args: { filePath: 'b/file' } };
+  await old.enforcement.onToolBefore(call, { args: call.args });
+  await childIdle(old, 'child-a');
+  const state = structuredClone(old.state);
+  const store = { getRun: () => state, loadRun: async () => state, saveRun: async () => {} };
+  const enforcement = createEnforcement({ settings: {}, store, runner: old.runner, bindings: new Map() });
+  await enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });
+  await enforcement.onToolAfter(call, {});
+  await enforcement.onToolAfter(call, {});
+  assert.equal(state.sideEffects.length, 1);
+  assert.equal(state.sideEffects[0].target, 'b/file');
+  assert.equal(state.sideEffects[0].dispatchId, state.nodes.b.dispatchId);
+  assert.equal(state.status, 'AWAITING_USER_DECISION');
+});
+
+for (const hostStatus of ['busy', 'idle', 'idle-omitted', 'unavailable']) {
+  test(`restart reconciles paused lingering attempts without dispatch capability: host=${hostStatus}`, async () => {
+    const old = await pausedWriters();
+    await childIdle(old, 'child-a');
+    const user = old.hostMessages.get('child-b').find((m) => m.info.role === 'user');
+    old.hostMessages.get('child-b').push({ info: { id: 'b-terminal', sessionID: 'child-b', role: 'assistant',
+      mode: 'graph-implementer', parentID: user.info.id, finish: 'stop', time: { created: 1, completed: 2 } }, parts: [] });
+    const state = structuredClone(old.state);
+    const firstPause = structuredClone(state.pendingDecision);
+    let durable;
+    const store = { getRun: () => state, loadRun: async () => state, saveRun: async (s) => { durable = structuredClone(s); } };
+    const bindings = new Map();
+    let observedStatus = hostStatus;
+    const client = { session: {
+      messages: old.client.session.messages,
+      message: old.client.session.message,
+      get: async ({ path }) => ({ data: { id: path.id, parentID: 'root' } }),
+      status: async () => {
+        if (observedStatus === 'unavailable') throw new Error('host offline');
+        return { data: observedStatus === 'idle-omitted' ? {} : { 'child-b': { type: observedStatus } } };
+      },
+    } };
+    const enforcement = createEnforcement({ settings: {}, store, runner: old.runner, bindings, client });
+    const tools = createSubmitTools({ store, runner: old.runner, bindings, dispatches: enforcement.dispatches }).tools;
+    await enforcement.onChatMessage({ sessionID: 'root', agent: 'graph-orchestrator' });
+    assert.equal(state.status, 'AWAITING_USER_DECISION');
+    assert.deepEqual(state.pendingDecision, firstPause);
+    assert.equal(state.nodes.b.attempt, 1);
+    await assert.rejects(() => enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-b', callID: 'after-restart' }, { args: { filePath: 'b/file' } }), /BINDING_UNAVAILABLE/);
+    const decide = () => tools.graph_run_decide.execute({ action: 'abort', reason: 'user stops' }, { sessionID: 'root', agent: 'graph-orchestrator' }).then(JSON.parse);
+    if (!hostStatus.startsWith('idle')) {
+      assert.equal((await decide()).code, 'RUN_BUSY');
+      observedStatus = 'idle';
+      await enforcement.onEvent({ event: { id: 'ended', type: 'session.idle', properties: { sessionID: 'child-b' } } });
+    }
+    assert.equal(state.nodes.b.state, 'FAILED');
+    assert.equal(durable.nodes.b.state, 'FAILED');
+    assert.deepEqual(durable.pendingDecision, firstPause);
+    assert.equal((await decide()).ok, true);
+  });
 }
 
 test('only the first graph-orchestrator root request is captured', async (t) => {
@@ -425,6 +935,7 @@ test('crash window: side effects lead to RECOVERY_REQUIRED; resume preserves att
   await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
   await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
+  await h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-impl', callID: 'e1' }, { args: { filePath: join(dir, 'src', 'a.ts') } });
   await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-impl', callID: 'e1', args: { filePath: join(dir, 'src', 'a.ts') } }, { title: 'edit', output: 'ok' });
   assert.equal(h.store.getRun('root').nodes['impl-1'].attempt, 1);
 
@@ -587,6 +1098,7 @@ test('write tool is scope-gated exactly like edit and enters the side-effect led
   assert.ok(h.store.getRun('root').violations.some((entry) => entry.kind === 'out-of-scope-write'));
 
   await mkdir(join(dir, 'pkg-b'), { recursive: true });
+  await h.enforcement.onToolBefore({ tool: 'write', sessionID: 'child-b', callID: 'w2' }, { args: { filePath: join(dir, 'pkg-b', 'new.ts'), content: 'y' } });
   await h.enforcement.onToolAfter({ tool: 'write', sessionID: 'child-b', callID: 'w2', args: { filePath: join(dir, 'pkg-b', 'new.ts'), content: 'y' } }, { title: 'write', output: 'ok' });
   const state = h.store.getRun('root');
   assert.ok(state.sideEffects.some((effect) => effect.nodeId === 'impl-b' && effect.tool === 'write' && effect.target === 'pkg-b/new.ts'));
@@ -1094,6 +1606,7 @@ test('crash on the final attempt: refund plus cross-restart task_id continuation
   await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'PASS', findings: [] }, ctx(h, 'child-critic', 'graph-plan-critic'));
   await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
   await bindChild(h, 'child-impl', 'graph-implementer');
+  await h.enforcement.onToolBefore({ tool: 'edit', sessionID: 'child-impl', callID: 'e1' }, { args: { filePath: join(dir, 'src', 'a.ts') } });
   await h.enforcement.onToolAfter({ tool: 'edit', sessionID: 'child-impl', callID: 'e1', args: { filePath: join(dir, 'src', 'a.ts') } }, { title: 'edit', output: 'ok' });
   // The crash happened on the node's third and final attempt.
   const preCrash = h.store.getRun('root');
@@ -1351,6 +1864,7 @@ test('declared deliverables surface as mechanical progress through graph_inspect
 
   // One of two deliverables exists so far: inspect reports 1/2 mechanically.
   await mkdir(join(dir, 'src'), { recursive: true });
+  await h.enforcement.onToolBefore({ tool: 'write', sessionID: 'child-impl', callID: 'w1' }, { args: { filePath: join(dir, 'src', 'a.ts'), content: 'a' } });
   await writeFile(join(dir, 'src', 'a.ts'), 'a');
   await h.enforcement.onToolAfter({ tool: 'write', sessionID: 'child-impl', callID: 'w1', args: { filePath: join(dir, 'src', 'a.ts'), content: 'a' } }, { title: 'write', output: 'ok' });
   let inspected = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'root', 'graph-orchestrator')));

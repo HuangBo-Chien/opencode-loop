@@ -139,7 +139,8 @@ for (const [name, prompt, extra] of [
     const args = await h.dispatch('b', prompt, extra);
     assert.match(args.prompt, /Assigned nodeId: b/);
     assert.match(args.prompt, /writeScope: pkg-b\/\*\*/);
-    assert.ok(args.prompt.endsWith(prompt));
+    assert.ok(args.prompt.includes(prompt));
+    assert.match(args.prompt, /\n\[RUNNER_TASK_CALL:[a-f0-9-]{36}\]$/);
     await h.session('child-b');
     await h.metadata('b', 'child-b', args);
     assert.equal(h.bindings.get('child-b').nodeId, 'b');
@@ -154,7 +155,8 @@ for (const agent of ['graph-implementer', 'graph-verifier']) {
       await h.session('child-a');
       await h.metadata('initial', 'child-a', initial);
       if (phase !== 'RUNNING') {
-        await h.enforcement.dispatches.onIdle('child-a', 'idle-initial');
+        await h.enforcement.dispatches.onPart({ type: 'tool', tool: 'task', sessionID: 'root', callID: 'initial',
+          state: { status: 'completed', input: initial, metadata: { parentSessionId: 'root', sessionId: 'child-a' } } });
         assert.equal(h.state.nodes.a.state, 'INCOMPLETE');
         if (phase === 'PENDING' || phase === 'STALE') h.state.nodes.a.state = phase;
         if (phase === 'restart') h.enforcement.dispatches.invalidate('root');
