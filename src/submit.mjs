@@ -363,23 +363,40 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
   });
 
   const graph_run_decide = tool({
-    description: 'Orchestrator delivers the user\'s decision for a run paused by exhaustion, an UNVERIFIED verdict, or repeated identical runner rejections (AWAITING_USER_DECISION), or deliberately rotates/terminates a run. action="abort" irreversibly marks the run ABORTED (all findings, plans, reviews, violations and dispatch history preserved; dispatch closed). action="reset" archives the run in place (decision + successorRunId, original status and evidence untouched) and starts a fresh successor run with reset counters that re-walks the explorer → planner → critic gates without replaying any implementer work or side effects. A user-provided reason is required; native permission ask enforces user confirmation.',
+    description: 'Root orchestrator delivers a user-confirmed decision with a required reason; native permission ask applies. abort irreversibly terminates the run, preserving evidence. reset archives it and opens a fresh gated successor. retry requires expectedPauseId from graph_inspect and allows at most ONE same-run verification retry, persisted across restart/replan: only nonbaseline UNVERIFIED or INSUFFICIENT_EVIDENCE/ARTIFACT_REQUIRED/INVALID_VERDICT rejection pauses, with normal attempts left, valid unchanged approval/dependencies and trustworthy equal filesystem snapshots. All host calls and pending effects must settle. Retry preserves original evidence, siblings, counters and rejection streak, clears the active pause, and requires a new ordinary verifier dispatch; it neither grants PASS nor proves an external service healthy. graph_run_resume remains crash recovery.',
     args: {
-      action: z.enum(['reset', 'abort']),
+      action: z.enum(['reset', 'abort', 'retry']),
       reason: z.string().min(1).max(2000),
+      expectedPauseId: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
     },
     async execute(args, context) {
       const wrong = requireRole(context, 'graph-orchestrator');
       if (wrong) return wrong;
+      if (!['reset', 'abort', 'retry'].includes(args.action) || typeof args.reason !== 'string' || !args.reason.trim() || args.reason.length > 2000
+        || args.action !== 'retry' && args.expectedPauseId !== undefined) return rejected('INVALID_DECISION', 'Use abort/reset with a user reason, or retry with a user reason and expectedPauseId');
       const binding = bindings.get(context.sessionID);
       if (!binding?.root) return rejected('NOT_GRAPH_SESSION', 'only the root orchestrator of this run may deliver a user decision');
       const state = store.getRun(binding.runId);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
       if (state.successorRunId) return rejected('RUN_SUPERSEDED', `this run was already reset; its successor ${state.successorRunId} owns the session now`);
+      if (state.dispatchRecoveryIssues !== undefined && (!Array.isArray(state.dispatchRecoveryIssues) || state.dispatchRecoveryIssues.length !== 0)) {
+        return rejected('DISPATCH_RECOVERY_UNRESOLVED', 'unrestorable outstanding lifetimes are preserved; no decision may assume they completed');
+      }
       const running = Object.values(state.nodes).filter((node) => node.state === 'RUNNING');
       if (running.length) return rejected('RUN_BUSY', `nodes are still in flight: ${running.map((node) => node.spec.id).join(', ')}; wait for correlated terminal turn/task evidence (idle or metadata alone is not completion)`);
       const outstanding = dispatches ? dispatches.inspect(state.runId) : [];
-      if (outstanding.length) return rejected('DISPATCH_PENDING', 'task dispatches are still registered for this run; wait for their sessions to finish first');
+      if (outstanding.length || state.dispatchReservations !== undefined && (!Array.isArray(state.dispatchReservations) || state.dispatchReservations.length !== 0)) return rejected('DISPATCH_PENDING', 'task dispatches are still registered for this run; wait for their sessions to finish first');
+
+      if (args.action === 'retry') {
+        if (context.sessionID !== state.rootSessionId || binding.agent !== context.agent) return rejected('NOT_GRAPH_SESSION', 'retry requires the owning root orchestrator');
+        const observedSnapshot = await store.hashFiles(Object.keys(state.pendingDecision?.proof?.expectedSnapshot ?? {}));
+        const checked = runner.prepareRetry(state, { ...args, observedSnapshot, now: NOW() });
+        if (!checked.ok) return reply(checked);
+        await store.saveRun(checked.candidate);
+        Object.assign(state, checked.candidate);
+        return reply({ ok: true, action: 'retry', runId: state.runId, status: state.status, nodeId: checked.nodeId,
+          next: 'dispatch the original verifier using task_id or a fresh session; normal attempts and PASS evidence gates still apply' });
+      }
 
       if (args.action === 'abort') {
         if (state.status === 'SUCCEEDED') return rejected('RUN_NOT_ABORTABLE', 'a succeeded run has nothing to abort');

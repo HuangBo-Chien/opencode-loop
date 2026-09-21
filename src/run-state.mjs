@@ -57,7 +57,7 @@ export function newRun({ runId, rootSessionId, now, request = null, requestCaptu
   };
 }
 
-function sanitizeRun(state) {
+export function sanitizeRun(state) {
   let cleaned = cleanJson(state, { maxBytes: RUN_MAX_BYTES, maxValues: 20_000, maxDepth: 32 });
   if (cleaned.schemaVersion === 1) {
     cleaned = { ...cleaned, schemaVersion: SCHEMA_VERSION, request: null, requestCaptureCompleted: true };

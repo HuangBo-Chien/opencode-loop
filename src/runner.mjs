@@ -11,6 +11,7 @@
 //   artifacts invalidate downstream results conservatively.
 
 import { cleanJson } from './json-safe.mjs';
+import { captureVerificationPause, prepareVerificationRetry } from './recovery-policy.mjs';
 import { artifactRef, canonicalRef, exactRef, lineageIndex, consumedRefs, publishArtifact, retainedLineage, validateRepairTargets, repairClosure, applyRepair, repairSettlementPending } from './artifact-dependencies.mjs';
 import { matchScopePath, normalizeScopePath, validateFileClaim, validateTaskGraph, validateDependencies, canonicalOutput, ARTIFACT_REF_PATTERN } from './task-spec.mjs';
 
@@ -222,7 +223,7 @@ function planArtifacts(state, plan) {
   return artifacts;
 }
 
-function validatePlanLiveness(nodes, artifacts, basedOn) {
+function validatePlanLiveness(nodes, artifacts, basedOn, executionNodes = null) {
   const errors = [];
   const producers = new Map([...nodes.values()].filter((spec) => !completedByPlan(spec)).map((spec) => [canonicalOutput(spec), spec]));
   const edges = new Map([...nodes].map(([id, spec]) => [id, spec.dependsOn.map((id) => ({ id, via: 'dependsOn' }))]));
@@ -254,6 +255,9 @@ function validatePlanLiveness(nodes, artifacts, basedOn) {
       : 'no satisfiable future producer; submit currently-valid evidence first or correct the input/producer (explore/analyze nodes document existing findings, they do not publish on plan acceptance)'}`);
   }
   for (const spec of nodes.values()) {
+    // Retry keeps completed work. Unlike plan replacement, it cannot model
+    // successful producers as future publications that will replace evidence.
+    if (executionNodes && ['SUCCEEDED', 'SKIPPED'].includes(executionNodes.get(spec.id)?.state)) continue;
     for (const ref of spec.inputs ?? []) requireRef(spec.id, ref, { historicalOnly: completedByPlan(spec) });
     // PASS derives evidence from every dependsOn entry, even without inputs.
     // Keep this naming identical to submitVerification's default bindings.
@@ -263,8 +267,10 @@ function validatePlanLiveness(nodes, artifacts, basedOn) {
   }
   for (const ref of basedOn) requireRef('plan.basedOn', ref, { historicalOnly: true, planProvenance: true });
   if (errors.length) return { ok: false, errors };
-  const readers = publicationReaders(new Map([...nodes].map(([id, spec]) => [id, { spec, state: 'PENDING' }])), artifacts);
-  for (const [id, dependencies] of readers) edges.get(id).push(...dependencies);
+  const readers = publicationReaders(executionNodes ?? new Map([...nodes].map(([id, spec]) => [id, { spec, state: 'PENDING' }])), artifacts);
+  for (const [id, dependencies] of readers) {
+    if (!executionNodes || !['SUCCEEDED', 'SKIPPED'].includes(executionNodes.get(id)?.state)) edges.get(id).push(...dependencies);
+  }
   return validateDependencies(nodes, (spec) => edges.get(spec.id));
 }
 
@@ -297,22 +303,25 @@ export function depsSatisfied(state, node) {
 // Exhaustion and fundamental rejection no longer fail the run silently: the
 // run pauses for an explicit user decision (graph_run_decide). Nodes, attempt
 // counters, artifacts and violations stay exactly as they were for audit.
-function pauseForDecision(state, cause, detail, now) {
+function pauseForDecision(state, cause, detail, now, identity = {}) {
   state.status = 'AWAITING_USER_DECISION';
-  state.pendingDecision ??= { cause, detail, at: now };
+  if (!state.pendingDecision) {
+    state.pauseSequence = (state.pauseSequence ?? 0) + 1;
+    state.pendingDecision = { cause, detail, at: now, pauseId: state.pauseSequence, ...identity };
+  }
   state.blockedReason = null;
   state.updatedAt = now;
 }
 
 // Circuit breaker for deterministic verification rejections: two consecutive
-// identical content-level rejections mean no payload change can fix the
-// submission, so instead of burning the session in a loop the run pauses for
+// identical content-level rejections mean the submitted payload has not fixed
+// the problem, so instead of burning the session in a loop the run pauses for
 // a user decision and the node returns to PENDING (graph_run_decide's
 // in-flight check can then pass). The streak deliberately persists across
 // re-dispatches — a fresh session resubmitting the same broken payload is
 // still the same loop — and resets only on an accepted verdict (which also
 // covers rejections the corrected payload outgrew) or a different rejection.
-function trackRejection(state, node, code, detail, now) {
+function trackRejection(state, node, code, detail, now, evidence) {
   const previous = node.rejectionStreak;
   node.rejectionStreak = previous && previous.code === code && previous.detail === detail
     ? { code, detail, count: previous.count + 1 }
@@ -320,7 +329,7 @@ function trackRejection(state, node, code, detail, now) {
   if (node.rejectionStreak.count >= 2) {
     node.state = 'PENDING';
     node.finishedAt = now;
-    pauseForDecision(state, 'runner-rejection', detail, now);
+    pauseForDecision(state, 'runner-rejection', detail, now, captureVerificationPause(state, node, { ...evidence, detail }, code));
     return { ok: false, code: 'REJECTION_LOOP', detail: `${node.rejectionStreak.count} consecutive identical ${code} rejections: ${detail}` };
   }
   return { ok: false, code, detail };
@@ -452,7 +461,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     }
     if (state.status === 'AWAITING_USER_DECISION') {
       const pending = state.pendingDecision;
-      return { allowed: false, code: 'AWAITING_DECISION', detail: pending ? `run is awaiting a user decision (${pending.cause}: ${pending.detail}); report to the user and use graph_run_decide to reset or abort` : 'run is awaiting a user decision; use graph_run_decide to reset or abort' };
+      return { allowed: false, code: 'AWAITING_DECISION', detail: pending ? `run is awaiting a user decision (${pending.cause}: ${pending.detail}); report to the user and use graph_run_decide to abort, reset, or retry an eligible verifier with expectedPauseId` : 'run is awaiting a user decision; inspect the pause and use graph_run_decide' };
     }
     // No code path sets BLOCKED anymore; this branch and blockedReason stay
     // for legacy persisted runs, which graph_run_decide can still terminate
@@ -800,14 +809,17 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     const node = state.nodes[nodeId];
     if (!node || node.spec.kind !== 'verify') return { ok: false, code: 'NOT_VERIFY_NODE', detail: `${nodeId} is not a verify node` };
     if (node.state !== 'RUNNING') return { ok: false, code: 'NOT_RUNNING', detail: `${nodeId} is ${node.state}` };
+    const evidence = { payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot,
+      basedOn: changeRefs ?? node.consumedRefs ?? [] };
+    const reject = (code, detail) => trackRejection(state, node, code, detail, now, evidence);
 
     // Baseline capture: pre-change suite evidence recorded before any
     // implement node writes. The artifact is what later PASS verdicts match
     // nonzero commands against, so failures that predate the change can be
     // told apart from regressions the change introduced.
     if (verdict === 'BASELINE') {
-      if (node.spec.baseline !== true) return trackRejection(state, node, 'INVALID_VERDICT', 'BASELINE verdicts are only accepted on baseline verify nodes (declare baseline: true in the plan)', now);
-      if (!commands.length) return trackRejection(state, node, 'INSUFFICIENT_EVIDENCE', 'BASELINE requires at least one recorded command (the pre-change suite evidence)', now);
+      if (node.spec.baseline !== true) return reject('INVALID_VERDICT', 'BASELINE verdicts are only accepted on baseline verify nodes (declare baseline: true in the plan)');
+      if (!commands.length) return reject('INSUFFICIENT_EVIDENCE', 'BASELINE requires at least one recorded command (the pre-change suite evidence)');
       const name = `baseline:${nodeId}`;
       const previous = state.artifacts[name];
       const version = previous ? previous.version + 1 : 1;
@@ -820,7 +832,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       return { ok: true, effect: 'baseline' };
     }
     if (node.spec.baseline === true && (verdict === 'PASS' || verdict === 'FAIL')) {
-      return trackRejection(state, node, 'INVALID_VERDICT', 'baseline verify nodes only accept BASELINE or UNVERIFIED verdicts (there is no change to judge yet)', now);
+      return reject('INVALID_VERDICT', 'baseline verify nodes only accept BASELINE or UNVERIFIED verdicts (there is no change to judge yet)');
     }
     if (verdict === 'PASS') {
       // Nonzero exit codes are tolerated only when the exact command and
@@ -828,9 +840,9 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       // did not get worse. Everything else is a regression this change owns.
       const unmatched = commands.filter((command) => command.exitCode !== 0 && !baselineMatches(state, command));
       if (!commands.length || !commands.some((command) => command.exitCode === 0) || unmatched.length) {
-        return trackRejection(state, node, 'INSUFFICIENT_EVIDENCE', unmatched.length
+        return reject('INSUFFICIENT_EVIDENCE', unmatched.length
           ? `nonzero commands not covered by a baseline entry: ${unmatched.map((command) => command.command).join('; ')} — every failing command on PASS must match a declared baseline (same command and exitCode)`
-          : 'PASS requires at least one command with exitCode 0 (baseline matches tolerate pre-existing failures but never substitute for a green command)', now);
+          : 'PASS requires at least one command with exitCode 0 (baseline matches tolerate pre-existing failures but never substitute for a green command)');
       }
       // Deliverable-backed work earns real-surface evidence: when any
       // dependency implement node declared deliverables, PASS must cite at
@@ -838,7 +850,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       // not only a green command.
       const deliverableDeps = node.spec.dependsOn.map((dep) => state.nodes[dep]).filter((dep) => dep && dep.spec.kind === 'implement' && Array.isArray(dep.spec.deliverables) && dep.spec.deliverables.length);
       if (deliverableDeps.length && !artifacts.length) {
-        return trackRejection(state, node, 'ARTIFACT_REQUIRED', `implement nodes with declared deliverables (${deliverableDeps.map((dep) => dep.spec.id).join(', ')}) require at least one artifact path (an existing evidence file) on PASS`, now);
+        return reject('ARTIFACT_REQUIRED', `implement nodes with declared deliverables (${deliverableDeps.map((dep) => dep.spec.id).join(', ')}) require at least one artifact path (an existing evidence file) on PASS`);
       }
       const refs = changeRefs ?? node.consumedRefs ?? node.spec.dependsOn.map((dep) => depArtifactRef(state, dep));
       const history = lineageIndex(state);
@@ -850,7 +862,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
           // The streak identity is the raw missing-reason (guidance prose is
           // presentation only), so rewording the clause can never silently
           // reset a persisted streak.
-          const rejection = trackRejection(state, node, 'STALE_CHANGE', resolution.missing, now);
+          const rejection = reject('STALE_CHANGE', resolution.missing);
           return { ...rejection, detail: `${rejection.detail} — if this ref was derived from dependsOn rather than authored in the submission, no payload change can fix it; report the rejection instead of resubmitting` };
         }
       }
@@ -915,10 +927,23 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       const version = previous ? previous.version + 1 : 1;
       const refs = node.spec.dependsOn.map((dep) => depArtifactRef(state, dep));
       publishArtifact(state, name, { kind: 'verification', nodeId, version, basedOn: node.consumedRefs ?? refs, payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot, status: 'superseded', createdAt: now });
-      pauseForDecision(state, 'verification-unverified', summary || 'verifier could not verify', now);
+      pauseForDecision(state, 'verification-unverified', summary || 'verifier could not verify', now,
+        captureVerificationPause(state, node, { ...evidence, ref: `${name}@${version}` }));
       return { ok: true, effect: 'await-decision', detail: 'verification could not be completed; run paused for a user decision (evidence preserved)' };
     }
-    return trackRejection(state, node, 'INVALID_VERDICT', 'verdict must be PASS, FAIL or UNVERIFIED', now);
+    return reject('INVALID_VERDICT', 'verdict must be PASS, FAIL or UNVERIFIED');
+  }
+
+  function prepareRetry(state, args) {
+    const result = prepareVerificationRetry(state, { ...args, maxAttempts });
+    if (!result.ok) return result;
+    const graph = validateTaskGraph(Object.values(state.nodes).map((n) => n.spec), { light: state.mode === 'light' });
+    const liveness = graph.ok && validatePlanLiveness(graph.nodes, state.artifacts, state.artifacts.plan.basedOn, new Map(Object.entries(state.nodes)));
+    const deps = depsSatisfied(state, state.nodes[result.nodeId]);
+    if (!graph.ok || !liveness.ok || !deps.ok) return { ok: false, code: 'RETRY_INELIGIBLE', detail: 'The accepted graph or verifier dependencies are not satisfiable' };
+    try { assertSettlementCapacity(result.candidate); }
+    catch (error) { return { ok: false, code: 'RETRY_INELIGIBLE', detail: `Insufficient dispatch settlement capacity: ${error.message}` }; }
+    return result;
   }
 
   function recordSideEffect(state, { nodeId, tool, target, now, dispatchId, callID, sessionId, outcome, uncertain, messageId, partId }) {
@@ -1067,6 +1092,9 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     return {
       runId: state.runId, status: state.status, mode: state.mode, failReason: state.failReason,
       pendingDecision: state.pendingDecision ?? null,
+      pauseId: state.pendingDecision?.pauseId ?? null,
+      recoveryUsed: state.recoveryUsed ?? 0,
+      recoveryHistory: state.recoveryHistory ?? [],
       ...(state.repairPlanRevision ?? { needsPlanRevision: false, offendingRefs: [] }),
       closeouts: (state.closeouts ?? []).map(({ nodeId, dispatchId, tool, payload, at }) => ({ nodeId, dispatchId, tool, summary: payload.summary ?? null, at })),
       decision: state.decision ?? null,
@@ -1107,6 +1135,6 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   return Object.freeze({
     admitDispatch, beginNode, attachSession, submitPlan, submitReview, checkChange, submitChange, submitVerification,
     recordSideEffect, recordViolation, captureRequest, completeRequestCapture, markIncomplete, resumeRun, reconcileNode, revalidateArtifacts, inspect,
-    abortRun, archiveForReset, implementerCapacity, readerCapacity, taintAttempt,
+    abortRun, archiveForReset, prepareRetry, implementerCapacity, readerCapacity, taintAttempt,
   });
 }

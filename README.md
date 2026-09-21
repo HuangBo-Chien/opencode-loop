@@ -128,7 +128,23 @@ Structured submissions carry a bounded evidence vocabulary beyond file claims:
 
 ### Paused execution and settlement
 
-`AWAITING_USER_DECISION` closes execution: no new task dispatch (including `task_id` continuations) or workspace effects through edit/write/bash. It preserves the **first** `pendingDecision` cause, detail and timestamp even if another sibling exhausts its budget while ending.
+`AWAITING_USER_DECISION` closes execution: no new task dispatch (including `task_id` continuations) or workspace effects through edit/write/bash. It preserves the **first** `pendingDecision` cause, detail, timestamp and `pauseId` even if another sibling exhausts its budget while ending. Pause IDs are monotonic integers within a run; `graph_inspect` exposes the active `pauseId`, the original verifier generation/evidence, `recoveryUsed` and `recoveryHistory`.
+
+### One user-confirmed same-run verification retry
+
+The root orchestrator may call `graph_run_decide({ action: "retry", reason, expectedPauseId })` after the user confirms the decision through the existing native **ask** permission. `reason` must faithfully report the user's reason. `expectedPauseId` is required only for retry and must exactly match the active pause. There is **at most one successful retry decision per run**, durable across replans and restarts.
+
+- Eligible pauses: a **nonbaseline verifier** returned `UNVERIFIED`, or its repeated rejection was `INSUFFICIENT_EVIDENCE`, `ARTIFACT_REQUIRED` or `INVALID_VERDICT`. The original verifier must have a normal attempt remaining.
+- All native lifetimes must have settled, including unbound reservations, queued calls and free consultations, and there must be no pending effects or `RUNNING` nodes. A settlement closeout, even one reporting PASS, is neither approval nor proof that a host call ended.
+- The original plan and PASS review must still be valid (light uses its plan), with unchanged accepted dependencies and a satisfiable graph. Unrelated failed, incomplete, recovery-required or stale work, started pending work and Task1 `needsPlanRevision` blockers prevent retry.
+- Full retained change claims and provenance must provide trustworthy expected snapshots. Existing files require SHA-256 hashes; `MISSING` is allowed only for declared `filesDeleted`. The public tool hashes actual files through the store and requires equality. Drift, unexpected absence, links/unreadable files, missing coverage, conflicting snapshots and historical edge-only evidence without retained proof all fail closed. Empty true no-op claims are allowed. Expected hashes are never replaced with newly observed hashes to make retry possible.
+- `STALE_CHANGE`, baseline verification, functional FAIL/repair exhaustion, unknown causes, scope/ledger/denied-execution corruption and legacy pauses without sufficient identity/evidence are ineligible. No successor or additional attempts are granted.
+
+Success keeps the same run and session ownership, sets the run to `RUNNING`, leaves the exact original verifier `PENDING`, and explicitly clears active `pendingDecision`. Dispatch that verifier through an ordinary fresh session or `task_id` continuation: binding generates a new dispatch token and charges one normal attempt. Successful siblings, artifact versions, attempt/revision counters and the rejection streak are preserved. An identical bad payload therefore re-pauses immediately; corrected accepted evidence clears the streak normally. A later functional FAIL still uses selective `repairTargets`.
+
+The bounded recovery history retains the complete original pause, UNVERIFIED/rejection payload and user decision before the verifier's next publication replaces its artifact slot. Capacity is checked with the actual run sanitizer and dispatch settlement headroom, with no silent evidence truncation. The candidate is saved before memory is published; a failed save leaves the decision retryable. A crash after the saved decision but before dispatch needs no second decision and never refunds `recoveryUsed`. `graph_run_resume` continues to handle crash recovery separately. Snapshot equality is not proof that an external service is healthy: the retried verifier must satisfy every normal PASS gate.
+
+### Closeout evidence and host lifetime completion
 
 Already-owned attempts may still submit bounded closeout through their existing `graph_submit_*` tool. The usual role, exact node/session/dispatch identity, payload schema, file-claim and evidence checks apply. A successful response has `effect: "settlement"`: the report is saved in `closeouts`, **not** as a gating change, plan, review or verification artifact. Earlier accepted artifacts remain intact; dependents do not advance and the run cannot become successful through settlement. Each dispatch may close out once per submission tool; the run retains at most 64 closeouts, each limited to 8 KiB of plain JSON (1024 values, depth 16). `graph_inspect` lists closeout summaries.
 
