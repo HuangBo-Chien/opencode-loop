@@ -195,7 +195,9 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
           state.status = 'RECOVERY_REQUIRED';
           await store.saveRun(state);
         }
-        if (state.status === 'AWAITING_USER_DECISION') await dispatches.recoverPaused(state);
+        if (state.status === 'AWAITING_USER_DECISION' || state.dispatchReservations?.some((r) => r.settlementOnly)) {
+          await dispatches.recoverPaused(state);
+        }
         const pendingEffectsBeforeRecovery = state.pendingEffects?.length ?? 0;
         for (const effect of (state.pendingEffects ?? []).slice(0, 128)) {
           if (effect.runId === state.runId && typeof effect.sessionId === 'string' && typeof effect.callID === 'string') {
@@ -297,7 +299,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       if (!binding?.root) return;
       const state = store.getRun(binding.runId);
       if (!state) return;
-      const args = output.args ?? {};
+      const args = output.args ??= {};
       const subagentType = typeof args.subagent_type === 'string' ? args.subagent_type : null;
       const target = parseNodeIdHint(args, { strict: TARGET_REQUIRED_AGENTS.has(subagentType) });
       const decision = target.allowed ? await dispatches.admit(sessionID, callID, args, target.nodeId) : target;
@@ -306,8 +308,9 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
           runner.recordViolation(state, { nodeId: null, kind: 'gate-blocked-dispatch', detail: `${subagentType}: ${decision.code} — ${decision.detail}`, now: NOW() });
           await store.saveRun(state);
         });
-        const { task_id: _oldSession, nodeId: _nodeId, ...freshArgs } = args;
-        output.args = { ...freshArgs, description: args.description ?? 'runner-rejected dispatch', prompt: rejectionPrompt(decision), subagent_type: subagentType ?? 'graph-explorer' };
+        delete args.task_id;
+        delete args.nodeId;
+        Object.assign(args, { description: args.description ?? 'runner-rejected dispatch', prompt: rejectionPrompt(decision), subagent_type: subagentType ?? 'graph-explorer' });
         return;
       }
       let prompt = typeof args.prompt === 'string' ? args.prompt : '';
@@ -355,7 +358,8 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
         if (block) prompt = `${block}\n\n${prompt}`;
       }
       prompt = prompt.replace(/\[RUNNER_TASK_CALL:[^\]\r\n]*\]/g, '');
-      output.args = { ...args, prompt: `${prompt}\n[RUNNER_TASK_CALL:${decision.turnToken}]` };
+      // Native task execution retains the original args object across the hook.
+      args.prompt = `${prompt}\n[RUNNER_TASK_CALL:${decision.turnToken}]`;
       return;
     }
     if (tool === 'edit' || tool === 'write' || tool === 'bash') {

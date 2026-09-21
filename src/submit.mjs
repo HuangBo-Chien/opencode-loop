@@ -35,7 +35,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
   function runFor(context) {
     const binding = bindings.get(context.sessionID);
     if (!binding) return { error: rejected('NOT_GRAPH_SESSION', 'this session is not part of a graph run; work is dispatched by graph-orchestrator through native task') };
-    if (binding.agent !== context.agent || binding.active === false) return { error: rejected('NOT_DISPATCHED_NODE', 'caller must match an active dispatch binding') };
+    if (binding.agent !== context.agent || binding.active === false || binding.settlementOnly) return { error: rejected('NOT_DISPATCHED_NODE', 'caller must match an active dispatch binding') };
     const state = store.getRun(binding.runId);
     if (!state) return { error: rejected('RUN_GONE', 'the owning run no longer exists') };
     return { binding, state };
@@ -80,7 +80,8 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         ].join(' '));
       }
       try {
-        const result = runner.submitPlan(located.state, {
+        const candidate = structuredClone(located.state);
+        const result = runner.submitPlan(candidate, {
           intent: args.intent,
           nodes: graph.nodes,
           basedOn: cleanJson(args.basedOn ?? []),
@@ -88,8 +89,9 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
           now: NOW(),
         });
         if (!result.ok) return rejected(result.code, result.detail);
-        await store.saveRun(located.state);
-        dispatches?.invalidate(located.state.runId);
+        if (dispatches) await dispatches.revokeExecution(candidate);
+        else await store.saveRun(candidate);
+        Object.assign(located.state, candidate);
         // Echo the expanded literal paths so planner/orchestrator prose
         // (acceptance text, dispatch prompts) quotes real paths, not tokens.
         const lanes = [...graph.nodes.values()].filter((spec) => spec.kind === 'implement')

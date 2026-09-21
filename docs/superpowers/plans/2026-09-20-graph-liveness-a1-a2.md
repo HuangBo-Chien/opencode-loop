@@ -37,13 +37,13 @@ Required behavior:
 
 Execution:
 
-- [ ] Add failing host-event and public-submit regression tests for the reproduction and paused closeout.
-- [ ] Run node --test test/dispatch-bindings.test.mjs test/enforcement.test.mjs test/runner-and-state.test.mjs; confirm failure is the expected bug.
-- [ ] Implement the minimal ownership/settlement changes and bounded closeout handling.
-- [ ] Add adversarial persistence, stale-event, restart and pause-preservation cases.
-- [ ] Run affected tests (including strict-dispatch/workflow when modified) and npm test.
-- [ ] Spec review, resolve findings, re-review; then quality review, resolve findings, re-review.
-- [ ] Commit the reviewed A1 change.
+- [x] Add failing host-event and public-submit regression tests for the reproduction and paused closeout.
+- [x] Run node --test test/dispatch-bindings.test.mjs test/enforcement.test.mjs test/runner-and-state.test.mjs; confirm failure is the expected bug.
+- [x] Implement the minimal ownership/settlement changes and bounded closeout handling.
+- [x] Add adversarial persistence, stale-event, restart and pause-preservation cases.
+- [x] Run affected tests (including strict-dispatch/workflow when modified) and npm test.
+- [x] Spec review, resolve findings, re-review; then quality review, resolve findings, re-review.
+- [x] Commit the reviewed A1 change (b546c1a).
 
 ## Task 2 / A2: effective artifact dependency liveness
 
@@ -65,17 +65,28 @@ Required behavior:
 
 Execution:
 
-- [ ] Add failing self-cycle, indirect artifact-cycle and atomic rejection tests.
-- [ ] Run node --test test/json-and-spec.test.mjs test/runner-and-state.test.mjs test/enforcement.test.mjs; confirm expected red cases.
-- [ ] Implement producer-aware structural and state-aware admission checks before mutation.
-- [ ] Add positive cases for all supported lanes and replan/version semantics plus adversarial future/missing evidence cases.
-- [ ] Run affected tests and npm test.
-- [ ] Spec review, resolve findings, re-review; then quality review, resolve findings, re-review.
-- [ ] Commit the reviewed A2 change.
+- [x] Add failing self-cycle, indirect artifact-cycle and atomic rejection tests.
+- [x] Run node --test test/json-and-spec.test.mjs test/runner-and-state.test.mjs test/enforcement.test.mjs; confirm expected red cases.
+- [x] Implement producer-aware structural and state-aware admission checks before mutation.
+- [x] Add positive cases for all supported lanes and replan/version semantics plus adversarial future/missing evidence cases.
+- [x] Run affected tests and npm test.
+- [x] Spec review, resolve findings, re-review; then quality review, resolve findings, re-review.
+- [x] Commit the reviewed A2 change (6295eaa).
 
 ## Final integration and evidence
 
-- [ ] Independent overall code review against both tasks and base commit.
+### Integration corrections discovered by independent review and native host
+
+- Native OpenCode 1.18.31 retains the original tool argument object: replace-by-assignment does not transport runner guidance or per-call tokens. Mutate the original argument object in place, including intentional removal of stale fields on rejected dispatches. Add native-shaped identity-preserving hook tests and re-run the isolated fake-provider host harness.
+- Plan publication must revoke execution authority without deleting still-active host lifetimes, including the submitting background planner. Preserve durable settlement-only tracking across plan replacement; exact completion is still required before abort/reset.
+- A resumed attempt must not orphan a previous dispatch in the same session. Settle proven old reservations independently of the current execution binding and mutate node state only on exact attempt identity; cover repair/retry overlap before the old host turn finishes.
+- These are corrections to A1/A2 integration, not new workflow policy. Use a fresh implementer, followed by spec and quality review. The native harness and its immutable initial evidence live outside the repository under the approved temp root.
+
+Integration spec and quality re-review approved the corrections, including persist-before-publish rollback-free plan admission and admission-ordered free-session ownership restoration. The first native check failed token transport; the second check passed light-flow correlation and atomic cycle rejection. Final-code native revalidation is part of the remaining handoff check.
+
+Implementation clarification: native idle/status alone cannot prove that queued tasks finished. Original per-call user anchors require observed native chat.message provenance; authenticated compaction descendants can extend them. Legacy/cancelled calls lacking positive completion proof remain unresolved. This milestone does not claim automatic recovery of host facts the public API cannot establish.
+
+- [x] Independent overall code review against both tasks and base commit; identified integration corrections received separate spec and quality approval.
 - [ ] Run npm test and git diff --check on the final bytes.
 - [ ] Inspect real-host smoke infrastructure and run a bounded deterministic/fake-provider host test if supported. Distinguish host simulation, real host, and real-model evidence.
 - [ ] Check clean status and intended commit/file list; confirm original checkout remains unchanged.
