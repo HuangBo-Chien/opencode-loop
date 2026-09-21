@@ -412,7 +412,7 @@ test('integration review R3: revoked writer cannot fall back to a free identity 
 });
 
 for (const restart of [false, true]) {
-  test(`integration retry: overlapping verifier repair/retry retires original lifetime (restart=${restart})`, async (t) => {
+  test(`integration retry: selective repair fences replacement until original lifetime settles (restart=${restart})`, async (t) => {
     const dir = await mkdtemp(join(tmpdir(), 'loop-overlap-'));
     t.after(() => rm(dir, { recursive: true, force: true }));
     let h = harness(dir);
@@ -436,11 +436,18 @@ for (const restart of [false, true]) {
     const firstDispatch = h.bindings.get('verifier').dispatchId;
     assert.equal(JSON.parse(await h.tools.graph_submit_verification.execute({ nodeId: 'verify-1', verdict: 'FAIL', summary: 'needs repair' }, ctx(h, 'verifier', 'graph-verifier'))).effect, 'repair');
     await change('impl-v2');
-    // v1's structured FAIL is not its host turn end. Admit the retry first.
+    // v1's structured FAIL is not its host turn end. Both replacement paths
+    // are fenced until the original correlated host lifetime has settled.
     h.client.session.status = async () => ({ data: { verifier: { type: 'busy' } } });
+    for (const task_id of [undefined, 'verifier']) {
+      const denied = await dispatch(h, 'graph-verifier', { nodeId: 'verify-1', ...(task_id ? { task_id } : {}) });
+      assert.match(denied.args.prompt, /REPAIR_SETTLEMENT_PENDING/);
+    }
+    const oldTerminal = await terminalTurn(h, 'verifier', first.callID);
+    h.client.session.status = async () => ({ data: {} });
+    await childIdle(h, 'verifier');
     const second = await dispatch(h, 'graph-verifier', { nodeId: 'verify-1', task_id: 'verifier' });
     assert.doesNotMatch(second.args.prompt, /RUNNER_REJECTED/);
-    const oldTerminal = await terminalTurn(h, 'verifier', first.callID);
     await bindChild(h, 'verifier', 'graph-verifier', second.callID);
     await backgroundAck(h, second, 'verifier');
     let state = h.store.getRun('root');

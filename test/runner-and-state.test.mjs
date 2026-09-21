@@ -215,7 +215,7 @@ for (const explicit of [false, true]) {
           : runner.submitVerification(state, { nodeId: id, verdict: 'PASS', commands: [{ command: 'test', exitCode: 0 }], now: NOW });
       assert.equal(result.ok, true, JSON.stringify(result));
     }
-    assert.deepEqual(state.artifacts[`verification:${verification}`].basedOn, [`change:${implementation}@1`]);
+    assert.deepEqual(state.artifacts[`verification:${verification}`].basedOn, [`change:${implementation}@1`, 'review@1']);
     assert.equal(state.status, 'SUCCEEDED');
   });
 }
@@ -1123,7 +1123,7 @@ test('verify-kind dependencies bind PASS to upstream verification artifacts', ()
   const live = runner.submitVerification(state, { nodeId: 'verify-live', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], snapshot: { 'src/a.ts': 'hash-post' }, now: NOW });
   assert.equal(live.ok, true, JSON.stringify(live));
   assert.equal(state.artifacts['verification:verify-live'].status, 'valid');
-  assert.deepEqual(state.artifacts['verification:verify-live'].basedOn, ['change:impl-1@1', 'verification:verify-offline@1']);
+  assert.deepEqual(state.artifacts['verification:verify-live'].basedOn, ['change:impl-1@1', 'verification:verify-offline@1', 'review@1']);
 });
 
 test('verification FAIL records verify-kind dependency refs in the durable evidence artifact', () => {
@@ -1155,7 +1155,7 @@ test('verification FAIL records verify-kind dependency refs in the durable evide
   assert.equal(state.nodes['verify-offline'].state, 'STALE');
   const evidence = state.artifacts['verification:verify-live'];
   assert.equal(evidence.status, 'superseded');
-  assert.deepEqual(evidence.basedOn, ['change:impl-1@1', 'verification:verify-offline@1']);
+  assert.deepEqual(evidence.basedOn, ['change:impl-1@1', 'verification:verify-offline@1', 'review@1']);
 });
 
 test('invalidating a succeeded verifier resets it as new work against the new change version', async () => {
@@ -1242,7 +1242,7 @@ test('baseline verify dependencies bind PASS to the baseline artifact', () => {
   runner.beginNode(state, 'verify-live', { now: NOW, sessionId: 'sess-verify-live' });
   const live = runner.submitVerification(state, { nodeId: 'verify-live', verdict: 'PASS', commands: [{ command: 'npm test', exitCode: 0 }], snapshot: { 'src/a.ts': 'hash-post' }, now: NOW });
   assert.equal(live.ok, true, JSON.stringify(live));
-  assert.deepEqual(state.artifacts['verification:verify-live'].basedOn, ['change:impl-1@1', 'verification:verify-offline@1', 'baseline:baseline-1@1']);
+  assert.deepEqual(state.artifacts['verification:verify-live'].basedOn, ['change:impl-1@1', 'verification:verify-offline@1', 'baseline:baseline-1@1', 'review@1']);
 });
 
 test('change submissions store implementer-reported risks and inspect surfaces counts', async () => {

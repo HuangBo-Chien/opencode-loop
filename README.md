@@ -42,6 +42,46 @@ A node may read its own currently-valid prior output before publishing its succe
 
 On projects whose suite is already red, an honest verifier cannot cite an all-green command, so a `change` run used to burn repair attempts on failures it never caused. A plan may now declare a **baseline verify node** (`kind: "verify"`, `baseline: true`): it is dispatched *before* the implementer (it depends on the review node — the plan node in light graphs — and every implement node must depend on it, so the capture is mechanically ordered before any write). The verifier submits `verdict: "BASELINE"` with the commands it actually ran and their exit codes; the runner stores the versioned `baseline:<id>` artifact. A later `PASS` still requires at least one `exitCode 0` command, and every nonzero command is tolerated **only** when it matches a still-valid baseline entry (identical command string and exit code — purely mechanical, no output parsing, ecosystem-agnostic). A failure that got worse (different exit code), a new failure, or a stale baseline all reject the PASS. Replacing the plan supersedes existing baseline artifacts so pre-change evidence from a previous graph version can never tolerate failures under the new one.
 
+### Selective verification repair
+
+On a nonbaseline `FAIL`, `graph_submit_verification` accepts optional
+`repairTargets: ["implement-a"]`: a nonempty, unique array of literal node IDs,
+each a **direct implement dependency** of that verifier. Omission retains the
+legacy default of all direct implement dependencies. Other verdicts, baseline
+nodes, empty/duplicate lists, artifact refs, globs, unknown IDs, wrong kinds and
+unrelated nodes reject before counters, evidence, bindings or disk change.
+
+The effective targets are saved in FAIL evidence. Repair follows exact consumed
+artifact versions forward to a fixed point through implementation consumers,
+verifier chains, execution dependencies and artifact provenance. Selected
+implementations become `PENDING`; affected completed/in-flight consumers become
+`STALE`; never-started consumers await new evidence. A combined verifier becoming
+stale does not reopen an independent successful prerequisite. Unrelated nodes,
+versions and attempts are preserved, without no-op change submissions.
+
+`beginNode` captures explicit inputs, dependency outputs and approval as exact
+`consumedRefs`. Ordinary publication is not semantic invalidation. Reachable
+historical lineage retains only provenance edges/status, not old payloads or a
+history-reading API. Retention is bounded (1,024 visited refs, 4,096 edges and
+128 KiB/6,000 JSON values); closure/snapshot scans are bounded too. Capacity
+failures reject without discarding referenced lineage, with reserved settlement
+headroom preserved. Verification snapshots cover transitive available evidence.
+
+An obsolete explicit pin, invalidated approval or unverifiable legacy provenance
+returns `needsPlanRevision: true` and `offendingRefs` in the result and inspection.
+Pins are never silently rewritten by repair: use the existing planner route to
+submit satisfiable evidence. The run stays `RUNNING` unless an existing pause
+condition applies. The global repair cap still pauses at exhaustion and keeps
+the FAIL evidence; affected verifiers otherwise reset their attempt budget for
+new evidence. There is no user retry action.
+
+FAIL and scoped execution revocation are persisted together before publishing
+live state. Affected native lifetimes and pending effects retain their exact
+identities; fresh dispatch and `task_id` replacement return
+`REPAIR_SETTLEMENT_PENDING` until settlement. Resume cannot erase these fences.
+Unrelated live siblings keep authority. Repair guidance goes only to selected
+targets and affected consumers and survives a newer verifier publication.
+
 ### File claims and correction
 
 `filesTouched` contains **literal workspace-relative file paths**, not directories, trailing `/`, globs, or absolute paths. New/modified files must be readable regular files; linked paths are not accepted as verifiable file claims. Explicit deletions are included in both `filesTouched` and optional `filesDeleted` and must be absent at submission:
@@ -88,13 +128,29 @@ Structured submissions carry a bounded evidence vocabulary beyond file claims:
 
 ### Paused execution and settlement
 
-`AWAITING_USER_DECISION` closes execution: no new task dispatch (including `task_id` continuations) or workspace effects through edit/write/bash. It preserves the **first** `pendingDecision` cause, detail and timestamp even if another sibling exhausts its budget while ending.
+`AWAITING_USER_DECISION` closes execution: no new task dispatch (including `task_id` continuations) or workspace effects through edit/write/bash. It preserves the **first** `pendingDecision` cause, detail, timestamp and `pauseId` even if another sibling exhausts its budget while ending. Pause IDs are monotonic integers within a run; `graph_inspect` exposes the active `pauseId`, the original verifier generation/evidence, `recoveryUsed` and `recoveryHistory`.
+
+### One user-confirmed same-run verification retry
+
+The root orchestrator may call `graph_run_decide({ action: "retry", reason, expectedPauseId })` after the user confirms the decision through the existing native **ask** permission. `reason` must faithfully report the user's reason. `expectedPauseId` is required only for retry and must exactly match the active pause. There is **at most one successful retry decision per run**, durable across replans and restarts.
+
+- Eligible pauses: a **nonbaseline verifier** returned `UNVERIFIED`, or its repeated rejection was `INSUFFICIENT_EVIDENCE`, `ARTIFACT_REQUIRED` or `INVALID_VERDICT`. The original verifier must have a normal attempt remaining.
+- All native lifetimes must have settled, including unbound reservations, queued calls and free consultations, and there must be no pending effects or `RUNNING` nodes. A settlement closeout, even one reporting PASS, is neither approval nor proof that a host call ended.
+- The original plan and PASS review must still be valid (light uses its plan), with unchanged accepted dependencies and a satisfiable graph. Unrelated failed, incomplete, recovery-required or stale work, started pending work and Task1 `needsPlanRevision` blockers prevent retry.
+- Full retained change claims and provenance must provide trustworthy expected snapshots. Existing files require SHA-256 hashes; `MISSING` is allowed only for declared `filesDeleted`. The public tool hashes actual files through the store and requires equality. Drift, unexpected absence, links/unreadable files, missing coverage, conflicting snapshots and historical edge-only evidence without retained proof all fail closed. Empty true no-op claims are allowed. Expected hashes are never replaced with newly observed hashes to make retry possible.
+- `STALE_CHANGE`, baseline verification, functional FAIL/repair exhaustion, unknown causes, scope/ledger/denied-execution corruption and legacy pauses without sufficient identity/evidence are ineligible. No successor or additional attempts are granted.
+
+Success keeps the same run and session ownership, sets the run to `RUNNING`, leaves the exact original verifier `PENDING`, and explicitly clears active `pendingDecision`. Dispatch that verifier through an ordinary fresh session or `task_id` continuation: binding generates a new dispatch token and charges one normal attempt. Successful siblings, artifact versions, attempt/revision counters and the rejection streak are preserved. An identical bad payload therefore re-pauses immediately; corrected accepted evidence clears the streak normally. A later functional FAIL still uses selective `repairTargets`.
+
+The bounded recovery history retains the complete original pause, UNVERIFIED/rejection payload and user decision before the verifier's next publication replaces its artifact slot. Capacity is checked with the actual run sanitizer and dispatch settlement headroom, with no silent evidence truncation. The candidate is saved before memory is published; a failed save leaves the decision retryable. A crash after the saved decision but before dispatch needs no second decision and never refunds `recoveryUsed`. `graph_run_resume` continues to handle crash recovery separately. Snapshot equality is not proof that an external service is healthy: the retried verifier must satisfy every normal PASS gate.
+
+### Closeout evidence and host lifetime completion
 
 Already-owned attempts may still submit bounded closeout through their existing `graph_submit_*` tool. The usual role, exact node/session/dispatch identity, payload schema, file-claim and evidence checks apply. A successful response has `effect: "settlement"`: the report is saved in `closeouts`, **not** as a gating change, plan, review or verification artifact. Earlier accepted artifacts remain intact; dependents do not advance and the run cannot become successful through settlement. Each dispatch may close out once per submission tool; the run retains at most 64 closeouts, each limited to 8 KiB of plain JSON (1024 values, depth 16). `graph_inspect` lists closeout summaries.
 
 Structured closeout does not end a host execution lifetime. Exact foreground completion or correlated terminal child turns retire the matching calls; retirement must persist before reservations are released. A bounded history of the latest 128 settled call identities and their witnesses also accepts delayed closeout if the host end event arrived first, provided the run is still paused and the exact attempt identity has not been superseded; it never reopens the host lifetime. Active children and admitted-but-unbound reservations continue to block `graph_run_decide`. Once completion is proven, the existing user **abort/reset** paths are reachable. Late after-hooks for effects already admitted before the pause retain their original attempt identity and are recorded once; this grants no permission to start more work for evidence.
 
-Settlement follows each original dispatch lifetime, independently of the session's newest execution binding. Overlapping repair/retry attempts retain their own call witnesses; ending an older lifetime can mutate a node only when its session and dispatch ID still match that exact attempt. Same-attempt continuations still require completion proof for every call sharing the dispatch ID. Accepted plan publication durably revokes old execution while retaining settlement-only tracking of active calls, including the submitting planner and free or node-bound readers. Those calls cannot submit new graph evidence or paused closeout under the replacement plan, and still block abort/reset until authentic host completion. Rejected plans leave the existing graph and bindings intact; explicit resume/new/reset retain their documented invalidation behavior.
+Settlement follows each original dispatch lifetime, independently of the session's newest execution binding. Historical overlapping attempts retain their own call witnesses; ending an older lifetime can mutate a node only when its session and dispatch ID still match that exact attempt. Selective repair now fences replacement until affected lifetimes and effects settle. Same-attempt continuations still require completion proof for every call sharing the dispatch ID. Accepted plan publication durably revokes old execution while retaining settlement-only tracking of active calls, including the submitting planner and free or node-bound readers. Those calls cannot submit new graph evidence or paused closeout under the replacement plan, and still block abort/reset until authentic host completion. Rejected plans leave the existing graph and bindings intact; explicit new/reset retain their documented invalidation behavior, and resume cannot clear selective-repair fences.
 
 After restart, a paused run restores its durable lifetime, per-call witnesses and pending-effect bookkeeping without refunding attempts, unpausing, or replaying effects. Recovery uses bounded native message scans (64 messages, at most 256 parts each) and exact message lookups with two-second request deadlines. Missing scan results are never interpreted as completion. Legacy or cancelled calls without a recoverable per-call witness remain unresolved; synthetic parent notifications identify only a session/description and cannot discharge them. This is deliberately not universal automatic recovery. `graph_run_resume` does not turn a pause into permission to execute or discard active children. Ordinary RUNNING-run crash recovery retains its existing refund/reconciliation behavior.
 

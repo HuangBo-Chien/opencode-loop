@@ -8,6 +8,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { cleanJson } from './json-safe.mjs';
 import { assertSettlementCapacity, isUncertainEffect } from './runner.mjs';
+import { publishArtifact, validateRepairTargets, verificationFiles, repairSettlementPending } from './artifact-dependencies.mjs';
 import { validateTaskGraph, expandRunTokens, runToken, validateFileClaim } from './task-spec.mjs';
 
 const z = tool.schema;
@@ -163,10 +164,12 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
   });
 
   const graph_submit_verification = tool({
-    description: 'Verifier submits evidence-bound verification. PASS requires at least one command with exitCode 0 (nonzero commands are tolerated only when they match a declared baseline entry — same command and exit code) and binds to the current change versions; BASELINE records pre-change suite evidence on baseline verify nodes; FAIL returns work to the implementer (capped); UNVERIFIED pauses the run for a user decision honestly, with the verdict and evidence preserved as a verification artifact. artifacts are existing evidence file paths (logs, output files, screenshots); probed records adversarial scenarios exercised with their observed results; skipped records scenarios ruled out with a one-line reason. When the verified implement nodes declared deliverables, PASS additionally requires at least one artifact.',
+    description: 'Verifier submits evidence-bound verification. PASS requires at least one command with exitCode 0 (nonzero commands require an exact valid baseline match) and binds to consumed artifact versions. BASELINE records pre-change evidence; UNVERIFIED pauses for a user decision. Nonbaseline FAIL optionally accepts repairTargets: unique, nonempty literal DIRECT implement dependency node IDs; omitted means all direct implement dependencies. FAIL invalidates affected consumers transitively, preserves unrelated work, and remains globally capped. needsPlanRevision/offendingRefs require a revised plan, never silent repinning. Affected host lifetimes/effects must settle before replacement. artifacts are existing evidence file paths; probed and skipped record exercised or ruled-out scenarios. PASS over declared deliverables requires at least one artifact.',
     args: {
       nodeId: z.string().min(1).max(128),
       verdict: z.enum(['PASS', 'FAIL', 'UNVERIFIED', 'BASELINE']),
+      repairTargets: z.array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)).min(1).max(64)
+        .refine((ids) => new Set(ids).size === ids.length, 'repairTargets must be unique').optional(),
       commands: z.array(z.object({ command: z.string().min(1).max(2000), exitCode: z.number().int() })).max(32).default([]),
       artifacts: z.array(z.string().min(1).max(512)).max(32).default([]),
       probed: z.array(z.string().max(2000)).max(16).default([]),
@@ -183,15 +186,18 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (args.nodeId !== located.binding.nodeId) {
         return rejected('NOT_DISPATCHED_NODE', `nodeId must match the node bound to this session; this session is bound to ${located.binding.nodeId}`);
       }
+      const targets = validateRepairTargets(located.state, args);
+      if (!targets.ok) return reply(targets);
       for (const artifact of args.artifacts ?? []) {
         const problem = artifact.startsWith('/tmp/') ? null : artifactPathProblem(artifact);
         if (problem) return rejected('INVALID_FILE_CLAIM', problem, 'artifacts are literal workspace-relative file paths (a /tmp/-prefixed absolute path is also accepted), never directories or globs');
         const resolved = artifact.startsWith('/tmp/') ? artifact : join(worktree, artifact);
         if (!existsSync(resolved)) return rejected('ARTIFACT_MISSING', `${artifact}: cited evidence artifact does not exist at submission time`, 'ARTIFACT_MISSING is correctable within this attempt; check the path and resubmit without redoing verified work');
       }
-      const files = (bound.node.spec.dependsOn ?? []).flatMap((dep) => located.state.artifacts[`change:${dep}`]?.payload?.filesTouched ?? []);
+      const files = verificationFiles(located.state, bound.node);
       const snapshot = await store.hashFiles(files);
-      const result = runner.submitVerification(located.state, { ...args, snapshot, now: NOW() });
+      const candidate = structuredClone(located.state);
+      const result = runner.submitVerification(candidate, { ...args, snapshot, now: NOW() });
       if (!result.ok) {
         const hints = {
           INSUFFICIENT_EVIDENCE: 'cite the actual commands and their exit codes; nonzero commands are only tolerated on PASS when they match a declared baseline entry (same command and exit code)',
@@ -201,11 +207,16 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         // Rejections mutate run state too (rejection streaks; the loop breaker
         // pauses the run), so persist before replying — a crash must not
         // resurrect a RUNNING node from disk and lose the pause.
-        await store.saveRun(located.state);
+        if (JSON.stringify(candidate) !== JSON.stringify(located.state)) {
+          await store.saveRun(candidate);
+          Object.assign(located.state, candidate);
+        }
         return rejected(result.code, result.detail, hints[result.code] ?? null);
       }
-      await store.saveRun(located.state);
-      return reply({ ok: true, effect: result.effect, ...(result.detail ? { detail: result.detail } : {}) });
+      if (args.verdict === 'FAIL' && dispatches) await dispatches.revokeExecution(candidate, { nodeIds: result.affectedNodeIds });
+      else await store.saveRun(candidate);
+      Object.assign(located.state, candidate);
+      return reply(result);
     },
   });
 
@@ -224,21 +235,23 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       const located = runFor(context);
       if (located.error) return located.error;
       try {
-        const previous = located.state.artifacts.findings;
+        const candidate = structuredClone(located.state);
+        const previous = candidate.artifacts.findings;
         const version = previous ? previous.version + 1 : 1;
-        if (previous && previous.status === 'valid') previous.status = 'superseded';
-        located.state.artifacts.findings = {
+        publishArtifact(candidate, 'findings', {
           kind: 'findings', nodeId: located.binding.nodeId ?? 'free', version,
           basedOn: [], payload: cleanJson({ summary: args.summary, evidence: args.evidence ?? [], learnings: args.learnings ?? [] }),
           status: 'valid', createdAt: NOW(),
-        };
+        });
         // Bounded multi-version retention: parallel explorers each register a
         // version; the latest slot stays authoritative for existing consumers
         // while recent history survives for aggregation and inspection.
-        const log = located.state.findingsLog ??= [];
+        const log = candidate.findingsLog ??= [];
         log.push({ version, nodeId: located.binding.nodeId ?? 'free', summary: args.summary, evidence: (args.evidence ?? []).slice(0, 8), learnings: args.learnings ?? [] });
         if (log.length > 8) log.splice(0, log.length - 8);
-        await store.saveRun(located.state);
+        assertSettlementCapacity(candidate);
+        await store.saveRun(candidate);
+        Object.assign(located.state, candidate);
         return reply({ ok: true, artifact: `findings@${version}` });
       } catch (error) {
         return rejected('PAYLOAD_INVALID', error.message);
@@ -326,6 +339,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       const state = store.getRun(binding.runId);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
       if (state.status === 'AWAITING_USER_DECISION') return rejected('AWAITING_DECISION', 'the run remains paused; existing children must settle before graph_run_decide');
+      if (repairSettlementPending(state)) return rejected('REPAIR_SETTLEMENT_PENDING', 'revoked repair lifetimes and pending effects must settle before resume; inspect the outstanding dispatches');
       if (state.status !== 'SUCCEEDED' && state.status !== 'FAILED' && state.status !== 'ABORTED') dispatches?.invalidate(state.runId);
       const resume = runner.resumeRun(state, { now: NOW() });
       if (!resume.ok) return rejected(resume.code, resume.detail);
@@ -349,23 +363,40 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
   });
 
   const graph_run_decide = tool({
-    description: 'Orchestrator delivers the user\'s decision for a run paused by exhaustion, an UNVERIFIED verdict, or repeated identical runner rejections (AWAITING_USER_DECISION), or deliberately rotates/terminates a run. action="abort" irreversibly marks the run ABORTED (all findings, plans, reviews, violations and dispatch history preserved; dispatch closed). action="reset" archives the run in place (decision + successorRunId, original status and evidence untouched) and starts a fresh successor run with reset counters that re-walks the explorer → planner → critic gates without replaying any implementer work or side effects. A user-provided reason is required; native permission ask enforces user confirmation.',
+    description: 'Root orchestrator delivers a user-confirmed decision with a required reason; native permission ask applies. abort irreversibly terminates the run, preserving evidence. reset archives it and opens a fresh gated successor. retry requires expectedPauseId from graph_inspect and allows at most ONE same-run verification retry, persisted across restart/replan: only nonbaseline UNVERIFIED or INSUFFICIENT_EVIDENCE/ARTIFACT_REQUIRED/INVALID_VERDICT rejection pauses, with normal attempts left, valid unchanged approval/dependencies and trustworthy equal filesystem snapshots. All host calls and pending effects must settle. Retry preserves original evidence, siblings, counters and rejection streak, clears the active pause, and requires a new ordinary verifier dispatch; it neither grants PASS nor proves an external service healthy. graph_run_resume remains crash recovery.',
     args: {
-      action: z.enum(['reset', 'abort']),
+      action: z.enum(['reset', 'abort', 'retry']),
       reason: z.string().min(1).max(2000),
+      expectedPauseId: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
     },
     async execute(args, context) {
       const wrong = requireRole(context, 'graph-orchestrator');
       if (wrong) return wrong;
+      if (!['reset', 'abort', 'retry'].includes(args.action) || typeof args.reason !== 'string' || !args.reason.trim() || args.reason.length > 2000
+        || args.action !== 'retry' && args.expectedPauseId !== undefined) return rejected('INVALID_DECISION', 'Use abort/reset with a user reason, or retry with a user reason and expectedPauseId');
       const binding = bindings.get(context.sessionID);
       if (!binding?.root) return rejected('NOT_GRAPH_SESSION', 'only the root orchestrator of this run may deliver a user decision');
       const state = store.getRun(binding.runId);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
       if (state.successorRunId) return rejected('RUN_SUPERSEDED', `this run was already reset; its successor ${state.successorRunId} owns the session now`);
+      if (state.dispatchRecoveryIssues !== undefined && (!Array.isArray(state.dispatchRecoveryIssues) || state.dispatchRecoveryIssues.length !== 0)) {
+        return rejected('DISPATCH_RECOVERY_UNRESOLVED', 'unrestorable outstanding lifetimes are preserved; no decision may assume they completed');
+      }
       const running = Object.values(state.nodes).filter((node) => node.state === 'RUNNING');
       if (running.length) return rejected('RUN_BUSY', `nodes are still in flight: ${running.map((node) => node.spec.id).join(', ')}; wait for correlated terminal turn/task evidence (idle or metadata alone is not completion)`);
       const outstanding = dispatches ? dispatches.inspect(state.runId) : [];
-      if (outstanding.length) return rejected('DISPATCH_PENDING', 'task dispatches are still registered for this run; wait for their sessions to finish first');
+      if (outstanding.length || state.dispatchReservations !== undefined && (!Array.isArray(state.dispatchReservations) || state.dispatchReservations.length !== 0)) return rejected('DISPATCH_PENDING', 'task dispatches are still registered for this run; wait for their sessions to finish first');
+
+      if (args.action === 'retry') {
+        if (context.sessionID !== state.rootSessionId || binding.agent !== context.agent) return rejected('NOT_GRAPH_SESSION', 'retry requires the owning root orchestrator');
+        const observedSnapshot = await store.hashFiles(Object.keys(state.pendingDecision?.proof?.expectedSnapshot ?? {}));
+        const checked = runner.prepareRetry(state, { ...args, observedSnapshot, now: NOW() });
+        if (!checked.ok) return reply(checked);
+        await store.saveRun(checked.candidate);
+        Object.assign(state, checked.candidate);
+        return reply({ ok: true, action: 'retry', runId: state.runId, status: state.status, nodeId: checked.nodeId,
+          next: 'dispatch the original verifier using task_id or a fresh session; normal attempts and PASS evidence gates still apply' });
+      }
 
       if (args.action === 'abort') {
         if (state.status === 'SUCCEEDED') return rejected('RUN_NOT_ABORTABLE', 'a succeeded run has nothing to abort');

@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { resolveNodeIdHint, TARGET_REQUIRED_AGENTS } from './dispatch-target.mjs';
 import { cleanJson } from './json-safe.mjs';
 import { assertSettlementCapacity } from './runner.mjs';
+import { sanitizeRun } from './run-state.mjs';
 
 const NOW = () => new Date().toISOString();
 const key = (root, call) => JSON.stringify([root, call]);
@@ -15,6 +16,88 @@ const CONTINUABLE_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-pla
 // Read-only consultation roles whose free (unbound) dispatches share one
 // capacity budget with node-bound explore/analyze work.
 const READ_CONSULT_AGENTS = new Set(['graph-explorer', 'graph-multimodal']);
+const DISPATCH_AGENTS = new Set([...CONTINUABLE_ROLES, 'graph-implementer', 'graph-verifier']);
+const identityString = (value) => typeof value === 'string' && value.length > 0 && value.length <= 256 && value.trim() === value;
+// These two identifiers are minted only by randomUUID here, not by the host.
+const generationId = (value) => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value);
+const hasRecoveryIssues = (state) => state?.dispatchRecoveryIssues !== undefined
+  && (!Array.isArray(state.dispatchRecoveryIssues) || state.dispatchRecoveryIssues.length !== 0);
+
+// Recovery is a partition, never a filter: every persisted outstanding entry
+// becomes either an authenticated native record or an opaque durable issue.
+// Issues retain the exact source JSON but are NEVER indexed as native calls.
+function partitionReservations(state) {
+  const issues = state.dispatchRecoveryIssues === undefined ? [] : Array.isArray(state.dispatchRecoveryIssues)
+    ? structuredClone(state.dispatchRecoveryIssues) : [{ code: 'INVALID_RECOVERY_ISSUES', reservation: structuredClone(state.dispatchRecoveryIssues) }];
+  const source = state.dispatchReservations === undefined ? [] : Array.isArray(state.dispatchReservations)
+    ? state.dispatchReservations : [state.dispatchReservations];
+  const admission = new Set(Array.isArray(state.dispatchCallIds) ? state.dispatchCallIds : []);
+  const problem = (r, historical = false) => {
+    if (!r || typeof r !== 'object' || Array.isArray(r)) return 'INVALID_RESERVATION';
+    if (r.runId !== state.runId || r.rootSessionId !== state.rootSessionId
+      || !generationId(r.dispatchId) || !identityString(r.callID) || !generationId(r.turnToken)
+      || !DISPATCH_AGENTS.has(r.agent) || !(r.nodeId === null || typeof r.nodeId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(r.nodeId))
+      || !(r.sessionId === null || identityString(r.sessionId)) || !Number.isSafeInteger(r.planVersion) || r.planVersion < 0
+      || ['bound', 'continuation', 'acknowledged', 'idleSeen', 'terminal'].some((field) => typeof r[field] !== 'boolean')
+      || ['started', 'resumed', 'background', 'settlementOnly', 'repairRevoked', 'recovery'].some((field) => r[field] !== undefined && typeof r[field] !== 'boolean')
+      || (r.bound || r.started || r.continuation) && !identityString(r.sessionId)
+      || r.nodeId === null && !CONTINUABLE_ROLES.has(r.agent)) return 'INVALID_RESERVATION_IDENTITY';
+    if (r.recoveryBlocked) return 'UNRESOLVED_RESERVATION';
+    if (!admission.has(key(r.rootSessionId, r.callID))) return 'MISSING_ADMISSION_PROOF';
+    if (!historical) {
+      const version = state.artifacts.plan?.version ?? 0;
+      const owner = Object.values(state.nodes).find((node) => node.dispatchId === r.dispatchId && node.sessionId === r.sessionId);
+      if (r.planVersion > version || !r.settlementOnly && r.planVersion !== version
+        || owner && (owner.spec.id !== r.nodeId || owner.spec.agent !== r.agent)) return 'CONFLICTING_NODE_GENERATION';
+    }
+    return null;
+  };
+  const problems = source.map((r) => problem(r));
+  const groups = (field) => {
+    const map = new Map();
+    source.forEach((r, i) => {
+      const value = r && typeof r === 'object' ? field(r) : null;
+      if (value === null) return;
+      const entries = map.get(value) ?? [];
+      entries.push(i); map.set(value, entries);
+    });
+    return map;
+  };
+  const callKey = (r) => identityString(r.rootSessionId) && identityString(r.callID) ? key(r.rootSessionId, r.callID) : null;
+  const conflict = (indices) => { for (const index of indices) problems[index] = 'CONFLICTING_RESERVATION_IDENTITY'; };
+  for (const indices of groups(callKey).values()) if (indices.length > 1) conflict(indices);
+  for (const indices of groups((r) => identityString(r.turnToken) ? r.turnToken : null).values()) if (indices.length > 1) conflict(indices);
+  for (const indices of groups((r) => identityString(r.dispatchId) ? r.dispatchId : null).values()) {
+    const identities = new Set(indices.map((i) => {
+      const r = source[i];
+      return JSON.stringify([r.runId, r.rootSessionId, r.agent, r.nodeId, r.sessionId, r.planVersion]);
+    }));
+    if (identities.size > 1) conflict(indices);
+  }
+  const settled = Array.isArray(state.settledDispatches) ? state.settledDispatches : [];
+  const settledCalls = new Set(settled.filter((r) => r && typeof r === 'object').map(callKey).filter(Boolean));
+  const settledDispatches = new Set(settled.filter((r) => r?.runId === state.runId && identityString(r.dispatchId)).map((r) => r.dispatchId));
+  const restored = [];
+  source.forEach((r, i) => {
+    if (r && (settledCalls.has(callKey(r)) || settledDispatches.has(r.dispatchId))) problems[i] = 'CONFLICT_WITH_SETTLED_IDENTITY';
+    const code = problems[i] ?? (restored.length >= 128 ? 'RECOVERY_RESERVATION_CAPACITY' : null);
+    if (code) issues.push({ code, reservation: structuredClone(r) });
+    else restored.push({ ...r, ...(state.status !== 'AWAITING_USER_DECISION' ? { settlementOnly: true } : {}) });
+  });
+  return { restored, issues, settled: settled.filter((r) => !problem(r, true)) };
+}
+
+// Shared by ordinary persistence and staged recovery. Receipt ownership is
+// projected from the candidate ledger, never from a partially rebuilt registry.
+function projectIdleEvidence(runId, reservations, evidence) {
+  const live = new Set(reservations.map((r) => key(r.callID, r.dispatchId)));
+  let remaining = 256;
+  return evidence.filter((entry) => entry.runId === runId).slice(-128).reverse().map((entry) => {
+    const owners = entry.owners.filter((owner) => live.has(key(owner.callID, owner.dispatchId))).slice(0, remaining);
+    remaining -= owners.length;
+    return { ...entry, owners };
+  }).filter((entry) => entry.owners.length).reverse();
+}
 // Pinned native v1.18.25 compaction.ts creates this text with its internal
 // compaction_continue marker. Text alone is never a lineage witness.
 const COMPACTION_CONTINUE = 'Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.';
@@ -27,21 +110,28 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
   const idleEvidence = new Map();
   const seenIdleEvents = new Map();
 
+  function publishIdleHistory(runId, idleEventIds, pendingIdleEvidence) {
+    seenIdleEvents.set(runId, new Set(idleEventIds));
+    for (const [session, entries] of idleEvidence) {
+      const retained = entries.filter((entry) => entry.runId !== runId);
+      if (retained.length) idleEvidence.set(session, retained);
+      else idleEvidence.delete(session);
+    }
+    for (const entry of pendingIdleEvidence) {
+      const entries = idleEvidence.get(entry.sessionId) ?? [];
+      entries.push(entry);
+      idleEvidence.set(entry.sessionId, entries);
+    }
+  }
+
   // Persist host lifetimes as well as node state. A delivered node and a free
   // consultation may still have an active host child when a sibling pauses.
   async function persist(state, omit = () => false, extra = {}, reserve = false) {
     const dispatchReservations = (extra.dispatchReservations ?? [...records.values()].filter((r) => r.runId === state.runId && !omit(r))).map((r) => ({ ...r }));
     const idleEventIds = [...(seenIdleEvents.get(state.runId) ?? new Set(state.idleEventIds ?? []))].slice(-256);
-    const live = new Set(dispatchReservations.map((r) => key(r.callID, r.dispatchId)));
     // Receipts are hints, not completion authority. Bound total ownership refs
     // (not just each array), and discard references as reservations retire.
-    let remaining = 256;
-    const pendingIdleEvidence = (extra.pendingIdleEvidence ?? [...idleEvidence.values()].flat())
-      .filter((entry) => entry.runId === state.runId).slice(-128).reverse().map((entry) => {
-        const owners = entry.owners.filter((owner) => live.has(key(owner.callID, owner.dispatchId))).slice(0, remaining);
-        remaining -= owners.length;
-        return { ...entry, owners };
-      }).filter((entry) => entry.owners.length).reverse();
+    const pendingIdleEvidence = projectIdleEvidence(state.runId, dispatchReservations, extra.pendingIdleEvidence ?? [...idleEvidence.values()].flat());
     const saved = { ...state, ...extra, dispatchReservations, idleEventIds, pendingIdleEvidence };
     if (reserve) assertSettlementCapacity(saved);
     cleanJson(saved, { maxBytes: 1_048_576, maxValues: 20_000, maxDepth: 32 });
@@ -51,13 +141,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     state.pendingIdleEvidence = saved.pendingIdleEvidence;
     state.updatedAt = saved.updatedAt;
     Object.assign(state, extra, { pendingIdleEvidence });
-    seenIdleEvents.set(state.runId, new Set(idleEventIds));
-    for (const [session, entries] of idleEvidence) if (entries.some((entry) => entry.runId === state.runId)) idleEvidence.delete(session);
-    for (const entry of pendingIdleEvidence) {
-      const entries = idleEvidence.get(entry.sessionId) ?? [];
-      entries.push(entry);
-      idleEvidence.set(entry.sessionId, entries);
-    }
+    publishIdleHistory(state.runId, idleEventIds, pendingIdleEvidence);
   }
 
   function exclusive(runId, operation) {
@@ -78,7 +162,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     const candidates = binding.active === false ? state.settledDispatches ?? [] : [...records.values()];
     const record = candidates.find((r) => r.bound && r.runId === binding.runId && r.agent === binding.agent
       && r.sessionId === binding.sessionId && r.dispatchId === binding.dispatchId && r.nodeId === binding.nodeId);
-    if (!record) return false;
+    if (!record || record.recoveryBlocked) return false;
     if (binding.settlementOnly) return record.settlementOnly === true;
     if (!binding.nodeId) return true;
     const node = state.nodes[binding.nodeId];
@@ -104,6 +188,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     return exclusive(root.runId, async () => {
       const state = store.getRun(root.runId);
       if (!state) return denied('RUN_GONE', 'owning run is unavailable');
+      if (hasRecoveryIssues(state)) return denied('DISPATCH_RECOVERY_UNRESOLVED', 'unrestorable outstanding lifetimes remain; inspection preserves their original evidence');
       const recordKey = key(rootSessionId, callID);
       const turnToken = randomUUID();
       const used = state.dispatchCallIds ?? [];
@@ -121,6 +206,12 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       if (typeof callID !== 'string' || !callID.length || callID.length > 256 || used.includes(recordKey)) return denied('DUPLICATE_DISPATCH', 'a unique host callID is required, including after recovery');
       if (used.length >= 900) return denied('DISPATCH_LIMIT', 'run dispatch history reached its persistence-safe limit');
       if ([...records.values()].filter((r) => r.runId === root.runId).length >= 128) return denied('DISPATCH_LIMIT', 'too many outstanding task calls');
+      // Selective repair revokes authority without ending host lifetimes. Both
+      // fresh dispatch and task_id replacement wait for old calls AND effects.
+      if (target && ([...records.values()].some((r) => r.runId === root.runId && r.nodeId === target && r.repairRevoked)
+        || (state.pendingEffects ?? []).some((effect) => effect.nodeId === target && effect.repairRevoked))) {
+        return denied('REPAIR_SETTLEMENT_PENDING', `${target} has revoked host lifetimes or pending effects; wait for exact terminal/effect settlement before replacement`);
+      }
       // A free-role continuation keeps the session identity: round-1
       // planners, explorers and multimodal sessions are free-bound (no node
       // identity to resume), but their conversation can still pick up the
@@ -240,7 +331,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
   }
 
   async function bind(record) {
-    if (record.bound || !record.sessionId || !parents.has(record.sessionId)) return;
+    if (record.recoveryBlocked || record.bound || !record.sessionId || !parents.has(record.sessionId)) return;
     if (!record.acknowledged && !record.started) return;
     const state = store.getRun(record.runId);
     // A stale INACTIVE binding (its dispatch finished or was rejected) must
@@ -330,6 +421,9 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     await refreshTurns(sessionId, lifetimes[0].rootSessionId, observed);
     for (const dispatchId of new Set(lifetimes.map((r) => r.dispatchId))) {
       const calls = lifetimes.filter((r) => r.dispatchId === dispatchId);
+      // Neither cached terminal flags nor sibling calls can retire a lifetime
+      // whose original admission identity could not be authenticated.
+      if (calls.some((r) => r.recoveryBlocked)) continue;
       // A failed begin/binding save must still reconcile through bind first.
       if (calls.some((r) => !r.bound && !r.settlementOnly)) continue;
       // Metadata is published before start/extend, and idle occurs before and
@@ -613,7 +707,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
 
   // Also used by serialized restart reconciliation; never nests the run queue.
   async function applyPart(part, recordKey, record) {
-    if (records.get(recordKey) !== record) return; // revoked while waiting
+    if (records.get(recordKey) !== record || record.recoveryBlocked) return; // revoked or insufficient lifetime proof
     const meta = part.state?.metadata;
     // The host call key is authoritative. Optional metadata may strengthen
     // it, but contradictory identity must never retire that call's owner.
@@ -680,14 +774,19 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     });
   }
 
-  // Accepted plan replacement revokes execution, not native host lifetimes.
+  // Plan publication revokes all execution; repair selects only affected nodes.
+  // Neither transition ends native host lifetimes.
   // Save the candidate graph and revoked ledger before changing live authority.
-  async function revokeExecution(state) {
-    const dispatchReservations = [...records.values()].filter((r) => r.runId === state.runId).map((r) => ({ ...r, settlementOnly: true }));
+  async function revokeExecution(state, { nodeIds = null } = {}) {
+    const selected = nodeIds === null ? null : new Set(nodeIds);
+    const affected = (r) => r.runId === state.runId && (selected === null || selected.has(r.nodeId));
+    const revoked = (r) => affected(r) ? { ...r, settlementOnly: true, ...(selected ? { repairRevoked: true } : {}) } : { ...r };
+    const dispatchReservations = [...records.values()].filter((r) => r.runId === state.runId).map(revoked);
     await persist(state, undefined, { dispatchReservations,
-      settledDispatches: (state.settledDispatches ?? []).map((r) => ({ ...r, settlementOnly: true })) });
-    for (const record of records.values()) if (record.runId === state.runId) record.settlementOnly = true;
-    for (const binding of bindings.values()) if (!binding.root && binding.runId === state.runId) binding.settlementOnly = true;
+      ...(selected ? { pendingEffects: (state.pendingEffects ?? []).map((effect) => selected.has(effect.nodeId) ? { ...effect, repairRevoked: true } : effect) } : {}),
+      settledDispatches: (state.settledDispatches ?? []).map(revoked) }, selected !== null);
+    for (const record of records.values()) if (affected(record)) Object.assign(record, revoked(record));
+    for (const binding of bindings.values()) if (!binding.root && affected(binding)) Object.assign(binding, revoked(binding));
   }
 
   function invalidate(runId) {
@@ -757,11 +856,21 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
   }
 
   function inspect(runId) {
-    return [...records.values()].filter((r) => r.runId === runId).map((r) => ({
+    const state = store.getRun(runId);
+    const issues = Array.isArray(state?.dispatchRecoveryIssues) ? state.dispatchRecoveryIssues
+      : hasRecoveryIssues(state) ? [{ code: 'INVALID_RECOVERY_ISSUES' }] : [];
+    return [...[...records.values()].filter((r) => r.runId === runId).map((r) => ({
       callID: r.callID, nodeId: r.nodeId, agent: r.agent, sessionId: r.sessionId, bound: r.bound, continuation: r.continuation,
       resumed: r.resumed === true, targeted: r.targeted === true,
+      ...(r.repairRevoked ? { repairRevoked: true } : {}),
+      ...(r.settlementOnly ? { settlementOnly: true } : {}),
+      ...(r.recoveryBlocked ? { recoveryBlocked: r.recoveryBlocked } : {}),
       errorCode: r.errorCode ?? null,
-    }));
+    })), ...issues.map((issue, issueIndex) => ({ issueIndex, bound: false, settlementOnly: true,
+      recoveryBlocked: issue?.code ?? 'INVALID_RECOVERY_ISSUE',
+      callID: identityString(issue?.reservation?.callID) ? issue.reservation.callID : null,
+      nodeId: typeof issue?.reservation?.nodeId === 'string' ? issue.reservation.nodeId : null,
+      errorCode: 'DISPATCH_RECOVERY_UNRESOLVED' }))];
   }
 
   // Called only while rebinding a root after restart. Paused ownership and
@@ -769,27 +878,34 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
   // must also survive a restart BEFORE the replacement graph reaches a pause.
   async function recoverPaused(state) {
     const paused = state.status === 'AWAITING_USER_DECISION';
-    if (!paused && !state.dispatchReservations?.some((r) => r.settlementOnly)) return;
-    seenIdleEvents.set(state.runId, new Set((state.idleEventIds ?? []).slice(-256)));
+    if (!paused && !hasRecoveryIssues(state) && !state.dispatchReservations?.some((r) => r?.settlementOnly)) return;
+    const idleEventIds = [...new Set((state.idleEventIds ?? []).slice(-256))];
+    const recoveryRecords = new Map();
+    const recoveryBindings = new Map();
+    const recoveryParents = new Map();
+    const recoveryIdle = new Map([...idleEvidence].map(([session, entries]) => [session,
+      entries.filter((entry) => entry.runId === state.runId)]).filter(([, entries]) => entries.length));
+    const parentFor = (session) => recoveryParents.get(session) ?? parents.get(session);
     // A single lifetime ledger is persisted for the run. Restoring revoked
     // calls must not discard newer active consultations from that same ledger.
     // Outside a pause, crash recovery restores only settlement capability;
     // explicit resume still owns ordinary attempt refund/reconciliation.
-    const restored = (state.dispatchReservations ?? []).slice(0, 128).map((r) => paused ? r : { ...r, settlementOnly: true });
+    const { restored, issues, settled } = partitionReservations(state);
     for (const node of Object.values(state.nodes)) {
       if (!paused || node.state !== 'RUNNING' || !node.sessionId || !node.dispatchId
-        || restored.some((r) => r.dispatchId === node.dispatchId)) continue;
+        || restored.some((r) => r.dispatchId === node.dispatchId)
+        || issues.some((issue) => issue?.reservation?.nodeId === node.spec.id && issue.reservation.sessionId === node.sessionId)) continue;
       // Compatibility with pre-lifetime-ledger runs: a persisted node identity
       // is sufficient to restore a blocker, not to infer an idle event's lifetime
       // or re-dispatch. Without the original per-call correlation token a legacy
       // identity cannot be discharged just because native status says idle.
-      restored.push({ runId: state.runId, rootSessionId: state.rootSessionId, callID: `recovery:${node.dispatchId}`,
+      issues.push({ code: 'LEGACY_LIFETIME_WITHOUT_ADMISSION', reservation: { runId: state.runId, rootSessionId: state.rootSessionId, callID: `recovery:${node.dispatchId}`,
         nodeId: node.spec.id, agent: node.spec.agent, sessionId: node.sessionId, dispatchId: node.dispatchId,
         bound: true, started: true, acknowledged: true, terminal: false, idleSeen: false,
-        planVersion: state.artifacts.plan?.version ?? 0, recovery: true });
+        planVersion: state.artifacts.plan?.version ?? 0, recovery: true } });
     }
-    const settled = (state.settledDispatches ?? []).slice(-128);
-    const callOrder = new Map((state.dispatchCallIds ?? []).map((id, index) => [id, index]));
+    const recoveryFields = issues.length || state.dispatchRecoveryIssues !== undefined ? { dispatchRecoveryIssues: issues } : {};
+    const callOrder = new Map((Array.isArray(state.dispatchCallIds) ? state.dispatchCallIds : []).map((id, index) => [id, index]));
     const dispatchOrder = new Map();
     for (const record of [...restored, ...settled]) {
       if (record.runId !== state.runId || record.rootSessionId !== state.rootSessionId) continue;
@@ -801,12 +917,13 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       return !!node && node.sessionId === identity.sessionId && node.dispatchId === identity.dispatchId;
     };
     function restoreBinding(record, active) {
+      if (record.recoveryBlocked) return;
       const order = dispatchOrder.get(record.dispatchId) ?? -1;
       // Free sessions have no node identity fallback for missing admission proof.
       if (!record.nodeId && order < 0) return;
-      const existing = bindings.get(record.sessionId);
+      const existing = recoveryBindings.get(record.sessionId) ?? bindings.get(record.sessionId);
       if (existing) {
-        if (existing.root) return;
+        if (existing.root || existing.runId !== state.runId) return;
         const exact = exactOwner(record);
         const existingExact = exactOwner(existing);
         if (existingExact && !exact) return;
@@ -814,18 +931,17 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
         // the latest free binding. Continuations share one dispatch identity.
         if (exact === existingExact && order <= (dispatchOrder.get(existing.dispatchId) ?? -1)) return;
       }
-      bindings.set(record.sessionId, { runId: record.runId, root: false, agent: record.agent, nodeId: record.nodeId,
+      recoveryBindings.set(record.sessionId, { runId: record.runId, root: false, agent: record.agent, nodeId: record.nodeId,
         sessionId: record.sessionId, dispatchId: record.dispatchId, active, ...(!active ? { settled: true } : {}), settlementOnly: record.settlementOnly === true });
     }
     for (const record of restored) {
-      if (record.runId !== state.runId || record.rootSessionId !== state.rootSessionId || typeof record.dispatchId !== 'string') continue;
       const recordKey = key(record.rootSessionId, record.callID);
-      if (!record.recovery && !(state.dispatchCallIds ?? []).includes(recordKey)) continue;
-      records.set(recordKey, { ...record });
+      recoveryRecords.set(recordKey, { ...record });
       if (record.sessionId && (record.bound || record.started)) {
-        parents.set(record.sessionId, record.rootSessionId);
+        if (parentFor(record.sessionId) !== undefined && parentFor(record.sessionId) !== state.rootSessionId) continue;
+        recoveryParents.set(record.sessionId, record.rootSessionId);
         restoreBinding(record, true);
-        records.get(recordKey).bound = true;
+        recoveryRecords.get(recordKey).bound = true;
       }
     }
     for (const record of settled) {
@@ -836,16 +952,44 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       if (evidence.runId !== state.runId || evidence.rootSessionId !== state.rootSessionId
         || typeof evidence.sessionId !== 'string' || !Array.isArray(evidence.owners)) continue;
       const owners = evidence.owners.slice(0, 128).filter((owner) => {
-        const record = records.get(key(state.rootSessionId, owner.callID));
+        const record = recoveryRecords.get(key(state.rootSessionId, owner.callID));
         return record?.dispatchId === owner.dispatchId && (!record.sessionId || record.sessionId === evidence.sessionId);
       });
-      if (!owners.length || parents.has(evidence.sessionId) && parents.get(evidence.sessionId) !== state.rootSessionId) continue;
-      parents.set(evidence.sessionId, state.rootSessionId);
-      const pending = idleEvidence.get(evidence.sessionId) ?? [];
+      if (!owners.length || parentFor(evidence.sessionId) !== undefined && parentFor(evidence.sessionId) !== state.rootSessionId) continue;
+      recoveryParents.set(evidence.sessionId, state.rootSessionId);
+      const pending = recoveryIdle.get(evidence.sessionId) ?? [];
       if (!pending.some((entry) => entry.identity === evidence.identity)) pending.push({ ...evidence, owners });
-      idleEvidence.set(evidence.sessionId, pending);
+      recoveryIdle.set(evidence.sessionId, pending);
     }
-    await persist(state);
+
+    // Save the COMPLETE scoped projection before publishing any private state.
+    // Calling persist here would derive the ledger from the live registry and
+    // require destructive pre-save mutation; an EIO followed by another event
+    // could then serialize that partial registry and erase unproven work.
+    const dispatchReservations = [...recoveryRecords.values()];
+    const pendingIdleEvidence = projectIdleEvidence(state.runId, dispatchReservations, [...recoveryIdle.values()].flat());
+    const candidate = structuredClone({ ...state, ...recoveryFields, dispatchReservations, idleEventIds, pendingIdleEvidence });
+    sanitizeRun(candidate); // No truncation to fit recovery/issues into the run.
+    await store.saveRun(candidate);
+
+    // No await between durable save and publication. Merge only this run's
+    // records and staged keys: other runs may have changed while save awaited.
+    Object.assign(state, {
+      dispatchReservations: candidate.dispatchReservations, idleEventIds: candidate.idleEventIds,
+      pendingIdleEvidence: candidate.pendingIdleEvidence, updatedAt: candidate.updatedAt,
+      ...(Object.hasOwn(recoveryFields, 'dispatchRecoveryIssues') ? { dispatchRecoveryIssues: candidate.dispatchRecoveryIssues } : {}),
+    });
+    for (const [id, record] of records) if (record.runId === state.runId) records.delete(id);
+    for (const [id, record] of recoveryRecords) records.set(id, record);
+    for (const [session, binding] of recoveryBindings) {
+      const existing = bindings.get(session);
+      if (!existing || !existing.root && existing.runId === state.runId) bindings.set(session, binding);
+    }
+    for (const [session, parent] of recoveryParents) {
+      if (!parents.has(session) || parents.get(session) === parent) parents.set(session, parent);
+    }
+    publishIdleHistory(state.runId, candidate.idleEventIds, candidate.pendingIdleEvidence);
+
     for (const sessionId of idleEvidence.keys()) {
       if (bindings.get(sessionId)?.runId === state.runId) await consumeIdle(sessionId);
     }
