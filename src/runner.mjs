@@ -452,7 +452,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       || (state.pendingEffects ?? []).some((effect) => effect.nodeId === chosen.spec.id), ...(revisionContext(state, chosen) ?? {}) };
   }
 
-  function admitDispatch(state, { agent, now, nodeId = null, excludeNodeIds = null }) {
+  function admitDispatch(state, { agent, now, nodeId = null, excludeNodeIds = null, consultOnly = false }) {
     if (TERMINAL_RUN.has(state.status)) {
       return { allowed: false, code: 'RUN_TERMINATED', detail: state.failReason ? `run failed: ${state.failReason}` : 'run already finished' };
     }
@@ -473,6 +473,12 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       return { allowed: false, code: 'INVALID_AGENT', detail: `${agent} is not a dispatchable graph specialist` };
     }
 
+    if (consultOnly) {
+      if (state.status !== 'RUNNING' || agent !== 'graph-multimodal' || nodeId !== null) {
+        return { allowed: false, code: 'INVALID_CONSULT', detail: 'consultOnly requires a RUNNING run, graph-multimodal and no node target' };
+      }
+      return { allowed: true, nodeId: null, free: true };
+    }
     const mine = Object.values(state.nodes).filter((node) => node.spec.agent === agent);
     // Implementers run under a bounded-capacity writer gate: several write
     // nodes with pairwise-disjoint writeScopes may be RUNNING at once, up to

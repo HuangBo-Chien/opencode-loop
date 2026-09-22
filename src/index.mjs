@@ -51,8 +51,10 @@ export default async function GraphPlugin(context, options = {}) {
   const runner = createRunner({ maxAttempts: settings.maxAttempts, maxPlanRevisions: settings.maxPlanRevisions, implementerParallel: settings.maxImplementerParallel, readerParallel: settings.maxParallel });
   const bindings = new Map();
   let toolPermissions = null;
+  let hostConfig = null;
   const getToolPermissions = () => toolPermissions;
-  const enforcement = createEnforcement({ settings: { worktree, journal: settings.journal, lessons: settings.lessons }, store, runner, bindings, client: context.client, lessons: lessonService, getToolPermissions });
+  const getSubagentDepth = () => hostConfig?.subagent_depth ?? 1;
+  const enforcement = createEnforcement({ settings: { worktree, journal: settings.journal, lessons: settings.lessons }, store, runner, bindings, client: context.client, lessons: lessonService, getToolPermissions, getSubagentDepth });
   const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches });
   const journalTools = createJournalTools({
     journalService,
@@ -70,7 +72,13 @@ export default async function GraphPlugin(context, options = {}) {
   });
 
   return {
-    async config(config) { toolPermissions = registerAgents(config, settings); },
+    async config(config) {
+      toolPermissions = registerAgents(config, settings);
+      // Native Config.subagent_depth is a top-level nonnegative integer.
+      // TaskTool checks it before publishing any child lifetime metadata.
+      if (config.subagent_depth === undefined) config.subagent_depth = 2;
+      hostConfig = config;
+    },
     tool: { graph_status: createStatusTool(settings, journalService, lessonService, getToolPermissions), ...tools, ...journalTools, ...lessonTools },
     'chat.message': enforcement.onChatMessage,
     'tool.execute.before': enforcement.onToolBefore,

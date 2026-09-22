@@ -57,6 +57,31 @@ test('disabled plugin is inert and does not access host context', async () => {
   assert.deepEqual(await plugin(context, { enabled: false }), {});
 });
 
+for (const explicit of [undefined, 0, 1, 2, 4]) test(`native subagent depth default/preservation and admission (${explicit})`, async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'loop-depth-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const { default: plugin } = await load();
+  const hooks = await plugin({ worktree: dir });
+  const config = explicit === undefined ? {} : { subagent_depth: explicit };
+  await hooks.config(config);
+  assert.equal(config.subagent_depth, explicit ?? 2);
+  await hooks['chat.message']({ sessionID: 'root', agent: 'graph-orchestrator' }, { parts: [] });
+  const args = { subagent_type: 'graph-explorer', prompt: 'Explore' };
+  await hooks['tool.execute.before']({ tool: 'task', sessionID: 'root', callID: 'owner' }, { args });
+  if (explicit !== 0) {
+    await hooks.event({ event: { type: 'session.created', properties: { info: { id: 'caller', parentID: 'root' } } } });
+    await hooks.event({ event: { type: 'message.part.updated', properties: { part: {
+      type: 'tool', tool: 'task', sessionID: 'root', callID: 'owner', state: { status: 'running', input: args, metadata: { sessionId: 'caller', parentSessionId: 'root' } },
+    } } } });
+    const call = () => hooks['tool.execute.before']({ tool: 'task', sessionID: 'caller', callID: 'nested' }, { args: { subagent_type: 'graph-multimodal', prompt: 'Read PNG' } });
+    if (explicit === 1) await assert.rejects(call(), /SUBAGENT_DEPTH_LIMIT/);
+    else await call();
+  }
+  const state = JSON.parse(await readFile(join(dir, '.opencode-loop/runs/root.json'), 'utf8'));
+  assert.equal(state.dispatchReservations?.length ?? 0, explicit === 0 ? 0 : explicit === 1 ? 1 : 2);
+  assert.equal(state.dispatchCallIds?.length ?? 0, explicit === 0 ? 0 : explicit === 1 ? 1 : 2);
+});
+
 test('registers exactly seven runner-gated agents, preserving native definitions and default', async () => {
   const { default: plugin } = await load();
   const hooks = await plugin({});

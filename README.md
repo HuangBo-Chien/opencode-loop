@@ -14,9 +14,64 @@ The model proposes; the runner decides. Every hook decision is persisted to a ru
 | `testsPassed`-style claims are not trusted | Verdicts travel only through `graph_submit_*` tools; `PASS` requires at least one cited command with `exitCode 0` (plus at least one existing `artifacts` evidence path when any verified implement node declared `deliverables` — missing files are rejected as `ARTIFACT_MISSING`); nonzero commands are tolerated only when they match a still-valid `baseline` entry (same command and exit code), and change submissions are cross-checked against the runner's own edit ledger (undisclosed files fail the node) |
 | Reviews and verifications bind to versions | A review targets `plan@v`; a resubmitted plan supersedes the old PASS. Verifications bind change versions plus file-hash snapshots; on resume, drifted hashes mark stale evidence and its node `STALE` |
 | Crashes never blindly redo side effects | A restart moves in-flight nodes to `RECOVERY_REQUIRED` and **refunds the attempt a crash interrupted** (the reconcile re-dispatch charges a fresh one, so a crash costs no budget); `graph_run_resume` revokes old dispatch bindings and reservations, classifies nodes, and the interrupted session can be picked back up by `task_id` (host metadata re-verifies parentage) — otherwise re-dispatch injects the recorded side-effect ledger so the implementer reconciles reality first |
-| Child sessions cannot consume another task's queue entry | Reservations are keyed by root session and native task `callID`; host task metadata supplies `sessionId`, checked against child parentage. Attempts start only after binding. Session creation order is not used |
+| Child sessions cannot consume another task's queue entry | Reservations are keyed by actual caller session and native task `callID`; host task metadata supplies `sessionId`, checked against child parentage. Attempts start only after binding. Session creation order is not used |
 
 Explorer, planner and multimodal dispatch without a node binding on healthy runs (the critic still requires an admissible review node); explorer and multimodal dispatches run in parallel under a bounded reader capacity (`maxParallel`), and enforcement concentrates on the write path and the verdict gates.
+
+### Specialist image consultations
+
+During an active authenticated dispatch, **explorer, planner, plan-critic,
+implementer and verifier** may use native `task` to consult **graph-multimodal
+only**. Supply the image path/source and a concrete interpretation question;
+omit `nodeId` and node markers. Multimodal cannot delegate further.
+
+The plugin defaults the host's top-level `subagent_depth` to **2 only when
+unspecified**. This is a host-wide nesting limit, not a plugin option or an extra
+task permission grant. Explicit settings are preserved: `1` disables specialist
+nesting and `0` disables all task dispatch. Admission reports
+`SUBAGENT_DEPTH_LIMIT` before reserving a lifetime when the configured depth is
+insufficient. Change host configuration and restart OpenCode to enable nesting;
+arbitrary native task errors still retain their unresolved lifetimes.
+
+Nested consultations are always free consultations: they never select a ready
+`analyze` node, charge an attempt or publish a findings artifact. The runner
+injects `[RUNNER NESTED_CONSULT]` delivery instructions. The analyst returns
+observations, sources, uncertainty and limitations in its native task response;
+the caller uses that evidence in its own formal submission. Nested
+`graph_submit_findings` is rejected even during paused closeout. Root-dispatched
+multimodal work retains its ordinary findings contract.
+
+There is a **fixed run-wide nested capacity of one**, separate from `maxParallel`:
+an explorer using the last ordinary reader slot can still ask for image help.
+Outstanding or revoked host lifetimes retain that slot until authenticated
+completion. On `NESTED_CONSULT_CAPACITY`, do not spin or wait on yourself; proceed
+with available evidence or report the limitation. Nested admission denials are
+hard tool errors attributed to the caller's node.
+
+`task_id` can reuse only a settled nested free consultation from the **same run,
+caller session and caller dispatch generation**. Root/nested, cross-caller and
+node-bound reuse reject before reserving anything. `graph_inspect` exposes
+`nested`, `callerSessionId` and `callerDispatchId`. Durable lineage and actual
+caller metadata are used across restart; parent completion/revocation removes
+descendant execution authority without discarding its lifetime. Resume retains
+outstanding nested lifetimes and their owner witnesses. Legacy reservations
+without caller provenance continue to mean root dispatches.
+
+If a root free-role continuation has lost its binding, it must prove native
+parentage and ownership in the current run **before reservation**. A retained
+authenticated dispatch record, or bounded native task metadata matching the
+current run's admission ledger, supplies ownership. Missing lookup/history
+evidence rejects with `TASK_CALLER_MISMATCH`; use a fresh session. Sharing a root
+session with a successor run is not proof of ownership in that successor.
+
+Selective repair fences also follow a revoked nested consultation's
+`callerDispatchId` to its retained parent record. Finishing the parent's host
+call does not permit replacement of the affected node until the descendant
+settles. Dispatcher admission, runner admission and `beginNode` use the same
+fence; unrelated siblings keep their independent repair status.
+
+Native host acceptance is separate from unit tests. See the reproducible
+[nested consultation host probe](docs/nested-multimodal-host-probe.md).
 
 ## Structured handoff
 
