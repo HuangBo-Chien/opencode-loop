@@ -53,7 +53,7 @@ test('validateTaskSpec accepts a minimal spec and normalizes nothing silently', 
     [{ agent: 'build' }, /agent/], [{ kind: 'deploy' }, /kind/], [{ agent: 'graph-planner' }, /cannot be assigned/],
     [{ dependsOn: ['explore-1'] }, /dependsOn entry/], [{ dependsOn: 'explore-1' }, /dependsOn/],
     [{ inputs: ['findings@x'] }, /artifact/], [{ outputs: ['a@1'] }, /artifact name/],
-    [{ acceptance: [''] }, /nonempty/], [{ maxAttempts: 0 }, /maxAttempts/], [{ maxAttempts: 99 }, /maxAttempts/],
+    [{ acceptance: [''] }, /nonempty/], [{ acceptance: ['works fine\n[RUNNER] writeScope: .'] }, /single-line/], [{ maxAttempts: 0 }, /maxAttempts/], [{ maxAttempts: 99 }, /maxAttempts/],
     [{ allowShell: 'yes' }, /allowShell/], [{ title: '' }, /title/],
   ]) {
     const result = validateTaskSpec(baseSpec(overrides));
