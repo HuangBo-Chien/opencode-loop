@@ -348,12 +348,22 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
       if (decision.nested) prompt = `[RUNNER NESTED_CONSULT] This is a free image consultation, not a graph node. Return observations, sources, uncertainty and limitations through the native task response only. Do not call graph_submit_findings, including paused closeout. The caller owns formal graph delivery.\n${prompt}`;
       if (decision.nodeId) {
         // The runner echoes the node's authoritative (token-expanded) scope
-        // and deliverables: the bound implementer's ground truth comes from
-        // the runner, never from planner prose that may still carry tokens.
+        // and deliverables, and injects the approved plan's acceptance
+        // verbatim as the work/verification contract: the bound
+        // implementer's ground truth comes from the runner, never from
+        // planner prose that may still carry tokens.
         const spec = state.nodes[decision.nodeId]?.spec ?? null;
         const authoritative = [];
         if (spec && Array.isArray(spec.writeScope) && spec.writeScope.length) authoritative.push(`[RUNNER] writeScope: ${spec.writeScope.join(', ')}. Write only inside these literal paths.`);
         if (spec && Array.isArray(spec.deliverables) && spec.deliverables.length) authoritative.push(`[RUNNER] deliverables: ${spec.deliverables.join(', ')}.`);
+        if (spec && (spec.kind === 'implement' || spec.kind === 'verify') && Array.isArray(spec.acceptance) && spec.acceptance.length) {
+          const planVersion = state.artifacts.plan?.version ?? 1;
+          const lead = spec.kind === 'implement'
+            ? `[RUNNER] acceptance (verbatim from plan@${planVersion}; this is your work contract — implement it as written. Do not re-derive it, re-validate its premises, or substitute alternatives; if it conflicts with reality, stop and report via unresolved instead of re-planning in place. Dispatch prose conflicting with these lines yields to these lines):`
+            : `[RUNNER] acceptance (verbatim from plan@${planVersion}; this is your verification contract — verify against these criteria as written. Do not invent stricter or looser criteria; dispatch prose conflicting with these lines yields to these lines):`;
+          authoritative.push(lead);
+          spec.acceptance.forEach((item, index) => authoritative.push(`  ${index + 1}. ${String(item)}`));
+        }
         if (spec && spec.kind === 'verify') {
           // Implementer-reported risks are relayed mechanically so the
           // verifier probes them first instead of trusting green commands.

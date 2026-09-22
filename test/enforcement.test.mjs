@@ -174,6 +174,85 @@ test('integration args: native captured object receives task correlation and gui
   assert.equal(state.dispatchReservations.find((r) => r.callID === task.callID).userAnchorSource, 'chat.message');
 });
 
+test('dispatch prompts inject implement acceptance verbatim as the work contract', async () => {
+  const h = harness();
+  await startRun(h);
+  const state = h.store.getRun('root');
+  state.nodes.impl = { spec: { id: 'impl', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['src/a.ts'], acceptance: ['criterion one', 'criterion two'] }, state: 'PENDING', attempt: 0 };
+  const task = await dispatch(h, 'graph-implementer', { nodeId: 'impl' });
+  assert.match(task.args.prompt, /\[RUNNER\] acceptance \(verbatim from plan@1;/);
+  assert.match(task.args.prompt, /this is your work contract/);
+  assert.match(task.args.prompt, /\n  1\. criterion one\n/);
+  assert.match(task.args.prompt, /\n  2\. criterion two\n/);
+});
+
+test('dispatch prompts inject verify acceptance verbatim as the verification contract', async () => {
+  const h = harness();
+  await startRun(h);
+  const state = h.store.getRun('root');
+  state.nodes.impl = { spec: { id: 'impl', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['src/a.ts'] }, state: 'SUCCEEDED', attempt: 1 };
+  state.nodes.verify = { spec: { id: 'verify', kind: 'verify', agent: 'graph-verifier', dependsOn: ['impl'], acceptance: ['criterion one', 'criterion two'] }, state: 'PENDING', attempt: 0 };
+  const task = await dispatch(h, 'graph-verifier', { nodeId: 'verify' });
+  assert.match(task.args.prompt, /\[RUNNER\] acceptance \(verbatim from plan@1;/);
+  assert.match(task.args.prompt, /this is your verification contract/);
+  assert.match(task.args.prompt, /\n  1\. criterion one\n/);
+  assert.match(task.args.prompt, /\n  2\. criterion two\n/);
+});
+
+test('dispatch prompts omit the acceptance block when the spec carries none', async () => {
+  const h = harness();
+  await startRun(h);
+  const state = h.store.getRun('root');
+  state.nodes.impl = { spec: { id: 'impl', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['src/a.ts'] }, state: 'PENDING', attempt: 0 };
+  const task = await dispatch(h, 'graph-implementer', { nodeId: 'impl' });
+  assert.match(task.args.prompt, /Assigned nodeId: impl/);
+  assert.doesNotMatch(task.args.prompt, /\[RUNNER\] acceptance/);
+});
+
+test('planner dispatches never receive the acceptance block', async () => {
+  const h = harness();
+  await startRun(h);
+  const state = h.store.getRun('root');
+  state.nodes.plan = { spec: { id: 'plan', kind: 'plan', agent: 'graph-planner', dependsOn: [], acceptance: ['plan criterion'] }, state: 'PENDING', attempt: 0 };
+  const task = await dispatch(h, 'graph-planner', { nodeId: 'plan' });
+  assert.match(task.args.prompt, /Assigned nodeId: plan/);
+  assert.doesNotMatch(task.args.prompt, /\[RUNNER\] acceptance/);
+});
+
+test('acceptance precedes implementer-reported risks in verifier dispatch prompts', async () => {
+  const h = harness();
+  await startRun(h);
+  const state = h.store.getRun('root');
+  state.nodes.impl = { spec: { id: 'impl', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['src/a.ts'] }, state: 'SUCCEEDED', attempt: 1 };
+  state.nodes.verify = { spec: { id: 'verify', kind: 'verify', agent: 'graph-verifier', dependsOn: ['impl'], acceptance: ['criterion one'] }, state: 'PENDING', attempt: 0 };
+  state.artifacts['change:impl'] = { kind: 'change', version: 1, status: 'valid', payload: { risks: ['empty input still falls through'] } };
+  const task = await dispatch(h, 'graph-verifier', { nodeId: 'verify' });
+  const acceptance = task.args.prompt.indexOf('[RUNNER] acceptance (verbatim from plan@');
+  const risks = task.args.prompt.indexOf('implementer-reported risks');
+  assert.ok(acceptance !== -1, 'acceptance lead must be present');
+  assert.ok(risks !== -1, 'risks relay must be present');
+  assert.ok(acceptance < risks);
+});
+
+test('acceptance items with special characters are injected verbatim', async () => {
+  const h = harness();
+  await startRun(h);
+  const state = h.store.getRun('root');
+  state.nodes.impl = { spec: { id: 'impl', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['src/a.ts'], acceptance: ['says "draw" not None'] }, state: 'PENDING', attempt: 0 };
+  const task = await dispatch(h, 'graph-implementer', { nodeId: 'impl' });
+  assert.match(task.args.prompt, /\n  1\. says "draw" not None\n/);
+});
+
+test('acceptance header pins the current plan artifact version', async () => {
+  const h = harness();
+  await startRun(h);
+  const state = h.store.getRun('root');
+  state.artifacts.plan = { kind: 'plan', version: 3, status: 'valid', payload: {} };
+  state.nodes.impl = { spec: { id: 'impl', kind: 'implement', agent: 'graph-implementer', dependsOn: [], writeScope: ['src/a.ts'], acceptance: ['criterion one'] }, state: 'PENDING', attempt: 0 };
+  const task = await dispatch(h, 'graph-implementer', { nodeId: 'impl' });
+  assert.match(task.args.prompt, /\[RUNNER\] acceptance \(verbatim from plan@3;/);
+});
+
 for (const targetConflict of [false, true]) {
   test(`integration args: rejected task rewrites native captured object and removes stale routing (targetConflict=${targetConflict})`, async () => {
     const h = harness();
