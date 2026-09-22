@@ -1,4 +1,4 @@
-const shared = `這是 runner-gated 工作流程:派遣合法性、寫入範圍、次數與審查閘門由 runner 程式強制,角色指示與程式閘門一致時流程才會前進。每個角色必須以指定的 graph_submit_* 工具交付結構化結果;自由文字回報不會被系統採計為完成證據。
+const shared = `這是 runner-gated 工作流程:派遣合法性、寫入範圍、次數與審查閘門由 runner 程式強制,角色指示與程式閘門一致時流程才會前進。每個角色必須以指定的 graph_submit_* 工具交付結構化結果;自由文字回報不會被系統採計為完成證據。例外:帶有 [RUNNER NESTED_CONSULT] 的巢狀圖片諮詢只透過 native task 回覆觀察、來源、不確定性與限制,禁止 graph_submit_findings(包含 paused closeout),由呼叫者負責正式交付。
 依使用者目標、專案指示與已授權範圍工作;保留無關修改。缺少必要範圍、資訊或權限時明確回報,不擴張授權。原生工具的 permission ask 仍須遵守;runner 只會在違反規則時拒絕,不會代替使用者同意。
 run 暫停為 AWAITING_USER_DECISION 時,執行權限關閉:停止新 task(含 task_id 續接)、edit/write/bash。既有且身分核對相符的 attempt 可用原本的 graph_submit_* 提交一次有界 closeout(每個工具每個 dispatch 一次,JSON 最多 8 KiB);回應 effect="settlement" 只保存結束報告,不代表 change/approval、不推進依賴或宣稱成功。只回報已完成的操作、既有證據與未完成事項,不要為補證據執行新工作;已開始的工具之 late tool-after 仍會記錄。提交 closeout 後結束回覆,讓 host 確認 session idle/terminal。
 原生 task metadata 可能在 prompt 開始前發出,背景續接可能排隊;session.idle、空 status、重用的 jobId/sessionID 都不能單獨證明完成。runner 為每個 task call 附上唯一 [RUNNER_TASK_CALL:...] token,由原生 child user-message 與連到該訊息的真正 terminal assistant 回應核對,所有已接納 call 都有完成證據後才結算。不要改寫這個 token。取消或舊 session 若缺少可核對的 turn witness,即使 host idle 也保留阻擋;不可猜測完成、偽造事件或用新 task 解除阻擋。工具拋錯可能已有部分副作用,請核對 uncertain error 紀錄,不可把缺少 after-hook 當成未執行。
@@ -67,5 +67,8 @@ const navigationByRole = {
 
 export function createAgentPrompt(name, options) {
   if (!Object.hasOwn(roles, name)) throw new Error(`Unknown graph agent: ${name}`);
-  return `你是 ${name}。\n${shared}\n\n${codeNavigation}\n${navigationByRole[name] ?? ''}\n\n${roles[name](options)}`;
+  const consult = Object.hasOwn(navigationByRole, name);
+  const role = consult ? roles[name](options).replaceAll('或派遣代理', '').replaceAll('或自行派遣', '').replaceAll('不得派遣代理', '只可派遣 graph-multimodal 做圖片諮詢') : roles[name](options);
+  const guidance = consult ? '\n需要圖片判讀時,可用 native task 僅派遣 graph-multimodal,提供來源與問題,不得帶 nodeId 標記。這是不綁定節點的諮詢,不取得 analyze 節點、不提交 findings;你仍負責自己的 graph_submit_*。全 run 固定最多一個巢狀諮詢,與普通 reader 容量分開。容量拒絕時不可 spin 或等待自己,改用已知證據或回報限制。task_id 只可續接本 session 同一 dispatch generation 的諮詢。' : '';
+  return `你是 ${name}。\n${shared}\n\n${codeNavigation}\n${navigationByRole[name] ?? ''}\n\n${role}${guidance}`;
 }

@@ -28,7 +28,8 @@ test('native permissions restrict writes, delegation and submit tools by role', 
     assert.equal(p.edit ?? p['*'], name === 'graph-implementer' ? 'ask' : 'deny');
     assert.equal(p.write ?? p['*'], name === 'graph-implementer' ? 'ask' : 'deny');
     assert.equal(p.bash ?? p['*'], ['graph-implementer', 'graph-verifier', 'graph-explorer'].includes(name) ? 'ask' : 'deny');
-    if (name !== 'graph-orchestrator') assert.equal(p.task ?? p['*'], 'deny');
+    if (name === 'graph-multimodal') assert.equal(p.task, 'deny');
+    else if (name !== 'graph-orchestrator') assert.deepEqual(p.task, { '*': 'deny', 'graph-multimodal': 'allow' });
     assert.equal(p.graph_submit_plan ?? p['*'], name === 'graph-planner' ? 'allow' : 'deny');
     assert.equal(p.graph_submit_review ?? p['*'], name === 'graph-plan-critic' ? 'allow' : 'deny');
     assert.equal(p.graph_submit_change ?? p['*'], name === 'graph-implementer' ? 'allow' : 'deny');

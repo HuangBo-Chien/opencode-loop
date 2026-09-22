@@ -1240,13 +1240,13 @@ test('bounded host read resolves missing metadata event before child work', asyn
   assert.equal(messageCalls, 1);
 });
 
-test('unresolved sessions fail closed but verified native sessions are not graph-managed', async () => {
+test('unresolved sessions and unknown ancestors fail closed', async () => {
   const h = await harness({ session: { async get() { throw new Error('offline'); }, async messages() {} } });
   await h.admit('call', 'impl');
   assert.equal(await h.dispatches.ensureSession('unknown'), false);
   assert.equal(h.dispatches.managed('unknown'), true);
   await h.dispatches.onSession({ id: 'native-child', parentID: 'native-root' });
-  assert.equal(h.dispatches.managed('native-child'), false);
+  assert.equal(h.dispatches.managed('native-child'), true); // parent lookup failed: it might itself be a graph descendant
 });
 
 test('idle of an original prompt does not cancel an admitted continuation', async () => {

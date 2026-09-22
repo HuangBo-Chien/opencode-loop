@@ -95,7 +95,7 @@ function learningsPrompt(state) {
   return `[RUNNER] Explorer learnings (incorporate these; re-validate against current state before relying on them):\n${lines.join('\n')}`;
 }
 
-export function createEnforcement({ settings, store, runner, bindings, client, dispatches = createDispatchBindings({ store, runner, bindings, client }), lessons = null, getToolPermissions = () => null }) {
+export function createEnforcement({ settings, store, runner, bindings, client, getSubagentDepth = () => 2, dispatches = createDispatchBindings({ store, runner, bindings, client, getSubagentDepth }), lessons = null, getToolPermissions = () => null }) {
   const deniedCalls = new Map();
   const startedCalls = new Map();
   const observedToolParts = new Map();
@@ -214,7 +214,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
           state.status = 'RECOVERY_REQUIRED';
           await store.saveRun(state);
         }
-        if (state.status === 'AWAITING_USER_DECISION' || state.dispatchReservations?.some((r) => r.settlementOnly)) {
+        if (state.status === 'AWAITING_USER_DECISION' || state.dispatchReservations?.some((r) => r.settlementOnly || r.nested)) {
           await dispatches.recoverPaused(state);
         }
         const pendingEffectsBeforeRecovery = state.pendingEffects?.length ?? 0;
@@ -316,25 +316,31 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     const configuredDenial = configuredToolDenial(sessionID, tool);
     if (configuredDenial) throw new Error(configuredDenial);
     if (tool === 'task') {
+      await dispatches.ensureSession(sessionID);
       const binding = bindings.get(sessionID);
-      if (!binding?.root) return;
+      if (!binding) {
+        if (dispatches.managed(sessionID)) throw new Error('BINDING_UNAVAILABLE: task requires an active authenticated dispatch; stop and report the limitation');
+        return;
+      }
       const state = store.getRun(binding.runId);
-      if (!state) return;
+      if (!state) throw new Error('BINDING_UNAVAILABLE: owning run is unavailable; stop and report the limitation');
       const args = output.args ??= {};
       const subagentType = typeof args.subagent_type === 'string' ? args.subagent_type : null;
       const target = parseNodeIdHint(args, { strict: TARGET_REQUIRED_AGENTS.has(subagentType) });
       const decision = target.allowed ? await dispatches.admit(sessionID, callID, args, target.nodeId) : target;
       if (!decision.allowed) {
         await dispatches.exclusive(binding.runId, async () => {
-          runner.recordViolation(state, { nodeId: null, kind: 'gate-blocked-dispatch', detail: `${subagentType}: ${decision.code} — ${decision.detail}`, now: NOW() });
+          runner.recordViolation(state, { nodeId: binding.nodeId ?? null, kind: 'gate-blocked-dispatch', detail: `${subagentType}: ${decision.code} — ${decision.detail}`, now: NOW() });
           await store.saveRun(state);
         });
+        if (!binding.root) throw new Error(`RUNNER_REJECTED(${decision.code}): ${decision.detail}. Do not retry unchanged or wait on yourself; report the limitation in your own delivery.`);
         delete args.task_id;
         delete args.nodeId;
         Object.assign(args, { description: args.description ?? 'runner-rejected dispatch', prompt: rejectionPrompt(decision), subagent_type: subagentType ?? 'graph-explorer' });
         return;
       }
       let prompt = typeof args.prompt === 'string' ? args.prompt : '';
+      if (decision.nested) prompt = `[RUNNER NESTED_CONSULT] This is a free image consultation, not a graph node. Return observations, sources, uncertainty and limitations through the native task response only. Do not call graph_submit_findings, including paused closeout. The caller owns formal graph delivery.\n${prompt}`;
       if (decision.nodeId) {
         // The runner echoes the node's authoritative (token-expanded) scope
         // and deliverables: the bound implementer's ground truth comes from

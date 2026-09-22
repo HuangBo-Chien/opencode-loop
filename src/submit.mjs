@@ -232,6 +232,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (context.agent !== 'graph-explorer' && context.agent !== 'graph-multimodal') {
         return rejected('WRONG_ROLE', 'only graph-explorer or graph-multimodal may call this tool');
       }
+      if (bindings.get(context.sessionID)?.nested) return rejected('NESTED_CONSULT_ONLY', 'return observations to the caller through the native task response; no findings or closeout');
       const located = runFor(context);
       if (located.error) return located.error;
       try {
@@ -515,6 +516,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       const binding = bindings.get(context.sessionID);
       return binding ? dispatches.exclusive(binding.runId, () => {
         const state = store.getRun(binding.runId);
+        if (name === 'graph_submit_findings' && binding.nested) return rejected('NESTED_CONSULT_ONLY', 'return observations to the caller through the native task response; no findings or closeout');
         if (name.startsWith('graph_submit_') && state?.status === 'AWAITING_USER_DECISION') {
           return settlePaused(name, definition, args, context, binding, state);
         }

@@ -10,7 +10,7 @@ import { createEnforcement } from '../src/enforcement.mjs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { exactRef, publishArtifact, repairClosure, retainedLineage, verificationFiles } from '../src/artifact-dependencies.mjs';
+import { exactRef, publishArtifact, repairClosure, retainedLineage, verificationFiles, repairSettlementPending } from '../src/artifact-dependencies.mjs';
 
 const now = '2026-09-21T00:00:00.000Z';
 const roles = { plan: 'planner', review: 'plan-critic', implement: 'implementer', verify: 'verifier' };
@@ -122,7 +122,7 @@ test('global repair exhaustion preserves effective targets and invalidation evid
   assert.deepEqual(state, before);
 });
 
-async function publicFixture(t, { failSave = () => false, cInput = 'change:a' } = {}) {
+async function publicFixture(t, { failSave = () => false, cInput = 'change:a', nestedA = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'selective-repair-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const backing = createRunStore({ worktree: dir });
@@ -156,10 +156,18 @@ async function publicFixture(t, { failSave = () => false, cInput = 'change:a' } 
   }
   const context = (call) => ({ sessionID: call.sessionId, agent: call.args.subagent_type });
   const a = await bind('a');
+  let nested;
+  if (nestedA) {
+    nested = { sessionId: 'nested-image', callID: 'nested-call', args: { subagent_type: 'graph-multimodal', prompt: 'Read image' } };
+    assert.equal((await dispatches.admit(a.sessionId, nested.callID, nested.args)).allowed, true);
+    await dispatches.onSession({ id: nested.sessionId, parentID: a.sessionId });
+    await dispatches.onPart({ type: 'tool', tool: 'task', sessionID: a.sessionId, callID: nested.callID,
+      state: { status: 'running', input: nested.args, metadata: { parentSessionId: a.sessionId, sessionId: nested.sessionId } } });
+  }
   assert.equal(JSON.parse(await tools.graph_submit_change.execute({ nodeId: 'a', filesTouched: [], summary: 'a' }, context(a))).ok, true);
   const c = await bind('c'); const d = await bind('d'); const v = await bind('v');
   const submit = (args = {}) => tools.graph_submit_verification.execute({ nodeId: 'v', verdict: 'FAIL', repairTargets: ['a'], ...args }, context(v)).then(JSON.parse);
-  return { state, store, runner: f.runner, bindings, dispatches, enforcement, tools, bind, a, c, d, v, submit,
+  return { dir, nested, state, store, runner: f.runner, bindings, dispatches, enforcement, tools, bind, a, c, d, v, submit,
     disk: () => readFile(join(dir, '.opencode-loop/runs/repair.json'), 'utf8') };
 }
 
@@ -185,6 +193,39 @@ test('public selective revocation fences affected RUNNING and host-alive SUCCEED
   h.state.pendingEffects = [];
   assert.equal((await h.bind('a', h.a.sessionId)).allowed, true);
   assert.equal(h.dispatches.current(d), true);
+});
+
+for (const restart of [false, true]) test(`public repair waits for revoked descendant after parent host settles (restart=${restart})`, async (t) => {
+  const h = await publicFixture(t, { nestedA: true });
+  const sibling = structuredClone(h.state.nodes.d);
+  assert.equal((await h.submit()).ok, true);
+  assert.equal(h.dispatches.current(h.bindings.get(h.d.sessionId)), true);
+  await h.dispatches.onPart({ type: 'tool', tool: 'task', sessionID: 'root', callID: h.a.callID, state: { status: 'completed' } });
+  assert.equal(h.state.dispatchReservations.some(r => r.nodeId === 'a'), false);
+  assert.ok(h.state.dispatchReservations.find(r => r.nested)?.repairRevoked);
+  let { state, dispatches } = h;
+  if (restart) {
+    const store = createRunStore({ worktree: h.dir });
+    state = await store.loadRun('repair');
+    const bindings = new Map([['root', { root: true, runId: 'repair', agent: 'graph-orchestrator' }]]);
+    dispatches = createDispatchBindings({ store, runner: h.runner, bindings });
+    await dispatches.recoverPaused(state);
+  }
+  assert.equal(repairSettlementPending(state, 'a'), true);
+  assert.equal(repairSettlementPending(state, 'd'), false);
+  assert.deepEqual(state.nodes.d, sibling);
+  assert.equal(state.dispatchReservations.find(r => r.sessionId === h.d.sessionId).repairRevoked, undefined);
+  const before = structuredClone(state);
+  assert.equal(h.runner.admitDispatch(state, { agent: 'graph-implementer', nodeId: 'a', now }).code, 'REPAIR_SETTLEMENT_PENDING');
+  assert.throws(() => h.runner.beginNode(state, 'a', { sessionId: 'replacement', dispatchId: 'replacement', now }), /repair settlement/);
+  for (const task_id of [undefined, h.a.sessionId]) {
+    assert.equal((await dispatches.admit('root', 'replacement', { subagent_type: 'graph-implementer', task_id }, 'a')).code, 'REPAIR_SETTLEMENT_PENDING');
+  }
+  assert.deepEqual(state, before);
+  await dispatches.onPart({ type: 'tool', tool: 'task', sessionID: h.a.sessionId, callID: h.nested.callID,
+    state: { status: 'completed', input: h.nested.args, metadata: { parentSessionId: h.a.sessionId, sessionId: h.nested.sessionId } } });
+  assert.equal(repairSettlementPending(state, 'a'), false);
+  assert.equal((await dispatches.admit('root', 'replacement', { subagent_type: 'graph-implementer' }, 'a')).allowed, true);
 });
 
 for (const failure of ['EIO', 'capacity']) test(`public FAIL ${failure} rolls back state, disk, bindings and private reservations`, async (t) => {

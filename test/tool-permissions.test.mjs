@@ -43,7 +43,8 @@ test('shared tools reach all seven roles without opening native or graph control
     assert.equal(action(p, 'memory_search_nodes'), 'deny');
     assert.equal(action(p, 'codegraph_delete'), 'deny');
     assert.equal(action(p, 'edit'), name === 'graph-implementer' ? 'ask' : 'deny');
-    if (name !== 'graph-orchestrator') assert.equal(action(p, 'task'), 'deny');
+    if (name === 'graph-multimodal') assert.equal(action(p, 'task'), 'deny');
+    else if (name !== 'graph-orchestrator') assert.deepEqual(action(p, 'task'), { '*': 'deny', 'graph-multimodal': 'allow' });
     assert.equal(action(p, 'graph_submit_change'), name === 'graph-implementer' ? 'allow' : 'deny');
   }
 });

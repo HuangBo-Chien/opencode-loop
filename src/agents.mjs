@@ -25,7 +25,7 @@ function createPermission(name) {
     permission.todowrite = 'allow';
     permission.task = { '*': 'deny', ...Object.fromEntries(AGENT_NAMES.filter(agent => agent !== name).map(agent => [agent, 'allow'])) };
   } else {
-    permission.task = 'deny';
+    permission.task = name === 'graph-multimodal' ? 'deny' : { '*': 'deny', 'graph-multimodal': 'allow' };
   }
   for (const tool of SUBMIT_TOOL_BY_AGENT[name] ?? []) permission[tool] = 'allow';
   if (JOURNAL_READ_AGENTS.has(name)) {
