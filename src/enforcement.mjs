@@ -102,7 +102,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
   const recordedCalls = new Set();
   const callKey = (sessionID, callID) => JSON.stringify([sessionID, callID]);
   const settlementTools = new Set(['graph_submit_plan', 'graph_submit_review', 'graph_submit_change', 'graph_submit_verification', 'graph_submit_findings']);
-  const denialKinds = new Set(['out-of-scope-edit', 'out-of-scope-write', 'out-of-scope-bash', 'blocked-bash']);
+  const denialKinds = new Set(['out-of-scope-edit', 'out-of-scope-write', 'out-of-scope-bash', 'blocked-bash', 'unparsed-write-target']);
   function recorded(identity) {
     recordedCalls.add(identity);
     if (recordedCalls.size > 256) recordedCalls.delete(recordedCalls.values().next().value);
@@ -277,9 +277,14 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
     const node = binding.nodeId ? state.nodes[binding.nodeId] : null;
     if (tool === 'edit' || tool === 'write') {
       if (!node || node.spec.kind !== 'implement') return null;
-      const target = toWorkspaceRelative(args?.filePath ?? args?.path);
       const patterns = node.spec.writeScope ?? [];
-      const allowed = typeof target === 'string' && patterns.length > 0 && patterns.some((pattern) => matchScopePath(pattern, target));
+      const rawTarget = args?.filePath ?? args?.path;
+      const target = toWorkspaceRelative(rawTarget);
+      if (typeof target !== 'string') {
+        return { state, node, nodeId: node.spec.id, target: null, allowed: false, kind: 'unparsed-write-target',
+          reason: `could not determine the ${tool} target${typeof rawTarget === 'string' ? ` from ${JSON.stringify(rawTarget.slice(0, 120))}` : ' (missing filePath)'}; supply a literal workspace-relative file path inside the writeScope [${patterns.join(', ')}] of ${node.spec.id}` };
+      }
+      const allowed = patterns.length > 0 && patterns.some((pattern) => matchScopePath(pattern, target));
       return { state, node, nodeId: node.spec.id, target, allowed, kind: tool === 'edit' ? 'out-of-scope-edit' : 'out-of-scope-write',
         reason: `${tool} target ${target} is outside the writeScope [${patterns.join(', ')}] of ${node.spec.id}` };
     }
@@ -370,7 +375,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
           const block = await dispatchLessonsBlock(spec.writeScope ?? [], args.prompt);
           if (block) authoritative.push(block);
         }
-        prompt = `[RUNNER] Assigned nodeId: ${decision.nodeId}. Submit only this node.${authoritative.length ? `\n${authoritative.join('\n')}` : ''}\n${prompt}`;
+        prompt = `[RUNNER] Assigned nodeId: ${decision.nodeId}${decision.resolvedBy === 'unique-admissible' ? ' (auto-resolved: the only admissible node for this role right now; always include [nodeId:...] on the first prompt line)' : ''}. Submit only this node.${authoritative.length ? `\n${authoritative.join('\n')}` : ''}\n${prompt}`;
         if (decision.reconcile) prompt = `${reconcilePrompt(state, decision.nodeId)}\n\n${prompt}`;
         const guidance = revisionPrompt(decision);
         if (guidance) prompt = `${guidance}\n\n${prompt}`;
@@ -428,6 +433,9 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
   function denyGuidance(kind) {
     if (kind === 'blocked-bash') {
       return 'Do not retry bash. Complete the work with edit/write; if it genuinely requires shell (installs, builds), wrap up and report via graph_submit_change unresolved (or your final task report) that the coordinator must revise the plan: set allowShell=true for this node or split out an install node with its own lane.';
+    }
+    if (kind === 'unparsed-write-target') {
+      return 'Retry with a literal workspace-relative file path in filePath; never a directory, glob, empty value or absent argument. The [RUNNER] writeScope line in your dispatch prompt is authoritative.';
     }
     if (kind === 'out-of-scope-bash') {
       return 'Retarget or remove the out-of-scope write (redirections, tee/cp/mv/rm/sed -i, ...) so every write lands inside your writeScope; the [RUNNER] writeScope line in your dispatch prompt is authoritative.';

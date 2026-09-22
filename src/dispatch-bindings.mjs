@@ -224,7 +224,11 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
     const targetDecision = resolveNodeIdHint(args, desiredNodeId, { strict: TARGET_REQUIRED_AGENTS.has(agent) });
     if (!targetDecision.allowed) return targetDecision;
     const target = targetDecision.nodeId;
-    if (target === null && TARGET_REQUIRED_AGENTS.has(agent)) {
+    if (target === null && TARGET_REQUIRED_AGENTS.has(agent) && (args.task_id !== undefined || nested)) {
+      // Strict-target roles keep an explicit marker for continuations (the
+      // session's prior node is an identity, not a fresh choice) and for
+      // nested callers. A fresh root dispatch may fall through to the
+      // runner's unique-admissible auto-resolve inside the lock.
       return denied('NODE_ID_REQUIRED', `${agent} requires an explicit nodeId for every dispatch, including task_id continuations and single-node graphs; put [nodeId:target-node] alone on the first prompt line`);
     }
     return exclusive(root.runId, async () => {
@@ -389,7 +393,8 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
       } else if (reserved.size > 0) {
         return denied('DISPATCH_PENDING', 'a task for this role is reserved and awaiting host session binding');
       }
-      const decision = runner.admitDispatch(state, { agent, now: NOW(), nodeId: target, excludeNodeIds: reserved });
+      const decision = runner.admitDispatch(state, { agent, now: NOW(), nodeId: target, excludeNodeIds: reserved,
+        autoResolveUnique: target === null && TARGET_REQUIRED_AGENTS.has(agent) });
       if (!decision.allowed) {
         // A sorted pick that found nothing because every candidate is already
         // reserved is a pending reservation, not a missing graph.
@@ -404,6 +409,7 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
       records.set(recordKey, { runId: root.runId, rootSessionId, callerSessionId, callID, agent, turnToken, nodeId: decision.nodeId,
         dispatchId: randomUUID(), sessionId: continuationSession, bound: false, continuation: continuationSession !== null,
         resumed: continuationSession !== null, acknowledged: false, idleSeen: false, terminal: false, targeted: target !== null,
+        autoResolved: decision.resolvedBy === 'unique-admissible',
         planVersion: state.artifacts.plan?.version ?? 0 });
       if (continuationSession) bindings.delete(continuationSession); // the stale free binding must not block the fresh one
       recordDispatch();
@@ -985,7 +991,7 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
     return [...[...records.values()].filter((r) => r.runId === runId).map((r) => ({
       callID: r.callID, nodeId: r.nodeId, agent: r.agent, sessionId: r.sessionId, bound: r.bound, continuation: r.continuation,
       callerSessionId: callerOf(r), nested: r.nested === true, ...(r.nested ? { callerDispatchId: r.callerDispatchId } : {}),
-      resumed: r.resumed === true, targeted: r.targeted === true,
+      resumed: r.resumed === true, targeted: r.targeted === true, autoResolved: r.autoResolved === true,
       ...(r.repairRevoked ? { repairRevoked: true } : {}),
       ...(r.settlementOnly ? { settlementOnly: true } : {}),
       ...(r.recoveryBlocked ? { recoveryBlocked: r.recoveryBlocked } : {}),

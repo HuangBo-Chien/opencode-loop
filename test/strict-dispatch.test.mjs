@@ -32,16 +32,33 @@ async function harness(agent = 'graph-implementer', count = 2) {
 }
 
 for (const agent of ['graph-implementer', 'graph-verifier']) {
-  for (const count of [1, 2]) {
-    test(`strict target: ${agent} requires a node even with ${count} ready node(s)`, async () => {
-      const h = await harness(agent, count);
-      const args = await h.dispatch('missing', 'Work on task B');
-      assert.match(args.prompt, /RUNNER_REJECTED/);
-      assert.match(args.prompt, /NODE_ID_REQUIRED/);
-      assert.deepEqual(h.enforcement.dispatches.inspect('root'), []);
-      assert.ok(Object.values(h.state.nodes).every((node) => node.state === 'PENDING' && node.attempt === 0));
-    });
-  }
+  test(`strict target: ${agent} auto-resolves a single admissible candidate`, async () => {
+    const h = await harness(agent, 1);
+    const args = await h.dispatch('auto', 'Work on the only task');
+    assert.doesNotMatch(args.prompt, /RUNNER_REJECTED/);
+    assert.ok(args.prompt.includes(`[RUNNER] Assigned nodeId: a (auto-resolved: the only admissible node for this role right now; always include [nodeId:...] on the first prompt line). Submit only this node.`), args.prompt);
+    assert.ok(args.prompt.includes('Work on the only task'));
+    assert.match(args.prompt, /\n\[RUNNER_TASK_CALL:[a-f0-9-]{36}\]$/);
+    assert.equal(h.state.nodes.a.attempt, 0); // reservation never charges
+    const record = h.enforcement.dispatches.inspect('root')[0];
+    assert.equal(record.nodeId, 'a');
+    assert.equal(record.autoResolved, true);
+    assert.equal(record.targeted, false);
+    await h.session('child-a');
+    await h.metadata('auto', 'child-a', args);
+    assert.equal(h.bindings.get('child-a').nodeId, 'a');
+    assert.equal(h.state.nodes.a.attempt, 1);
+  });
+
+  test(`strict target: ${agent} with several admissible candidates still requires an explicit marker`, async () => {
+    const h = await harness(agent, 2);
+    const args = await h.dispatch('missing', 'Work on task B');
+    assert.match(args.prompt, /RUNNER_REJECTED/);
+    assert.match(args.prompt, /NODE_ID_REQUIRED/);
+    assert.match(args.prompt, /a, b/); // the candidate list
+    assert.deepEqual(h.enforcement.dispatches.inspect('root'), []);
+    assert.ok(Object.values(h.state.nodes).every((node) => node.state === 'PENDING' && node.attempt === 0));
+  });
 
   test(`strict target: direct ${agent} admission cannot bypass target validation`, async () => {
     const h = await harness(agent);
@@ -238,3 +255,92 @@ for (const reverseSessions of [false, true]) {
     }
   }
 }
+
+test('strict parallel: after one node is reserved, a marker-less dispatch converges on the remaining candidate', async () => {
+  const h = await harness();
+  const b = await h.dispatch('call-b', '[nodeId:b]\nImplement B in pkg-b/main.js');
+  await h.session('child-b');
+  await h.metadata('call-b', 'child-b', b);
+  assert.equal(h.bindings.get('child-b').nodeId, 'b');
+  // node b is RUNNING, node a is the only admissible candidate left
+  const auto = await h.dispatch('call-a', 'Implement A in pkg-a/main.js');
+  assert.doesNotMatch(auto.prompt, /RUNNER_REJECTED/);
+  assert.ok(auto.prompt.includes('Assigned nodeId: a (auto-resolved'), auto.prompt);
+  const record = h.enforcement.dispatches.inspect('root').find((entry) => entry.callID === 'call-a');
+  assert.equal(record.autoResolved, true);
+});
+
+test('strict target: direct admission auto-resolves a unique candidate and flags the record', async () => {
+  for (const agent of ['graph-implementer', 'graph-verifier']) {
+    const h = await harness(agent, 1);
+    const result = await h.enforcement.dispatches.admit('root', 'direct-unique', { subagent_type: agent }, null);
+    assert.equal(result.allowed, true, JSON.stringify(result));
+    assert.equal(result.nodeId, 'a');
+    assert.equal(result.resolvedBy, 'unique-admissible');
+    const record = h.enforcement.dispatches.inspect('root')[0];
+    assert.equal(record.nodeId, 'a');
+    assert.equal(record.autoResolved, true);
+  }
+});
+
+test('strict target: direct admission with several candidates lists them in the rejection', async () => {
+  const h = await harness('graph-implementer', 2);
+  const result = await h.enforcement.dispatches.admit('root', 'direct-ambiguous', { subagent_type: 'graph-implementer' }, null);
+  assert.equal(result.allowed, false);
+  assert.equal(result.code, 'NODE_ID_REQUIRED');
+  assert.match(result.detail, /\(a, b\)/);
+  assert.deepEqual(h.enforcement.dispatches.inspect('root'), []);
+});
+
+test('dispatch without subagent_type is AGENT_REQUIRED; an unknown role stays INVALID_AGENT', async () => {
+  const h = await harness('graph-implementer', 1);
+  const missing = { args: { description: 'no-role', prompt: 'hello' } };
+  await h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID: 'no-role' }, missing);
+  assert.match(missing.args.prompt, /RUNNER_REJECTED/);
+  assert.ok(missing.args.prompt.includes('AGENT_REQUIRED'), missing.args.prompt);
+  assert.ok(missing.args.prompt.includes('subagent_type'), missing.args.prompt);
+  assert.equal(missing.args.subagent_type, 'graph-explorer');
+  assert.deepEqual(h.enforcement.dispatches.inspect('root'), []);
+
+  const unknown = { args: { description: 'bad-role', subagent_type: 'graph-minion', prompt: 'hello' } };
+  await h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID: 'bad-role' }, unknown);
+  assert.match(unknown.args.prompt, /RUNNER_REJECTED/);
+  assert.ok(unknown.args.prompt.includes('INVALID_AGENT'), unknown.args.prompt);
+  assert.ok(unknown.args.prompt.includes('graph-minion'), unknown.args.prompt);
+  assert.equal(h.state.violations.some((v) => v.detail.includes('AGENT_REQUIRED')), true);
+});
+
+test('write without a parseable target is denied as unparsed-write-target with actionable guidance', async () => {
+  const h = await harness('graph-implementer', 1);
+  const args = await h.dispatch('u', '[nodeId:a]\nImplement A');
+  await h.session('child-a');
+  await h.metadata('u', 'child-a', args);
+  await assert.rejects(
+    h.enforcement.onToolBefore({ tool: 'write', sessionID: 'child-a', callID: 'w-none' }, { args: {} }),
+    /RUNNER_DENIED\(unparsed-write-target\)/,
+  );
+  await assert.rejects(
+    h.enforcement.onToolBefore({ tool: 'write', sessionID: 'child-a', callID: 'w-empty' }, { args: { filePath: '' } }),
+    /RUNNER_DENIED\(unparsed-write-target\)/,
+  );
+  const unparsed = h.state.violations.filter((v) => v.kind === 'unparsed-write-target');
+  assert.equal(unparsed.length, 2);
+  for (const violation of unparsed) {
+    assert.match(violation.detail, /could not determine the write target/);
+    assert.match(violation.detail, /writeScope \[pkg-a\/\*\*\]/);
+  }
+  // in-scope writes still work after the denials
+  await assert.doesNotReject(h.enforcement.onToolBefore(
+    { tool: 'write', sessionID: 'child-a', callID: 'w-own' },
+    { args: { filePath: 'pkg-a/main.js' } },
+  ));
+});
+
+test('targeted NODE_NOT_ADMISSIBLE names other admissible nodes of the role', async () => {
+  const h = await harness('graph-implementer', 2);
+  h.state.nodes.b.spec.dependsOn = ['a'];
+  const result = await h.enforcement.dispatches.admit('root', 'targeted-blocked', { subagent_type: 'graph-implementer' }, 'b');
+  assert.equal(result.allowed, false);
+  assert.equal(result.code, 'NODE_NOT_ADMISSIBLE');
+  assert.match(result.detail, /other admissible graph-implementer nodes: a/);
+});
