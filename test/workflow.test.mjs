@@ -28,7 +28,8 @@ test('native permissions restrict writes, delegation and submit tools by role', 
     assert.equal(p.edit ?? p['*'], name === 'graph-implementer' ? 'ask' : 'deny');
     assert.equal(p.write ?? p['*'], name === 'graph-implementer' ? 'ask' : 'deny');
     assert.equal(p.bash ?? p['*'], ['graph-implementer', 'graph-verifier', 'graph-explorer'].includes(name) ? 'ask' : 'deny');
-    if (name !== 'graph-orchestrator') assert.equal(p.task ?? p['*'], 'deny');
+    if (name === 'graph-multimodal') assert.equal(p.task, 'deny');
+    else if (name !== 'graph-orchestrator') assert.deepEqual(p.task, { '*': 'deny', 'graph-multimodal': 'allow' });
     assert.equal(p.graph_submit_plan ?? p['*'], name === 'graph-planner' ? 'allow' : 'deny');
     assert.equal(p.graph_submit_review ?? p['*'], name === 'graph-plan-critic' ? 'allow' : 'deny');
     assert.equal(p.graph_submit_change ?? p['*'], name === 'graph-implementer' ? 'allow' : 'deny');
@@ -133,4 +134,21 @@ test('dispatch prompts require explicit writer targets and stop on task conflict
   for (const role of ['graph-implementer', 'graph-verifier']) {
     assert.match(definitions[role].prompt, /任務正文.*衝突.*停止.*回報/);
   }
+});
+
+test('all roles receive capability-aware code navigation guidance with distinct uses', async () => {
+  const definitions = await agents();
+  for (const { prompt } of Object.values(definitions)) {
+    assert.match(prompt, /可用且獲授權/);
+    assert.match(prompt, /read\/glob\/grep/);
+    assert.match(prompt, /不.*繞過/);
+    assert.match(prompt, /不代表.*連線/);
+  }
+  for (const [role, purpose] of Object.entries({
+    'graph-explorer': /符號.*呼叫端.*測試/,
+    'graph-planner': /依賴.*修改範圍/,
+    'graph-plan-critic': /遺漏.*呼叫端/,
+    'graph-implementer': /修改前.*影響範圍/,
+    'graph-verifier': /回歸.*實際驗證/,
+  })) assert.match(definitions[role].prompt, purpose);
 });

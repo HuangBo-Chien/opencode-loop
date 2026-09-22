@@ -1,3 +1,5 @@
+import { parseToolPermissions } from './tool-permissions.mjs';
+
 export const AGENT_NAMES = Object.freeze([
   'graph-orchestrator', 'graph-explorer', 'graph-planner', 'graph-plan-critic',
   'graph-implementer', 'graph-verifier', 'graph-multimodal',
@@ -37,6 +39,7 @@ export function parseOptions(input = {}) {
     stateDirectory: '.opencode-loop', maxPlanRevisions: undefined, enforcement: 'hooks',
     journal: { enabled: true, includeUserRequest: true, semanticSearch: true, maxUserRequestChars: 8000 },
     lessons: { enabled: true, injectMax: 4 },
+    toolPermissions: {},
   };
   for (const key of Reflect.ownKeys(input)) {
     if (typeof key !== 'string' || !Object.hasOwn(defaults, key)) throw new TypeError(`Unknown plugin option: ${String(key)}`);
@@ -92,5 +95,6 @@ export function parseOptions(input = {}) {
   if (!Number.isInteger(lessons.injectMax) || lessons.injectMax < 0 || lessons.injectMax > 8) {
     throw new TypeError('lessons.injectMax must be an integer from 0 to 8');
   }
-  return Object.freeze({ ...options, models: Object.freeze(models), journal: Object.freeze(journal), lessons: Object.freeze(lessons) });
+  const toolPermissions = parseToolPermissions(options.toolPermissions, AGENT_NAMES);
+  return Object.freeze({ ...options, models: Object.freeze(models), journal: Object.freeze(journal), lessons: Object.freeze(lessons), toolPermissions });
 }

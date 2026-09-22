@@ -5,6 +5,7 @@ import { resolveNodeIdHint, TARGET_REQUIRED_AGENTS } from './dispatch-target.mjs
 import { cleanJson } from './json-safe.mjs';
 import { assertSettlementCapacity } from './runner.mjs';
 import { sanitizeRun } from './run-state.mjs';
+import { repairSettlementPending } from './artifact-dependencies.mjs';
 
 const NOW = () => new Date().toISOString();
 const key = (root, call) => JSON.stringify([root, call]);
@@ -17,6 +18,9 @@ const CONTINUABLE_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-pla
 // capacity budget with node-bound explore/analyze work.
 const READ_CONSULT_AGENTS = new Set(['graph-explorer', 'graph-multimodal']);
 const DISPATCH_AGENTS = new Set([...CONTINUABLE_ROLES, 'graph-implementer', 'graph-verifier']);
+const NESTED_CALLERS = new Set([...DISPATCH_AGENTS].filter((agent) => agent !== 'graph-multimodal'));
+const callerOf = (record) => record.callerSessionId ?? record.rootSessionId;
+const provenance = (record) => record.nested ? { nested: true, callerSessionId: record.callerSessionId, callerDispatchId: record.callerDispatchId } : {};
 const identityString = (value) => typeof value === 'string' && value.length > 0 && value.length <= 256 && value.trim() === value;
 // These two identifiers are minted only by randomUUID here, not by the host.
 const generationId = (value) => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value);
@@ -43,7 +47,12 @@ function partitionReservations(state) {
       || (r.bound || r.started || r.continuation) && !identityString(r.sessionId)
       || r.nodeId === null && !CONTINUABLE_ROLES.has(r.agent)) return 'INVALID_RESERVATION_IDENTITY';
     if (r.recoveryBlocked) return 'UNRESOLVED_RESERVATION';
-    if (!admission.has(key(r.rootSessionId, r.callID))) return 'MISSING_ADMISSION_PROOF';
+    if (r.callerSessionId !== undefined && !identityString(r.callerSessionId)
+      || r.nested !== undefined && typeof r.nested !== 'boolean'
+      || r.nested && (r.agent !== 'graph-multimodal' || r.nodeId !== null || !identityString(r.callerSessionId)
+        || r.callerSessionId === r.rootSessionId || !generationId(r.callerDispatchId))
+      || !r.nested && (callerOf(r) !== r.rootSessionId || r.callerDispatchId !== undefined)) return 'INVALID_CALLER_PROVENANCE';
+    if (!admission.has(key(callerOf(r), r.callID))) return 'MISSING_ADMISSION_PROOF';
     if (!historical) {
       const version = state.artifacts.plan?.version ?? 0;
       const owner = Object.values(state.nodes).find((node) => node.dispatchId === r.dispatchId && node.sessionId === r.sessionId);
@@ -63,18 +72,22 @@ function partitionReservations(state) {
     });
     return map;
   };
-  const callKey = (r) => identityString(r.rootSessionId) && identityString(r.callID) ? key(r.rootSessionId, r.callID) : null;
+  const callKey = (r) => identityString(callerOf(r)) && identityString(r.callID) ? key(callerOf(r), r.callID) : null;
   const conflict = (indices) => { for (const index of indices) problems[index] = 'CONFLICTING_RESERVATION_IDENTITY'; };
   for (const indices of groups(callKey).values()) if (indices.length > 1) conflict(indices);
   for (const indices of groups((r) => identityString(r.turnToken) ? r.turnToken : null).values()) if (indices.length > 1) conflict(indices);
   for (const indices of groups((r) => identityString(r.dispatchId) ? r.dispatchId : null).values()) {
     const identities = new Set(indices.map((i) => {
       const r = source[i];
-      return JSON.stringify([r.runId, r.rootSessionId, r.agent, r.nodeId, r.sessionId, r.planVersion]);
+      return JSON.stringify([r.runId, r.rootSessionId, callerOf(r), r.callerDispatchId, r.nested, r.agent, r.nodeId, r.sessionId, r.planVersion]);
     }));
     if (identities.size > 1) conflict(indices);
   }
   const settled = Array.isArray(state.settledDispatches) ? state.settledDispatches : [];
+  const lineageValid = (r) => !r.nested || [...source.filter((_, i) => !problems[i]), ...settled].some((parent) => !problem(parent, true)
+    && !parent.nested && parent.bound && NESTED_CALLERS.has(parent.agent)
+    && parent.sessionId === r.callerSessionId && parent.dispatchId === r.callerDispatchId);
+  source.forEach((r, i) => { if (!problems[i] && !lineageValid(r)) problems[i] = 'INVALID_CALLER_LINEAGE'; });
   const settledCalls = new Set(settled.filter((r) => r && typeof r === 'object').map(callKey).filter(Boolean));
   const settledDispatches = new Set(settled.filter((r) => r?.runId === state.runId && identityString(r.dispatchId)).map((r) => r.dispatchId));
   const restored = [];
@@ -84,7 +97,7 @@ function partitionReservations(state) {
     if (code) issues.push({ code, reservation: structuredClone(r) });
     else restored.push({ ...r, ...(state.status !== 'AWAITING_USER_DECISION' ? { settlementOnly: true } : {}) });
   });
-  return { restored, issues, settled: settled.filter((r) => !problem(r, true)) };
+  return { restored, issues, settled: settled.filter((r) => !problem(r, true) && lineageValid(r)) };
 }
 
 // Shared by ordinary persistence and staged recovery. Receipt ownership is
@@ -102,7 +115,7 @@ function projectIdleEvidence(runId, reservations, evidence) {
 // compaction_continue marker. Text alone is never a lineage witness.
 const COMPACTION_CONTINUE = 'Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.';
 const COMPACTION_OVERFLOW = "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n";
-export function createDispatchBindings({ store, runner, bindings, client }) {
+export function createDispatchBindings({ store, runner, bindings, client, getSubagentDepth = () => 2 }) {
   const records = new Map();
   const parents = new Map();
   const tails = new Map();
@@ -172,24 +185,68 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
   function current(binding) {
     if (!owns(binding)) return false;
     const state = store.getRun(binding.runId);
+    if (binding.nested) {
+      const parent = bindings.get(binding.callerSessionId);
+      if (!parent || parent.nested || parent.dispatchId !== binding.callerDispatchId || !current(parent)) return false;
+    }
     return !binding.settlementOnly && state.status === 'RUNNING' && (!binding.nodeId || state.nodes[binding.nodeId]?.state === 'RUNNING');
   }
 
-  async function admit(rootSessionId, callID, args, desiredNodeId = null) {
-    const root = bindings.get(rootSessionId);
-    if (!root?.root) return denied('NOT_GRAPH_SESSION', 'task dispatch requires the root orchestrator');
+  // A missing binding is not a free-role identity. Authenticate host parentage
+  // AND this run's ownership before reserving a fallback continuation. Native
+  // call metadata plus the durable admission ledger can survive history eviction.
+  async function rootContinuationOwned(state, sessionId, agent) {
+    if (!identityString(sessionId) || !client?.session?.get) return false;
+    const signal = AbortSignal.timeout(2000);
+    try {
+      const info = (await client.session.get({ path: { id: sessionId }, signal })).data;
+      if (info?.id !== sessionId || info.parentID !== state.rootSessionId
+        || info.agent !== undefined && info.agent !== agent) return false;
+      const partition = partitionReservations(state);
+      if ([...partition.restored, ...partition.settled].some((r) => !r.nested && r.bound
+        && r.sessionId === sessionId && r.agent === agent && callerOf(r) === state.rootSessionId)) return true;
+      if (!client.session.messages) return false;
+      const messages = (await client.session.messages({ path: { id: state.rootSessionId }, query: { limit: 64 }, signal })).data;
+      const admitted = new Set(state.dispatchCallIds ?? []);
+      return (Array.isArray(messages) ? messages.slice(-64) : []).some((message) =>
+        (Array.isArray(message.parts) ? message.parts.slice(0, 256) : []).some((part) =>
+          part?.type === 'tool' && part.tool === 'task' && part.sessionID === state.rootSessionId
+          && admitted.has(key(part.sessionID, part.callID)) && part.state?.input?.subagent_type === agent
+          && part.state?.metadata?.parentSessionId === state.rootSessionId && part.state?.metadata?.sessionId === sessionId));
+    } catch { return false; }
+  }
+
+  async function admit(callerSessionId, callID, args, desiredNodeId = null) {
+    const root = bindings.get(callerSessionId);
+    if (!root) return denied('NOT_GRAPH_SESSION', 'task dispatch requires an authenticated graph binding');
+    const nested = !root.root;
     const agent = args?.subagent_type;
     const targetDecision = resolveNodeIdHint(args, desiredNodeId, { strict: TARGET_REQUIRED_AGENTS.has(agent) });
     if (!targetDecision.allowed) return targetDecision;
     const target = targetDecision.nodeId;
-    if (target === null && TARGET_REQUIRED_AGENTS.has(agent)) {
+    if (target === null && TARGET_REQUIRED_AGENTS.has(agent) && (args.task_id !== undefined || nested)) {
+      // Strict-target roles keep an explicit marker for continuations (the
+      // session's prior node is an identity, not a fresh choice) and for
+      // nested callers. A fresh root dispatch may fall through to the
+      // runner's unique-admissible auto-resolve inside the lock.
       return denied('NODE_ID_REQUIRED', `${agent} requires an explicit nodeId for every dispatch, including task_id continuations and single-node graphs; put [nodeId:target-node] alone on the first prompt line`);
     }
     return exclusive(root.runId, async () => {
       const state = store.getRun(root.runId);
       if (!state) return denied('RUN_GONE', 'owning run is unavailable');
+      const rootSessionId = state.rootSessionId;
+      if (bindings.get(callerSessionId) !== root || nested && (!NESTED_CALLERS.has(root.agent) || !current(root))) {
+        return denied('BINDING_UNAVAILABLE', 'nested consultation requires an active authenticated specialist dispatch');
+      }
+      if (nested && (agent !== 'graph-multimodal' || target !== null || args.nodeId !== undefined || /\[nodeId:/i.test(args.prompt ?? ''))) {
+        return denied('NESTED_CONSULT_ONLY', 'specialists may only consult graph-multimodal without node markers');
+      }
       if (hasRecoveryIssues(state)) return denied('DISPATCH_RECOVERY_UNRESOLVED', 'unrestorable outstanding lifetimes remain; inspection preserves their original evidence');
-      const recordKey = key(rootSessionId, callID);
+      const depthLimit = getSubagentDepth();
+      if (!Number.isSafeInteger(depthLimit) || depthLimit < (nested ? 2 : 1)) {
+        return denied('SUBAGENT_DEPTH_LIMIT', `native subagent_depth must be at least ${nested ? 2 : 1} for this dispatch; respect the configured limit and report it, or change host configuration and restart`);
+      }
+      const recordKey = key(callerSessionId, callID);
       const turnToken = randomUUID();
       const used = state.dispatchCallIds ?? [];
       const previousCallIds = state.dispatchCallIds;
@@ -206,10 +263,35 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       if (typeof callID !== 'string' || !callID.length || callID.length > 256 || used.includes(recordKey)) return denied('DUPLICATE_DISPATCH', 'a unique host callID is required, including after recovery');
       if (used.length >= 900) return denied('DISPATCH_LIMIT', 'run dispatch history reached its persistence-safe limit');
       if ([...records.values()].filter((r) => r.runId === root.runId).length >= 128) return denied('DISPATCH_LIMIT', 'too many outstanding task calls');
+      // Nested continuations require durable exact-generation provenance, even
+      // after settlement. Never use the root free-role identity fallback here.
+      const prior = args.task_id === undefined ? null : [...records.values(), ...(state.settledDispatches ?? [])]
+        .filter((r) => r.runId === state.runId && r.sessionId === args.task_id).at(-1);
+      if (args.task_id !== undefined && (nested ? !prior?.nested || prior.nodeId !== null
+        || prior.callerSessionId !== callerSessionId || prior.callerDispatchId !== root.dispatchId
+        || previousBinding && previousBinding.runId !== state.runId : prior?.nested || previousBinding?.nested)) {
+        return denied('TASK_CALLER_MISMATCH', 'task_id must belong to this caller and exact dispatch generation; use a fresh consultation');
+      }
+      if (nested) {
+        const decision = runner.admitDispatch(state, { agent, now: NOW(), consultOnly: true });
+        if (!decision.allowed) return decision;
+        if ([...records.values()].some((r) => r.runId === state.runId && r.nested)) {
+          return denied('NESTED_CONSULT_CAPACITY', 'one nested consultation is outstanding in this run; do not spin or wait on yourself; use available evidence or report the limitation');
+        }
+        const record = { runId: state.runId, rootSessionId, callerSessionId, callerDispatchId: root.dispatchId, nested: true,
+          callID, agent, turnToken, nodeId: null, dispatchId: randomUUID(), sessionId: args.task_id ?? null,
+          bound: false, continuation: args.task_id !== undefined, acknowledged: false, idleSeen: false, terminal: false,
+          planVersion: state.artifacts.plan?.version ?? 0 };
+        records.set(recordKey, record);
+        recordDispatch();
+        try { await persist(state, undefined, {}, true); }
+        catch { return failedReservation(); }
+        if (args.task_id) bindings.delete(args.task_id);
+        return { ...decision, nested: true, turnToken };
+      }
       // Selective repair revokes authority without ending host lifetimes. Both
       // fresh dispatch and task_id replacement wait for old calls AND effects.
-      if (target && ([...records.values()].some((r) => r.runId === root.runId && r.nodeId === target && r.repairRevoked)
-        || (state.pendingEffects ?? []).some((effect) => effect.nodeId === target && effect.repairRevoked))) {
+      if (target && repairSettlementPending(state, target)) {
         return denied('REPAIR_SETTLEMENT_PENDING', `${target} has revoked host lifetimes or pending effects; wait for exact terminal/effect settlement before replacement`);
       }
       // A free-role continuation keeps the session identity: round-1
@@ -229,14 +311,19 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
           const resumed = Object.values(state.nodes).find((node) => node.sessionId === args.task_id
             && node.spec.agent === agent && ['PENDING', 'INCOMPLETE', 'STALE'].includes(node.state));
           if (resumed) previous = { runId: root.runId, agent, nodeId: resumed.spec.id, sessionId: args.task_id, root: false, active: false };
-          else if (CONTINUABLE_ROLES.has(agent)) continuationSession = args.task_id; // identity unverifiable here (e.g. the binding was invalidated after a plan submission); parentage is re-verified before the reservation binds
+          else if (CONTINUABLE_ROLES.has(agent)) {
+            if (!await rootContinuationOwned(state, args.task_id, agent)) {
+              return denied('TASK_CALLER_MISMATCH', 'task_id lacks authenticated native parentage and ownership in this run; use a fresh session');
+            }
+            continuationSession = args.task_id;
+          }
         }
         const sameRole = previous && !previous.root && previous.runId === root.runId && previous.agent === agent;
         if (sameRole && previous.nodeId && target !== null && target !== previous.nodeId) {
           return denied('TASK_NODE_MISMATCH', `requested node ${target} conflicts with this task_id's node ${previous.nodeId}; continue ${previous.nodeId} with its matching marker, or dispatch ${target} with its own session or a fresh session`);
         }
         if (sameRole && current(previous)) {
-          records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent, turnToken,
+          records.set(recordKey, { runId: root.runId, rootSessionId, callerSessionId, callID, agent, turnToken,
             nodeId: previous.nodeId, dispatchId: previous.dispatchId, sessionId: args.task_id,
             bound: true, continuation: true, acknowledged: false, idleSeen: false, terminal: false,
             planVersion: state.artifacts.plan?.version ?? 0 });
@@ -260,7 +347,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
                 `${previous.nodeId} cannot be continued in this session: ${decision.detail}`);
             }
             const dispatchId = randomUUID();
-            records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent, turnToken,
+            records.set(recordKey, { runId: root.runId, rootSessionId, callerSessionId, callID, agent, turnToken,
               nodeId: previous.nodeId, dispatchId, sessionId: args.task_id,
               bound: false, continuation: true, resumed: true, acknowledged: false, idleSeen: false, terminal: false,
               planVersion: state.artifacts.plan?.version ?? 0 });
@@ -284,7 +371,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       // work reaches here — active-attempt continuations returned above.
       if (READ_CONSULT_AGENTS.has(agent)) {
         const capacity = runner.readerCapacity(state);
-        const freeInFlight = [...records.values()].filter((r) => r.runId === root.runId && READ_CONSULT_AGENTS.has(r.agent) && !r.terminal && (!r.nodeId || r.settlementOnly)).length;
+        const freeInFlight = [...records.values()].filter((r) => r.runId === root.runId && !r.nested && READ_CONSULT_AGENTS.has(r.agent) && !r.terminal && (!r.nodeId || r.settlementOnly)).length;
         const nodeInFlight = Object.values(state.nodes).filter((node) => (node.spec.kind === 'explore' || node.spec.kind === 'analyze') && node.state === 'RUNNING').length;
         if (freeInFlight + nodeInFlight >= capacity) {
           return denied('READER_CAPACITY', `${freeInFlight + nodeInFlight}/${capacity} read-only exploration/analysis tasks are in flight; wait for one to finish before dispatching another`);
@@ -306,7 +393,8 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       } else if (reserved.size > 0) {
         return denied('DISPATCH_PENDING', 'a task for this role is reserved and awaiting host session binding');
       }
-      const decision = runner.admitDispatch(state, { agent, now: NOW(), nodeId: target, excludeNodeIds: reserved });
+      const decision = runner.admitDispatch(state, { agent, now: NOW(), nodeId: target, excludeNodeIds: reserved,
+        autoResolveUnique: target === null && TARGET_REQUIRED_AGENTS.has(agent) });
       if (!decision.allowed) {
         // A sorted pick that found nothing because every candidate is already
         // reserved is a pending reservation, not a missing graph.
@@ -318,9 +406,10 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
         if (decision.code !== 'NODE_NOT_FOUND') await persist(state);
         return decision;
       }
-      records.set(recordKey, { runId: root.runId, rootSessionId, callID, agent, turnToken, nodeId: decision.nodeId,
+      records.set(recordKey, { runId: root.runId, rootSessionId, callerSessionId, callID, agent, turnToken, nodeId: decision.nodeId,
         dispatchId: randomUUID(), sessionId: continuationSession, bound: false, continuation: continuationSession !== null,
         resumed: continuationSession !== null, acknowledged: false, idleSeen: false, terminal: false, targeted: target !== null,
+        autoResolved: decision.resolvedBy === 'unique-admissible',
         planVersion: state.artifacts.plan?.version ?? 0 });
       if (continuationSession) bindings.delete(continuationSession); // the stale free binding must not block the fresh one
       recordDispatch();
@@ -339,8 +428,10 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     // the overwrite. An active binding still refuses the collision.
     const established = bindings.get(record.sessionId);
     if (!state || !record.settlementOnly && (!['RUNNING', 'AWAITING_USER_DECISION'].includes(state.status) || (state.artifacts.plan?.version ?? 0) !== record.planVersion)
-      || parents.get(record.sessionId) !== record.rootSessionId || (established && established.active !== false)) return;
-    const settlementOnly = record.settlementOnly === true || state.status === 'AWAITING_USER_DECISION' && !record.started && !!record.nodeId;
+      || parents.get(record.sessionId) !== callerOf(record) || (established && established.active !== false)) return;
+    const parent = bindings.get(record.callerSessionId);
+    const settlementOnly = record.settlementOnly === true || record.nested && (!current(parent) || parent.dispatchId !== record.callerDispatchId)
+      || state.status === 'AWAITING_USER_DECISION' && !record.started && !!record.nodeId;
     if (record.nodeId && !record.settlementOnly) {
       const node = state.nodes[record.nodeId];
       if (settlementOnly) {
@@ -370,7 +461,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     }
     // Binding proves ownership, not that the native queued prompt has ended.
     bindings.set(record.sessionId, { runId: record.runId, root: false, agent: record.agent,
-      nodeId: record.nodeId, sessionId: record.sessionId, dispatchId: record.dispatchId, active: true, settlementOnly });
+      nodeId: record.nodeId, sessionId: record.sessionId, dispatchId: record.dispatchId, active: true, settlementOnly, ...provenance(record) });
     await consumeIdle(record.sessionId);
     if (record.terminal && ![...records.values()].some((r) => r.sessionId === record.sessionId && !r.terminal && !r.idleSeen)) await finish(record.sessionId, record.dispatchId);
   }
@@ -379,11 +470,11 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     if (typeof info?.id !== 'string' || typeof info.parentID !== 'string') return;
     if (parents.has(info.id) && parents.get(info.id) !== info.parentID) return;
     parents.set(info.id, info.parentID);
-    const root = bindings.get(info.parentID);
-    if (!root?.root) return;
-    await exclusive(root.runId, async () => {
+    const runId = runForSession(info.parentID) ?? [...records.values()].find((r) => callerOf(r) === info.parentID)?.runId;
+    if (!runId) return;
+    await exclusive(runId, async () => {
       for (const record of records.values()) {
-        if (record.rootSessionId === info.parentID && record.sessionId === info.id) await bind(record);
+        if (callerOf(record) === info.parentID && record.sessionId === info.id) await bind(record);
       }
     });
   }
@@ -404,8 +495,16 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     }
     // Always retry persistence before releasing the lifetime, including when
     // an earlier save failed after mutating the node in memory.
-    const settledDispatches = [...(state.settledDispatches ?? []).filter((r) => !ended(r)), ...completed].slice(-128);
-    await persist(state, ended, { settledDispatches });
+    const history = [...(state.settledDispatches ?? []).filter((r) => !ended(r)), ...completed];
+    const pinned = new Set([...records.values()].filter((r) => r.runId === state.runId && r.nested).map((r) => r.callerDispatchId));
+    const kept = history.filter((r) => pinned.has(r.dispatchId));
+    const settledDispatches = [...kept, ...history.filter((r) => !pinned.has(r.dispatchId)).slice(-(128 - kept.length))];
+    const dependent = (r) => r.runId === state.runId && r.nested && r.callerSessionId === sessionId && r.callerDispatchId === dispatchId;
+    const dispatchReservations = [...records.values()].filter((r) => r.runId === state.runId && !ended(r))
+      .map((r) => dependent(r) ? { ...r, settlementOnly: true } : { ...r });
+    await persist(state, ended, { settledDispatches, dispatchReservations });
+    for (const r of records.values()) if (dependent(r)) r.settlementOnly = true;
+    for (const b of bindings.values()) if (dependent(b)) b.settlementOnly = true;
     if (binding?.runId === owner.runId && binding.dispatchId === dispatchId) {
       binding.active = false;
       binding.settled = true;
@@ -418,7 +517,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     const lifetimes = [...records.values()].filter((r) => r.sessionId === sessionId);
     if (!lifetimes.some((r) => r.bound || r.settlementOnly)) return;
     const state = store.getRun(lifetimes[0].runId);
-    await refreshTurns(sessionId, lifetimes[0].rootSessionId, observed);
+    await refreshTurns(sessionId, callerOf(lifetimes[0]), observed);
     for (const dispatchId of new Set(lifetimes.map((r) => r.dispatchId))) {
       const calls = lifetimes.filter((r) => r.dispatchId === dispatchId);
       // Neither cached terminal flags nor sibling calls can retire a lifetime
@@ -434,13 +533,13 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       const pendingEffects = (state.pendingEffects ?? []).some((effect) => effect.sessionId === sessionId);
       if (!accounted || pendingEffects && !calls.every((r) => r.terminal)) {
         if (calls.some((r) => {
-          const saved = state.dispatchReservations?.find((entry) => entry.callID === r.callID);
+          const saved = state.dispatchReservations?.find((entry) => callerOf(entry) === callerOf(r) && entry.callID === r.callID);
           return saved?.idleSeen !== r.idleSeen || saved?.acknowledged !== r.acknowledged || saved?.terminal !== r.terminal;
         })) await persist(state);
         continue;
       }
       if (!calls.every((r) => r.terminal)) {
-        const idle = client?.session?.status ? await hostIsIdle(sessionId, calls[0].rootSessionId) : pending.length > 0;
+        const idle = client?.session?.status ? await hostIsIdle(sessionId, callerOf(calls[0])) : pending.length > 0;
         if (!idle) continue;
       }
       await finish(sessionId, dispatchId);
@@ -472,9 +571,9 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     return a.info.time.created - b.info.time.created || (a.info.id < b.info.id ? -1 : a.info.id > b.info.id ? 1 : 0);
   }
 
-  function captureTurns(sessionId, rootSessionId, messages, scan, promptMessage = null) {
+  function captureTurns(sessionId, callerSessionId, messages, scan, promptMessage = null) {
     let changed = false;
-    const mine = [...records.values()].filter((r) => r.rootSessionId === rootSessionId && (!r.sessionId || r.sessionId === sessionId) && r.turnToken);
+    const mine = [...records.values()].filter((r) => callerOf(r) === callerSessionId && (!r.sessionId || r.sessionId === sessionId) && r.turnToken);
     const validMessage = (m) => m?.info?.sessionID === sessionId && typeof m.info.id === 'string'
       && m.info.id.length <= 256 && Array.isArray(m.parts) && m.parts.length <= 256
       && m.parts.every((p) => p.sessionID === sessionId && p.messageID === m.info.id);
@@ -598,20 +697,20 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     return changed;
   }
 
-  async function refreshTurns(sessionId, rootSessionId, observed = null, fromPrompt = false) {
+  async function refreshTurns(sessionId, callerSessionId, observed = null, fromPrompt = false) {
     const signal = AbortSignal.timeout(2000);
     let messages = [];
     let scan = [];
     if (client?.session?.get && client?.session?.messages) {
       try {
         const info = (await client.session.get({ path: { id: sessionId }, signal })).data;
-        if (info?.id !== sessionId || info.parentID !== rootSessionId) return;
-        parents.set(sessionId, rootSessionId);
+        if (info?.id !== sessionId || info.parentID !== callerSessionId) return;
+        parents.set(sessionId, callerSessionId);
         const response = (await client.session.messages({ path: { id: sessionId }, query: { limit: 64 }, signal })).data;
         if (Array.isArray(response)) { scan = response.slice(-64); messages = [...scan]; }
       } catch { /* No scan result is not proof of completion. */ }
     }
-    if (parents.get(sessionId) !== rootSessionId) return;
+    if (parents.get(sessionId) !== callerSessionId) return;
     // The page was read after an exact lookup and may contain a newer summary
     // or completed part. Do not replace it with an older observed snapshot.
     if (observed && !messages.some((m) => m.info?.id === observed.info?.id)) messages.push(observed);
@@ -622,11 +721,11 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
         if (parent?.info?.id === observed.info.parentID && parent.info.sessionID === sessionId) messages.push(parent);
       } catch { /* A missing parent cannot authenticate this turn. */ }
     }
-    const mine = [...records.values()].filter((r) => r.rootSessionId === rootSessionId && r.sessionId === sessionId);
-    const candidates = [...records.values()].filter((r) => r.rootSessionId === rootSessionId && (!r.sessionId || r.sessionId === sessionId));
+    const mine = [...records.values()].filter((r) => callerOf(r) === callerSessionId && r.sessionId === sessionId);
+    const candidates = [...records.values()].filter((r) => callerOf(r) === callerSessionId && (!r.sessionId || r.sessionId === sessionId));
     if (!candidates.length) return;
     const before = candidates.map((record) => [record, structuredClone(record)]);
-    const changed = captureTurns(sessionId, rootSessionId, messages, scan, fromPrompt ? observed : null);
+    const changed = captureTurns(sessionId, callerSessionId, messages, scan, fromPrompt ? observed : null);
     const state = store.getRun(candidates[0].runId);
     const unsaved = mine.some((record) => {
       const saved = state.dispatchReservations?.find((r) => r.callID === record.callID && r.dispatchId === record.dispatchId);
@@ -654,7 +753,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       try {
         const session = (await client.session.get({ path: { id: info.sessionID }, signal: AbortSignal.timeout(2000) })).data;
         const root = bindings.get(session?.parentID);
-        if (session?.id === info.sessionID && root?.root) {
+        if (session?.id === info.sessionID && root) {
           parents.set(info.sessionID, session.parentID);
           runId = root.runId;
         }
@@ -668,8 +767,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
         catch { return; }
         if (message?.info?.id !== info.id || message.info.sessionID !== info.sessionID) return;
       }
-      const state = store.getRun(runId);
-      await refreshTurns(info.sessionID, state.rootSessionId, message, fromPrompt);
+      await refreshTurns(info.sessionID, parents.get(info.sessionID), message, fromPrompt);
       await consumeIdle(info.sessionID);
     });
   }
@@ -683,12 +781,12 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     if (runId) await exclusive(runId, () => consumeIdle(sessionId));
   }
 
-  async function hostIsIdle(sessionId, rootSessionId) {
+  async function hostIsIdle(sessionId, callerSessionId) {
     if (!client?.session?.get || !client?.session?.status) return false;
     const signal = AbortSignal.timeout(2000);
     try {
       const info = (await client.session.get({ path: { id: sessionId }, signal })).data;
-      if (info?.id !== sessionId || info.parentID !== rootSessionId) return false;
+      if (info?.id !== sessionId || info.parentID !== callerSessionId) return false;
       const statuses = (await client.session.status({ signal })).data;
       if (!statuses || typeof statuses !== 'object' || Array.isArray(statuses)) return false;
       // The native active-status map can omit idle sessions; the successful
@@ -712,10 +810,10 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     // The host call key is authoritative. Optional metadata may strengthen
     // it, but contradictory identity must never retire that call's owner.
     if (part.state?.input?.subagent_type !== undefined && part.state.input.subagent_type !== record.agent
-      || meta?.parentSessionId !== undefined && meta.parentSessionId !== record.rootSessionId
+      || meta?.parentSessionId !== undefined && meta.parentSessionId !== callerOf(record)
       || record.sessionId && meta?.sessionId !== undefined && meta.sessionId !== record.sessionId) return;
     if ((part.state?.status === 'running' || part.state?.status === 'completed' && meta?.background === true) && typeof meta?.sessionId === 'string'
-      && meta.parentSessionId === record.rootSessionId && part.state.input?.subagent_type === record.agent) {
+      && meta.parentSessionId === callerOf(record) && part.state.input?.subagent_type === record.agent) {
       if (record.sessionId && record.sessionId !== meta.sessionId) return;
       record.sessionId = meta.sessionId;
       record.background = meta.background === true;
@@ -741,7 +839,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
 
   async function onIdle(sessionId, eventId) {
     const binding = bindings.get(sessionId);
-    const runId = binding?.runId ?? bindings.get(parents.get(sessionId))?.runId;
+    const runId = runForSession(sessionId);
     if (!runId || binding?.root) return;
     await exclusive(runId, async () => {
       const state = store.getRun(runId);
@@ -753,6 +851,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       const identity = createHash('sha256').update(key(sessionId, typeof eventId === 'string' ? eventId : 'legacy-idle')).digest('hex');
       if (seen.has(identity)) { await persist(state); await consumeIdle(sessionId); return; }
       const candidates = [...records.values()].filter((r) => r.runId === runId && !r.terminal && !r.idleSeen
+        && (!parents.has(sessionId) || callerOf(r) === parents.get(sessionId))
         && (r.sessionId === sessionId || !r.sessionId && !r.continuation));
       if (!candidates.length) { await consumeIdle(sessionId); return; }
       seen.add(identity);
@@ -779,7 +878,9 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
   // Save the candidate graph and revoked ledger before changing live authority.
   async function revokeExecution(state, { nodeIds = null } = {}) {
     const selected = nodeIds === null ? null : new Set(nodeIds);
-    const affected = (r) => r.runId === state.runId && (selected === null || selected.has(r.nodeId));
+    const owners = new Set([...records.values(), ...(state.settledDispatches ?? [])]
+      .filter((r) => r.runId === state.runId && (selected === null || selected.has(r.nodeId))).map((r) => r.dispatchId));
+    const affected = (r) => r.runId === state.runId && (selected === null || selected.has(r.nodeId) || r.nested && owners.has(r.callerDispatchId));
     const revoked = (r) => affected(r) ? { ...r, settlementOnly: true, ...(selected ? { repairRevoked: true } : {}) } : { ...r };
     const dispatchReservations = [...records.values()].filter((r) => r.runId === state.runId).map(revoked);
     await persist(state, undefined, { dispatchReservations,
@@ -790,6 +891,14 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
   }
 
   function invalidate(runId) {
+    // A restart/resume cannot erase a nested lifetime or its lineage witness.
+    if ([...records.values()].some((r) => r.runId === runId && r.nested)) {
+      for (const r of records.values()) if (r.runId === runId) r.settlementOnly = true;
+      for (const b of bindings.values()) if (b.runId === runId && !b.root) b.settlementOnly = true;
+      const state = store.getRun(runId);
+      if (state) state.dispatchReservations = [...records.values()].filter((r) => r.runId === runId).map((r) => ({ ...r }));
+      return;
+    }
     for (const [id, record] of records) if (record.runId === runId) records.delete(id);
     const state = store.getRun(runId);
     if (state) { state.dispatchReservations = []; state.pendingIdleEvidence = []; }
@@ -798,20 +907,29 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
   }
 
   function managed(sessionId) {
-    return bindings.has(sessionId) || bindings.get(parents.get(sessionId))?.root === true
-      // Lookup failure is not evidence that an unknown session is unmanaged.
-      || !parents.has(sessionId) && [...bindings.values()].some((binding) => binding.root);
+    if (runForSession(sessionId) !== null) return true;
+    const seen = new Set();
+    for (let id = sessionId; typeof id === 'string' && !seen.has(id) && seen.size < 32; id = parents.get(id)) {
+      seen.add(id);
+      if (parents.get(id) === null) return false;
+    }
+    // Only a complete host-verified native ancestry can exempt a descendant.
+    return [...bindings.values()].some((binding) => binding.root);
   }
 
   // Read-only lookup: which run does a session belong to? Managed children
   // without their own binding (rejected or finished dispatches) resolve
   // through the host-verified parent chain to the root orchestrator's run.
   function runForSession(sessionId) {
-    const binding = bindings.get(sessionId);
-    if (binding) return binding.runId;
-    const parent = parents.get(sessionId);
-    const rootBinding = parent === undefined ? undefined : bindings.get(parent);
-    return rootBinding?.root === true ? rootBinding.runId : null;
+    const seen = new Set();
+    for (let id = sessionId; typeof id === 'string' && !seen.has(id) && seen.size < 32; id = parents.get(id)) {
+      seen.add(id);
+      const binding = bindings.get(id);
+      if (binding) return binding.runId;
+      const record = [...records.values()].find((r) => r.sessionId === id);
+      if (record) return record.runId;
+    }
+    return null;
   }
 
   async function resolveSession(sessionId) {
@@ -828,8 +946,19 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       const response = await client.session.get({ path: { id: sessionId }, signal });
       const info = response.data;
       if (info?.id !== sessionId) return false;
+      if (info.parentID != null && !identityString(info.parentID)) return false;
+      if (parents.has(sessionId) && parents.get(sessionId) !== (info.parentID ?? null)) return false;
       parents.set(sessionId, typeof info.parentID === 'string' ? info.parentID : null);
-      if (!bindings.get(info.parentID)?.root) return false;
+      const visited = new Set([sessionId]);
+      for (let parent = info.parentID; typeof parent === 'string' && !runForSession(parent); parent = parents.get(parent)) {
+        if (visited.has(parent) || visited.size >= 32) return false;
+        visited.add(parent);
+        if (parents.has(parent)) continue;
+        const ancestor = (await client.session.get({ path: { id: parent }, signal })).data;
+        if (ancestor?.id !== parent || ancestor.parentID != null && !identityString(ancestor.parentID)) return false;
+        parents.set(parent, ancestor.parentID ?? null);
+      }
+      if (!runForSession(info.parentID)) return false;
       await onSession(info);
       const messages = await client.session.messages({ path: { id: info.parentID }, query: { limit: 64 }, signal });
       if (!Array.isArray(messages.data)) return false;
@@ -861,7 +990,8 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       : hasRecoveryIssues(state) ? [{ code: 'INVALID_RECOVERY_ISSUES' }] : [];
     return [...[...records.values()].filter((r) => r.runId === runId).map((r) => ({
       callID: r.callID, nodeId: r.nodeId, agent: r.agent, sessionId: r.sessionId, bound: r.bound, continuation: r.continuation,
-      resumed: r.resumed === true, targeted: r.targeted === true,
+      callerSessionId: callerOf(r), nested: r.nested === true, ...(r.nested ? { callerDispatchId: r.callerDispatchId } : {}),
+      resumed: r.resumed === true, targeted: r.targeted === true, autoResolved: r.autoResolved === true,
       ...(r.repairRevoked ? { repairRevoked: true } : {}),
       ...(r.settlementOnly ? { settlementOnly: true } : {}),
       ...(r.recoveryBlocked ? { recoveryBlocked: r.recoveryBlocked } : {}),
@@ -878,7 +1008,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
   // must also survive a restart BEFORE the replacement graph reaches a pause.
   async function recoverPaused(state) {
     const paused = state.status === 'AWAITING_USER_DECISION';
-    if (!paused && !hasRecoveryIssues(state) && !state.dispatchReservations?.some((r) => r?.settlementOnly)) return;
+    if (!paused && !hasRecoveryIssues(state) && !state.dispatchReservations?.some((r) => r?.settlementOnly || r?.nested)) return;
     const idleEventIds = [...new Set((state.idleEventIds ?? []).slice(-256))];
     const recoveryRecords = new Map();
     const recoveryBindings = new Map();
@@ -909,7 +1039,7 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
     const dispatchOrder = new Map();
     for (const record of [...restored, ...settled]) {
       if (record.runId !== state.runId || record.rootSessionId !== state.rootSessionId) continue;
-      const order = callOrder.get(key(record.rootSessionId, record.callID));
+      const order = callOrder.get(key(callerOf(record), record.callID));
       if (order !== undefined && order > (dispatchOrder.get(record.dispatchId) ?? -1)) dispatchOrder.set(record.dispatchId, order);
     }
     const exactOwner = (identity) => {
@@ -932,14 +1062,14 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
         if (exact === existingExact && order <= (dispatchOrder.get(existing.dispatchId) ?? -1)) return;
       }
       recoveryBindings.set(record.sessionId, { runId: record.runId, root: false, agent: record.agent, nodeId: record.nodeId,
-        sessionId: record.sessionId, dispatchId: record.dispatchId, active, ...(!active ? { settled: true } : {}), settlementOnly: record.settlementOnly === true });
+        sessionId: record.sessionId, dispatchId: record.dispatchId, active, ...(!active ? { settled: true } : {}), settlementOnly: record.settlementOnly === true, ...provenance(record) });
     }
     for (const record of restored) {
-      const recordKey = key(record.rootSessionId, record.callID);
+      const recordKey = key(callerOf(record), record.callID);
       recoveryRecords.set(recordKey, { ...record });
       if (record.sessionId && (record.bound || record.started)) {
-        if (parentFor(record.sessionId) !== undefined && parentFor(record.sessionId) !== state.rootSessionId) continue;
-        recoveryParents.set(record.sessionId, record.rootSessionId);
+        if (parentFor(record.sessionId) !== undefined && parentFor(record.sessionId) !== callerOf(record)) continue;
+        recoveryParents.set(record.sessionId, callerOf(record));
         restoreBinding(record, true);
         recoveryRecords.get(recordKey).bound = true;
       }
@@ -952,11 +1082,12 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       if (evidence.runId !== state.runId || evidence.rootSessionId !== state.rootSessionId
         || typeof evidence.sessionId !== 'string' || !Array.isArray(evidence.owners)) continue;
       const owners = evidence.owners.slice(0, 128).filter((owner) => {
-        const record = recoveryRecords.get(key(state.rootSessionId, owner.callID));
+        const record = [...recoveryRecords.values()].find((r) => r.callID === owner.callID && r.dispatchId === owner.dispatchId);
         return record?.dispatchId === owner.dispatchId && (!record.sessionId || record.sessionId === evidence.sessionId);
       });
-      if (!owners.length || parentFor(evidence.sessionId) !== undefined && parentFor(evidence.sessionId) !== state.rootSessionId) continue;
-      recoveryParents.set(evidence.sessionId, state.rootSessionId);
+      const caller = [...recoveryRecords.values()].find((r) => owners.some((o) => o.dispatchId === r.dispatchId && o.callID === r.callID));
+      if (!owners.length || !caller || parentFor(evidence.sessionId) !== undefined && parentFor(evidence.sessionId) !== callerOf(caller)) continue;
+      recoveryParents.set(evidence.sessionId, callerOf(caller));
       const pending = recoveryIdle.get(evidence.sessionId) ?? [];
       if (!pending.some((entry) => entry.identity === evidence.identity)) pending.push({ ...evidence, owners });
       recoveryIdle.set(evidence.sessionId, pending);
@@ -994,23 +1125,25 @@ export function createDispatchBindings({ store, runner, bindings, client }) {
       if (bindings.get(sessionId)?.runId === state.runId) await consumeIdle(sessionId);
     }
     if (client?.session?.messages) {
-      let messages;
-      try { messages = (await client.session.messages({ path: { id: state.rootSessionId }, query: { limit: 64 }, signal: AbortSignal.timeout(2000) })).data; }
-      catch { messages = null; }
-      for (const message of Array.isArray(messages) ? messages.slice(-64) : []) {
-        for (const part of Array.isArray(message.parts) ? message.parts.slice(0, 256) : []) {
-          if (part?.type !== 'tool' || part.tool !== 'task' || part.sessionID !== state.rootSessionId) continue;
-          const recordKey = key(part.sessionID, part.callID);
-          const record = records.get(recordKey);
-          if (!record || record.runId !== state.runId) continue;
-          const sessionId = part.state?.metadata?.sessionId;
-          if (typeof sessionId === 'string' && !parents.has(sessionId) && client.session.get) {
-            try {
-              const info = (await client.session.get({ path: { id: sessionId }, signal: AbortSignal.timeout(2000) })).data;
-              if (info?.id === sessionId && info.parentID === state.rootSessionId) parents.set(sessionId, info.parentID);
-            } catch { /* Unknown parentage remains unbound and cannot execute. */ }
+      for (const callerSessionId of new Set([state.rootSessionId, ...restored.map(callerOf)])) {
+        let messages;
+        try { messages = (await client.session.messages({ path: { id: callerSessionId }, query: { limit: 64 }, signal: AbortSignal.timeout(2000) })).data; }
+        catch { messages = null; }
+        for (const message of Array.isArray(messages) ? messages.slice(-64) : []) {
+          for (const part of Array.isArray(message.parts) ? message.parts.slice(0, 256) : []) {
+            if (part?.type !== 'tool' || part.tool !== 'task' || part.sessionID !== callerSessionId) continue;
+            const recordKey = key(part.sessionID, part.callID);
+            const record = records.get(recordKey);
+            if (!record || record.runId !== state.runId) continue;
+            const sessionId = part.state?.metadata?.sessionId;
+            if (typeof sessionId === 'string' && !parents.has(sessionId) && client.session.get) {
+              try {
+                const info = (await client.session.get({ path: { id: sessionId }, signal: AbortSignal.timeout(2000) })).data;
+                if (info?.id === sessionId && info.parentID === callerSessionId) parents.set(sessionId, info.parentID);
+              } catch { /* Unknown parentage remains unbound and cannot execute. */ }
+            }
+            await applyPart(part, recordKey, record);
           }
-          await applyPart(part, recordKey, record);
         }
       }
     }

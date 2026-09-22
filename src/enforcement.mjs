@@ -11,12 +11,13 @@ import { createDispatchBindings } from './dispatch-bindings.mjs';
 import { parseNodeIdHint, TARGET_REQUIRED_AGENTS } from './dispatch-target.mjs';
 import { formatLessonsBlock } from './lessons.mjs';
 import { assertSettlementCapacity, isUncertainEffect } from './runner.mjs';
+import { isConfiguredMcpTool, toolPermission } from './tool-permissions.mjs';
 
 const READ_ONLY_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-multimodal']);
 // Tools that never mutate run state or the workspace stay available to graph
 // children even when their dispatch binding is gone (rejected dispatch, idle
 // session, terminated run). Write paths keep failing closed.
-const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'list', 'skill', 'graph_status', 'graph_inspect', 'graph_journal_search', 'graph_journal_read', 'graph_lesson_search', 'graph_lesson_read']);
+const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'list', 'skill', 'lsp', 'graph_status', 'graph_inspect', 'graph_journal_search', 'graph_journal_read', 'graph_lesson_search', 'graph_lesson_read']);
 const NOW = () => new Date().toISOString();
 
 function rejectionPrompt(decision) {
@@ -94,14 +95,14 @@ function learningsPrompt(state) {
   return `[RUNNER] Explorer learnings (incorporate these; re-validate against current state before relying on them):\n${lines.join('\n')}`;
 }
 
-export function createEnforcement({ settings, store, runner, bindings, client, dispatches = createDispatchBindings({ store, runner, bindings, client }), lessons = null }) {
+export function createEnforcement({ settings, store, runner, bindings, client, getSubagentDepth = () => 2, dispatches = createDispatchBindings({ store, runner, bindings, client, getSubagentDepth }), lessons = null, getToolPermissions = () => null }) {
   const deniedCalls = new Map();
   const startedCalls = new Map();
   const observedToolParts = new Map();
   const recordedCalls = new Set();
   const callKey = (sessionID, callID) => JSON.stringify([sessionID, callID]);
   const settlementTools = new Set(['graph_submit_plan', 'graph_submit_review', 'graph_submit_change', 'graph_submit_verification', 'graph_submit_findings']);
-  const denialKinds = new Set(['out-of-scope-edit', 'out-of-scope-write', 'out-of-scope-bash', 'blocked-bash']);
+  const denialKinds = new Set(['out-of-scope-edit', 'out-of-scope-write', 'out-of-scope-bash', 'blocked-bash', 'unparsed-write-target']);
   function recorded(identity) {
     recordedCalls.add(identity);
     if (recordedCalls.size > 256) recordedCalls.delete(recordedCalls.values().next().value);
@@ -114,6 +115,23 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
 
   function pausedEffect(binding, tool) {
     return ['edit', 'write', 'bash'].includes(tool) && store.getRun(binding?.runId)?.status === 'AWAITING_USER_DECISION';
+  }
+
+  // An allow/ask is not a read-only declaration. Configured MCP calls retain
+  // the active-dispatch fence and also require a healthy run for the root.
+  // This is admission only, not a sandbox or a ledger of MCP-internal effects.
+  function configuredToolDenial(sessionID, tool) {
+    const policy = getToolPermissions();
+    if (!isConfiguredMcpTool(policy, tool)) return null;
+    const binding = bindings.get(sessionID);
+    if (!binding && !dispatches.managed(sessionID)) return null;
+    if (!binding || store.getRun(binding.runId)?.status !== 'RUNNING' || !binding.root && !dispatches.current(binding)) {
+      return 'BINDING_UNAVAILABLE: configured MCP tools require a RUNNING run and an active, verified dispatch';
+    }
+    if (toolPermission(policy, binding.agent, tool) === 'deny') {
+      return 'TOOL_PERMISSION_DENIED: this role does not permit the configured MCP tool';
+    }
+    return null;
   }
 
   // Known project lessons ride into explorer/planner/implementer dispatches.
@@ -196,7 +214,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
           state.status = 'RECOVERY_REQUIRED';
           await store.saveRun(state);
         }
-        if (state.status === 'AWAITING_USER_DECISION' || state.dispatchReservations?.some((r) => r.settlementOnly)) {
+        if (state.status === 'AWAITING_USER_DECISION' || state.dispatchReservations?.some((r) => r.settlementOnly || r.nested)) {
           await dispatches.recoverPaused(state);
         }
         const pendingEffectsBeforeRecovery = state.pendingEffects?.length ?? 0;
@@ -259,9 +277,14 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
     const node = binding.nodeId ? state.nodes[binding.nodeId] : null;
     if (tool === 'edit' || tool === 'write') {
       if (!node || node.spec.kind !== 'implement') return null;
-      const target = toWorkspaceRelative(args?.filePath ?? args?.path);
       const patterns = node.spec.writeScope ?? [];
-      const allowed = typeof target === 'string' && patterns.length > 0 && patterns.some((pattern) => matchScopePath(pattern, target));
+      const rawTarget = args?.filePath ?? args?.path;
+      const target = toWorkspaceRelative(rawTarget);
+      if (typeof target !== 'string') {
+        return { state, node, nodeId: node.spec.id, target: null, allowed: false, kind: 'unparsed-write-target',
+          reason: `could not determine the ${tool} target${typeof rawTarget === 'string' ? ` from ${JSON.stringify(rawTarget.slice(0, 120))}` : ' (missing filePath)'}; supply a literal workspace-relative file path inside the writeScope [${patterns.join(', ')}] of ${node.spec.id}` };
+      }
+      const allowed = patterns.length > 0 && patterns.some((pattern) => matchScopePath(pattern, target));
       return { state, node, nodeId: node.spec.id, target, allowed, kind: tool === 'edit' ? 'out-of-scope-edit' : 'out-of-scope-write',
         reason: `${tool} target ${target} is outside the writeScope [${patterns.join(', ')}] of ${node.spec.id}` };
     }
@@ -295,26 +318,34 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
 
   async function onToolBefore(input, output) {
     const { tool, sessionID, callID } = input ?? {};
+    const configuredDenial = configuredToolDenial(sessionID, tool);
+    if (configuredDenial) throw new Error(configuredDenial);
     if (tool === 'task') {
+      await dispatches.ensureSession(sessionID);
       const binding = bindings.get(sessionID);
-      if (!binding?.root) return;
+      if (!binding) {
+        if (dispatches.managed(sessionID)) throw new Error('BINDING_UNAVAILABLE: task requires an active authenticated dispatch; stop and report the limitation');
+        return;
+      }
       const state = store.getRun(binding.runId);
-      if (!state) return;
+      if (!state) throw new Error('BINDING_UNAVAILABLE: owning run is unavailable; stop and report the limitation');
       const args = output.args ??= {};
       const subagentType = typeof args.subagent_type === 'string' ? args.subagent_type : null;
       const target = parseNodeIdHint(args, { strict: TARGET_REQUIRED_AGENTS.has(subagentType) });
       const decision = target.allowed ? await dispatches.admit(sessionID, callID, args, target.nodeId) : target;
       if (!decision.allowed) {
         await dispatches.exclusive(binding.runId, async () => {
-          runner.recordViolation(state, { nodeId: null, kind: 'gate-blocked-dispatch', detail: `${subagentType}: ${decision.code} — ${decision.detail}`, now: NOW() });
+          runner.recordViolation(state, { nodeId: binding.nodeId ?? null, kind: 'gate-blocked-dispatch', detail: `${subagentType}: ${decision.code} — ${decision.detail}`, now: NOW() });
           await store.saveRun(state);
         });
+        if (!binding.root) throw new Error(`RUNNER_REJECTED(${decision.code}): ${decision.detail}. Do not retry unchanged or wait on yourself; report the limitation in your own delivery.`);
         delete args.task_id;
         delete args.nodeId;
         Object.assign(args, { description: args.description ?? 'runner-rejected dispatch', prompt: rejectionPrompt(decision), subagent_type: subagentType ?? 'graph-explorer' });
         return;
       }
       let prompt = typeof args.prompt === 'string' ? args.prompt : '';
+      if (decision.nested) prompt = `[RUNNER NESTED_CONSULT] This is a free image consultation, not a graph node. Return observations, sources, uncertainty and limitations through the native task response only. Do not call graph_submit_findings, including paused closeout. The caller owns formal graph delivery.\n${prompt}`;
       if (decision.nodeId) {
         // The runner echoes the node's authoritative (token-expanded) scope
         // and deliverables: the bound implementer's ground truth comes from
@@ -344,7 +375,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
           const block = await dispatchLessonsBlock(spec.writeScope ?? [], args.prompt);
           if (block) authoritative.push(block);
         }
-        prompt = `[RUNNER] Assigned nodeId: ${decision.nodeId}. Submit only this node.${authoritative.length ? `\n${authoritative.join('\n')}` : ''}\n${prompt}`;
+        prompt = `[RUNNER] Assigned nodeId: ${decision.nodeId}${decision.resolvedBy === 'unique-admissible' ? ' (auto-resolved: the only admissible node for this role right now; always include [nodeId:...] on the first prompt line)' : ''}. Submit only this node.${authoritative.length ? `\n${authoritative.join('\n')}` : ''}\n${prompt}`;
         if (decision.reconcile) prompt = `${reconcilePrompt(state, decision.nodeId)}\n\n${prompt}`;
         const guidance = revisionPrompt(decision);
         if (guidance) prompt = `${guidance}\n\n${prompt}`;
@@ -402,6 +433,9 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
   function denyGuidance(kind) {
     if (kind === 'blocked-bash') {
       return 'Do not retry bash. Complete the work with edit/write; if it genuinely requires shell (installs, builds), wrap up and report via graph_submit_change unresolved (or your final task report) that the coordinator must revise the plan: set allowShell=true for this node or split out an install node with its own lane.';
+    }
+    if (kind === 'unparsed-write-target') {
+      return 'Retry with a literal workspace-relative file path in filePath; never a directory, glob, empty value or absent argument. The [RUNNER] writeScope line in your dispatch prompt is authoritative.';
     }
     if (kind === 'out-of-scope-bash') {
       return 'Retarget or remove the out-of-scope write (redirections, tee/cp/mv/rm/sed -i, ...) so every write lands inside your writeScope; the [RUNNER] writeScope line in your dispatch prompt is authoritative.';
@@ -576,6 +610,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, d
       return result;
     },
     onPermissionAsk: (input, output) => childOperation(input, output, async (i, o) => {
+      if (configuredToolDenial(i?.sessionID, i?.type)) { o.status = 'deny'; return; }
       if (pausedEffect(bindings.get(i?.sessionID), i?.type)) { o.status = 'deny'; return; }
       if (!READ_ONLY_TOOLS.has(i?.type) && dispatches.managed(i?.sessionID) && !bindings.get(i.sessionID)?.root && !dispatches.current(bindings.get(i.sessionID)) && !canCloseout(bindings.get(i.sessionID), i?.type)) { o.status = 'deny'; return; }
       return onPermissionAsk(i, o);

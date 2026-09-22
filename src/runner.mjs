@@ -452,7 +452,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       || (state.pendingEffects ?? []).some((effect) => effect.nodeId === chosen.spec.id), ...(revisionContext(state, chosen) ?? {}) };
   }
 
-  function admitDispatch(state, { agent, now, nodeId = null, excludeNodeIds = null }) {
+  function admitDispatch(state, { agent, now, nodeId = null, excludeNodeIds = null, consultOnly = false, autoResolveUnique = false }) {
     if (TERMINAL_RUN.has(state.status)) {
       return { allowed: false, code: 'RUN_TERMINATED', detail: state.failReason ? `run failed: ${state.failReason}` : 'run already finished' };
     }
@@ -469,10 +469,19 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     if (state.status === 'BLOCKED') {
       return { allowed: false, code: 'RUN_BLOCKED', detail: state.blockedReason ? `${state.blockedReason.kind}: ${state.blockedReason.detail}` : 'run is blocked' };
     }
-    if (typeof agent !== 'string' || (!READ_ONLY_AGENTS.has(agent) && !WRITE_AGENTS.has(agent))) {
+    if (typeof agent !== 'string' || !agent.length) {
+      return { allowed: false, code: 'AGENT_REQUIRED', detail: 'task dispatch requires subagent_type naming a graph-* specialist (graph-explorer, graph-planner, graph-plan-critic, graph-implementer, graph-verifier, graph-multimodal)' };
+    }
+    if (!READ_ONLY_AGENTS.has(agent) && !WRITE_AGENTS.has(agent)) {
       return { allowed: false, code: 'INVALID_AGENT', detail: `${agent} is not a dispatchable graph specialist` };
     }
 
+    if (consultOnly) {
+      if (state.status !== 'RUNNING' || agent !== 'graph-multimodal' || nodeId !== null) {
+        return { allowed: false, code: 'INVALID_CONSULT', detail: 'consultOnly requires a RUNNING run, graph-multimodal and no node target' };
+      }
+      return { allowed: true, nodeId: null, free: true };
+    }
     const mine = Object.values(state.nodes).filter((node) => node.spec.agent === agent);
     // Implementers run under a bounded-capacity writer gate: several write
     // nodes with pairwise-disjoint writeScopes may be RUNNING at once, up to
@@ -504,7 +513,16 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       if (!chosen) {
         return { allowed: false, code: 'NODE_NOT_FOUND', detail: `${nodeId} is not a ${agent} node in the current task graph` };
       }
-      return admissibleNode(state, chosen, agent, now, checkDeps);
+      const result = admissibleNode(state, chosen, agent, now, checkDeps);
+      if (!result.allowed && result.code === 'NODE_NOT_ADMISSIBLE') {
+        const others = mine
+          .filter((node) => node.spec.id !== nodeId && ELIGIBLE_STATES.has(node.state))
+          .map((node) => ({ id: node.spec.id, deps: checkDeps(node) }))
+          .filter((entry) => entry.deps.ok)
+          .map((entry) => entry.id);
+        if (others.length) result.detail += `; other admissible ${agent} nodes: ${others.join(', ')}`;
+      }
+      return result;
     }
 
     // Concurrent reservations for the same role must not collide on one node:
@@ -530,7 +548,19 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
         detail: waiting.length ? `not yet admissible: ${waiting.join('; ')}${artifactNameHint(waiting)}` : `no admissible ${agent} node exists in the current task graph`,
       };
     }
-    return admissibleNode(state, ready[0].node, agent, now, checkDeps);
+    // Preserve the sorted path's top-candidate semantics (including
+    // ATTEMPTS_EXHAUSTED pausing) before any ambiguity gate can apply.
+    const result = admissibleNode(state, ready[0].node, agent, now, checkDeps);
+    // Strict-target auto-resolve: a missing marker binds only when exactly one
+    // node of the role is admissible. Several candidates stay an explicit
+    // coordinator decision; malformed markers are rejected by the parser.
+    if (result.allowed && autoResolveUnique) {
+      if (ready.length > 1) {
+        return { allowed: false, code: 'NODE_ID_REQUIRED', detail: `${agent} requires an explicit nodeId when several nodes are admissible (${ready.map((entry) => entry.node.spec.id).join(', ')}); put [nodeId:<node>] alone on the first prompt line` };
+      }
+      result.resolvedBy = 'unique-admissible';
+    }
+    return result;
   }
 
   function beginNode(state, nodeId, { now, sessionId = null, dispatchId = null }) {

@@ -39,8 +39,20 @@ export function lineageIndex(state) {
 }
 
 export function repairSettlementPending(state, nodeId = null) {
-  return [...(state.dispatchReservations ?? []), ...(state.pendingEffects ?? [])]
-    .some((entry) => entry.repairRevoked && (nodeId === null || entry.nodeId === nodeId));
+  const reservations = state.dispatchReservations ?? [];
+  const lineage = [...reservations, ...(state.settledDispatches ?? [])];
+  return [...reservations, ...(state.pendingEffects ?? [])].some((entry) => {
+    if (!entry.repairRevoked) return false;
+    if (nodeId === null || entry.nodeId === nodeId) return true;
+    if (!entry.nested) return false;
+    // A nested free consultation owns no node. Its exact caller generation
+    // keeps the affected node fenced even after that parent's host has ended.
+    const owners = lineage.filter((owner) => owner.runId === state.runId && !owner.nested
+      && owner.dispatchId === entry.callerDispatchId && owner.sessionId === entry.callerSessionId);
+    const ids = new Set(owners.map((owner) => owner.nodeId).filter((id) => typeof id === 'string'));
+    // Missing/conflicting durable lineage is not evidence of independence.
+    return ids.size !== 1 || ids.has(nodeId);
+  });
 }
 
 export function consumedRefs(state, node) {

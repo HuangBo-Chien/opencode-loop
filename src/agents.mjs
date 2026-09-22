@@ -1,5 +1,6 @@
 import { AGENT_NAMES } from './config.mjs';
 import { createAgentPrompt } from './prompts.mjs';
+import { resolveToolPermissions, validateMcpToolPermissions } from './tool-permissions.mjs';
 
 const SUBMIT_TOOL_BY_AGENT = Object.freeze({
   'graph-orchestrator': ['graph_run_resume', 'graph_run_new', 'graph_run_decide'],
@@ -24,7 +25,7 @@ function createPermission(name) {
     permission.todowrite = 'allow';
     permission.task = { '*': 'deny', ...Object.fromEntries(AGENT_NAMES.filter(agent => agent !== name).map(agent => [agent, 'allow'])) };
   } else {
-    permission.task = 'deny';
+    permission.task = name === 'graph-multimodal' ? 'deny' : { '*': 'deny', 'graph-multimodal': 'allow' };
   }
   for (const tool of SUBMIT_TOOL_BY_AGENT[name] ?? []) permission[tool] = 'allow';
   if (JOURNAL_READ_AGENTS.has(name)) {
@@ -57,13 +58,16 @@ export function registerAgents(config, options) {
   for (const name of AGENT_NAMES) {
     if (name in existing) throw new Error(`Graph agent namespace collision: ${name}`);
   }
+  const toolPermissions = resolveToolPermissions(options.toolPermissions, AGENT_NAMES);
+  validateMcpToolPermissions(toolPermissions, config.mcp);
   const additions = Object.fromEntries(AGENT_NAMES.map(name => [name, {
     description: `${name.slice(6)} role for the runner-gated graph workflow`,
     mode: name === 'graph-orchestrator' ? 'primary' : 'subagent',
     prompt: createAgentPrompt(name, options),
-    permission: createPermission(name),
+    permission: { ...createPermission(name), ...toolPermissions[name] },
     ...(options.models[name] ? { model: options.models[name] } : {}),
   }]));
   config.agent = { ...existing, ...additions };
   if (options.setDefaultAgent) config.default_agent = 'graph-orchestrator';
+  return toolPermissions;
 }
