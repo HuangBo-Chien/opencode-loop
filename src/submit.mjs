@@ -138,7 +138,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       summary: z.string().min(1).max(2000),
       checksRun: z.array(z.string().max(2000)).max(16).default([]),
       unresolved: z.array(z.string().max(2000)).max(16).default([]),
-      risks: z.array(z.string().max(2000)).max(16).default([]),
+      risks: z.array(z.string().max(2000).refine((entry) => !/[\n\r]/.test(entry), 'risks entries must be single-line')).max(16).default([]),
     },
     async execute(args, context) {
       const wrong = requireRole(context, 'graph-implementer');
@@ -226,7 +226,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       nodeId: z.string().min(1).max(128).optional(),
       summary: z.string().min(1).max(4000),
       evidence: z.array(z.string().max(2000)).max(32).default([]),
-      learnings: z.array(z.string().max(2000)).max(16).default([]),
+      learnings: z.array(z.string().max(2000).refine((entry) => !/[\n\r]/.test(entry), 'learnings entries must be single-line')).max(16).default([]),
     },
     async execute(args, context) {
       if (context.agent !== 'graph-explorer' && context.agent !== 'graph-multimodal') {
