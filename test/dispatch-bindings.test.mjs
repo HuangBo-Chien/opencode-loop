@@ -1189,8 +1189,9 @@ test('task_id resume is denied without attempts, for other nodes and for foreign
   await h.dispatches.onIdle('child', 'idle-a');
   await h.dispatches.onIdle('child', 'idle-b');
   assert.equal(h.state.nodes.impl.state, 'FAILED');
-  assert.equal((await h.admit('exhausted', 'impl', 'graph-implementer', 'child')).code, 'FRESH_SESSION_REQUIRED');
-  assert.equal((await h.admit('wrong-role', null, 'graph-planner', 'child')).code, 'FRESH_SESSION_REQUIRED');
+  assert.equal(h.state.status, 'AWAITING_USER_DECISION');
+  assert.equal((await h.admit('exhausted', 'impl', 'graph-implementer', 'child')).code, 'AWAITING_DECISION');
+  assert.equal((await h.admit('wrong-role', null, 'graph-planner', 'child')).code, 'AWAITING_DECISION');
 
   const second = await harness();
   await second.admit('a', 'impl');
@@ -1200,6 +1201,7 @@ test('task_id resume is denied without attempts, for other nodes and for foreign
   await second.dispatches.onIdle('worker', 'idle-a');
   await second.dispatches.onIdle('worker', 'idle-b');
   assert.equal(second.state.nodes.impl.state, 'INCOMPLETE');
+  assert.equal((await second.admit('wrong-role', null, 'graph-planner', 'worker')).code, 'FRESH_SESSION_REQUIRED');
   // A different session never worked this node; only fresh sessions apply.
   await second.dispatches.onSession({ id: 'stranger', parentID: 'root' });
   assert.equal((await second.admit('stranger-call', 'impl', 'graph-implementer', 'stranger')).code, 'FRESH_SESSION_REQUIRED');

@@ -67,7 +67,8 @@ for (const explicit of [undefined, 0, 1, 2, 4]) test(`native subagent depth defa
   assert.equal(config.subagent_depth, explicit ?? 2);
   await hooks['chat.message']({ sessionID: 'root', agent: 'graph-orchestrator' }, { parts: [] });
   const args = { subagent_type: 'graph-explorer', prompt: 'Explore' };
-  await hooks['tool.execute.before']({ tool: 'task', sessionID: 'root', callID: 'owner' }, { args });
+  if (explicit === 0) await assert.rejects(hooks['tool.execute.before']({ tool: 'task', sessionID: 'root', callID: 'owner' }, { args }), /SUBAGENT_DEPTH_LIMIT/);
+  else await hooks['tool.execute.before']({ tool: 'task', sessionID: 'root', callID: 'owner' }, { args });
   if (explicit !== 0) {
     await hooks.event({ event: { type: 'session.created', properties: { info: { id: 'caller', parentID: 'root' } } } });
     await hooks.event({ event: { type: 'message.part.updated', properties: { part: {
@@ -96,11 +97,13 @@ test('registers exactly seven runner-gated agents, preserving native definitions
   for (const name of names) {
     assert.equal(config.agent[name].permission['*'], 'deny');
     assert.equal(config.agent[name].permission.graph_status, 'allow');
+    assert.equal(config.agent[name].permission.graph_artifact_read, 'allow');
     assert.match(config.agent[name].prompt, /runner-gated/);
     assert.equal(config.agent[name].mode, name === 'graph-orchestrator' ? 'primary' : 'subagent');
   }
-  assert.deepEqual(Object.keys(hooks).sort(), ['chat.message', 'config', 'event', 'permission.ask', 'tool', 'tool.execute.after', 'tool.execute.before']);
+  assert.deepEqual(Object.keys(hooks).sort(), ['chat.message', 'config', 'event', 'permission.ask', 'tool', 'tool.definition', 'tool.execute.after', 'tool.execute.before']);
   assert.deepEqual(Object.keys(hooks.tool).sort(), [
+    'graph_artifact_read',
     'graph_inspect',
     'graph_journal_promote',
     'graph_journal_read',

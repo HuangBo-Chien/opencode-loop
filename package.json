@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "3.8.1",
-    "@opencode-ai/plugin": "1.18.25"
+    "@opencode-ai/plugin": "1.18.25",
+    "effect": "4.0.0-beta.83"
   }
 }

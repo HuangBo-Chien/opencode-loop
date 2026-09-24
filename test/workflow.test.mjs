@@ -126,7 +126,9 @@ test('roles provide distinct evidence contracts, submit duties and capability li
 test('dispatch prompts require explicit writer targets and stop on task conflicts', async () => {
   const definitions = await agents();
   const coordinator = definitions['graph-orchestrator'].prompt;
-  assert.match(coordinator, /implementer\/verifier.*每次.*task_id.*必須.*獨占/);
+  assert.match(coordinator, /implementer\/verifier.*結構化 nodeId/);
+  assert.match(coordinator, /已核實.*續接可省略 nodeId/);
+  assert.match(coordinator, /不建立子 session/);
   for (const code of ['NODE_ID_REQUIRED', 'INVALID_NODE_ID', 'CONFLICTING_NODE_ID', 'TASK_NODE_MISMATCH']) {
     assert.ok(coordinator.includes(code), code);
   }

@@ -10,6 +10,7 @@ import { cleanJson } from './json-safe.mjs';
 import { assertSettlementCapacity, isUncertainEffect } from './runner.mjs';
 import { publishArtifact, validateRepairTargets, verificationFiles, repairSettlementPending } from './artifact-dependencies.mjs';
 import { validateTaskGraph, expandRunTokens, runToken, validateFileClaim } from './task-spec.mjs';
+import { readHandoff, handoffManifest, plannerHandoffConflict } from './artifact-handoffs.mjs';
 
 const z = tool.schema;
 const NOW = () => new Date().toISOString();
@@ -81,6 +82,8 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         ].join(' '));
       }
       try {
+        const conflict = plannerHandoffConflict(located.state, located.binding, args.basedOn ?? []);
+        if (conflict) return rejected('HANDOFF_INPUT_CHANGED', conflict);
         const candidate = structuredClone(located.state);
         const result = runner.submitPlan(candidate, {
           intent: args.intent,
@@ -260,10 +263,28 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
     },
   });
 
+  const graph_artifact_read = tool({
+    description: 'Read an exact artifact snapshot from your dispatch handoff. With ref, returns JSON text pages (limit 1..8000, default 4000 UTF-16 units), SHA-256 and nextOffset; concatenate through nextOffset=null. Omit ref to page its manifest entries (limit 1..16, default 16). Never substitutes latest. Root may inspect retained handoffs in its own run.',
+    args: {
+      handoffId: z.string().min(1).max(128), ref: z.string().min(1).max(256).optional(),
+      offset: z.number().int().min(0).optional(), limit: z.number().int().min(1).max(8000).optional(),
+    },
+    async execute(args, context) {
+      const binding = bindings.get(context.sessionID);
+      if (!binding || binding.agent !== context.agent || binding.nested
+        || !binding.root && dispatches && !dispatches.owns(binding, { settled: true })) {
+        return rejected('HANDOFF_UNAVAILABLE', 'An authenticated owner of this handoff is required.');
+      }
+      const state = store.getRun(binding.runId);
+      if (!state) return rejected('RUN_GONE', 'The owning run is unavailable.');
+      return reply(readHandoff(state, binding, args));
+    },
+  });
+
   const graph_inspect = tool({
-    description: 'Inspect the current graph run: node states, attempts, blockers, artifact versions and validity, plus a Mermaid diagram. Read-only.',
-    args: {},
-    async execute(_args, context) {
+    description: 'Inspect the current graph run: node states, attempts, blockers, artifact versions, validity and Mermaid diagram. Handoff summaries are paginated (handoffOffset, handoffLimit); follow handoffPage.nextOffset. Read an individual manifest with graph_artifact_read, omitting ref. Read-only.',
+    args: { handoffOffset: z.number().int().min(0).optional(), handoffLimit: z.number().int().min(1).max(16).optional() },
+    async execute(args, context) {
       if (!context.agent?.startsWith('graph-')) return rejected('NOT_GRAPH_AGENT', 'graph inspection is reserved for graph agents');
       const binding = bindings.get(context.sessionID);
       // Read-only and binding-free by design: managed children without their
@@ -294,7 +315,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         const stillPending = declared.filter((file) => !covered.has(file) && !existsSync(join(worktree, file)));
         node.deliverables = { total: declared.length, done: declared.length - stillPending.length, pending: stillPending.slice(0, 8) };
       }
-      return reply({ ...report, ...(dispatches ? { dispatches: dispatches.inspect(state.runId) } : {}) });
+      return reply({ ...report, ...handoffManifest(state, args), ...(dispatches ? { dispatches: dispatches.inspect(state.runId) } : {}) });
     },
   });
 
@@ -466,7 +487,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
 
   const definitions = {
       graph_submit_plan, graph_submit_review, graph_submit_change, graph_submit_verification,
-      graph_submit_findings, graph_inspect, graph_run_resume, graph_run_new, graph_run_decide,
+      graph_submit_findings, graph_inspect, graph_artifact_read, graph_run_resume, graph_run_new, graph_run_decide,
   };
   // Paused submissions are validated with the same public schemas and semantic
   // checks, on an isolated state copy. Only bounded, non-gating closeout evidence

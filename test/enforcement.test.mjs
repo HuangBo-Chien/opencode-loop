@@ -111,8 +111,10 @@ test('role deny overrides native approval, and finished or revoked MCP dispatche
 test('configured MCP stays closed for a rejected child and does not affect unmanaged native sessions', async () => {
   const h = harness(undefined, { toolPermissions: QUERY_PERMISSIONS });
   await startRun(h);
-  const rejected = await dispatch(h, 'graph-implementer', { nodeId: 'absent' });
-  assert.match(rejected.args.prompt, /RUNNER_REJECTED/);
+  const rejected = await rejectDispatch(h, 'graph-implementer', { nodeId: 'absent' });
+  assert.equal(rejected.code, 'NODE_NOT_FOUND');
+  // A late/unbound historical child remains fenced; the rejected call itself
+  // no longer creates one.
   await h.enforcement.onEvent({ event: { type: 'session.created', properties: { info: { id: 'rejected', parentID: 'root' } } } });
   await assert.rejects(h.enforcement.onToolBefore({ sessionID: 'rejected', tool: QUERY_TOOL }, { args: {} }), /BINDING_UNAVAILABLE/);
   await assert.doesNotReject(h.enforcement.onToolBefore({ sessionID: 'rejected', tool: 'lsp' }, { args: {} }));
@@ -133,8 +135,18 @@ async function dispatch(h, agent, options = {}) {
   const hostArgs = output.args;
   const callID = `call-${agent}-${Math.random().toString(36).slice(2)}`;
   await h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID }, output);
-  if (!hostArgs.prompt.includes('RUNNER_REJECTED')) h.calls.push({ agent, callID, args: hostArgs });
+  h.calls.push({ agent, callID, args: hostArgs });
   return { args: hostArgs, callID };
+}
+async function rejectDispatch(h, agent, options = {}) {
+  let error;
+  const calls = h.calls.length;
+  await assert.rejects(dispatch(h, agent, options), failure => {
+    error = failure;
+    return failure.name === 'DispatchRejection';
+  });
+  assert.equal(h.calls.length, calls, 'no native execution queued for rejected dispatch');
+  return error;
 }
 async function bindChild(h, sessionId, agent, callID) {
   const candidates = h.calls.filter((call) => call.agent === agent && (callID === undefined || call.callID === callID));
@@ -254,18 +266,15 @@ test('acceptance header pins the current plan artifact version', async () => {
 });
 
 for (const targetConflict of [false, true]) {
-  test(`integration args: rejected task rewrites native captured object and removes stale routing (targetConflict=${targetConflict})`, async () => {
+  test(`integration args: rejected task preserves native captured object and stops execution (targetConflict=${targetConflict})`, async () => {
     const h = harness();
     await startRun(h);
     const args = { subagent_type: 'graph-implementer', prompt: `[nodeId:${targetConflict ? 'other' : 'impl'}]\nUnsafe original`, task_id: 'old-child', nodeId: 'impl', extra: 'preserved' };
     const output = { args };
-    await h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID: 'native-rejected' }, output);
-    assert.match(args.prompt, /^RUNNER_REJECTED/);
+    const original = structuredClone(args);
+    await assert.rejects(h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID: 'native-rejected' }, output), /RUNNER_REJECTED/);
     assert.equal(output.args, args);
-    assert.equal(Object.hasOwn(args, 'task_id'), false);
-    assert.equal(Object.hasOwn(args, 'nodeId'), false);
-    assert.equal(args.extra, 'preserved');
-    assert.equal(args.description, 'runner-rejected dispatch');
+    assert.deepEqual(args, original);
     assert.equal(h.enforcement.dispatches.inspect('root').length, 0);
   });
 }
@@ -607,8 +616,8 @@ for (const restart of [false, true]) {
     // are fenced until the original correlated host lifetime has settled.
     h.client.session.status = async () => ({ data: { verifier: { type: 'busy' } } });
     for (const task_id of [undefined, 'verifier']) {
-      const denied = await dispatch(h, 'graph-verifier', { nodeId: 'verify-1', ...(task_id ? { task_id } : {}) });
-      assert.match(denied.args.prompt, /REPAIR_SETTLEMENT_PENDING/);
+      const denied = await rejectDispatch(h, 'graph-verifier', { nodeId: 'verify-1', ...(task_id ? { task_id } : {}) });
+      assert.equal(denied.code, 'REPAIR_SETTLEMENT_PENDING');
     }
     const oldTerminal = await terminalTurn(h, 'verifier', first.callID);
     h.client.session.status = async () => ({ data: {} });
@@ -688,7 +697,7 @@ for (const reader of ['free', 'node', 'unbound']) {
         await assert.rejects(() => h.enforcement.onToolBefore({ tool: 'bash', sessionID: 'reader', callID: 'revoked-running' }, { args: { command: 'node --version' } }), /BINDING_UNAVAILABLE/);
       }
       assert.deepEqual(h.store.getRun('root').artifacts, published, 'old calls cannot publish under the new RUNNING plan');
-      assert.match((await dispatch(h, 'graph-explorer')).args.prompt, /READER_CAPACITY/, 'active old readers still occupy host capacity');
+      assert.equal((await rejectDispatch(h, 'graph-explorer')).code, 'READER_CAPACITY', 'active old readers still occupy host capacity');
       const critic = await dispatch(h, 'graph-plan-critic');
       await bindChild(h, 'critic', 'graph-plan-critic', critic.callID);
       assert.equal(JSON.parse(await h.tools.graph_submit_review.execute({ planVersion: 1, verdict: 'FAIL', findings: ['revise scope'] }, ctx(h, 'critic', 'graph-plan-critic'))).ok, true);
@@ -1480,7 +1489,7 @@ test('historical schema v1 runs never capture a post-upgrade message as their in
   assert.equal(migrated.requestCaptureCompleted, true);
 });
 
-test('full gated flow: plan → FAIL pauses for decision; abort closes the run; blocked dispatch is rewritten as RUNNER_REJECTED', async (t) => {
+test('full gated flow: plan → FAIL pauses for decision; abort closes the run; blocked dispatch throws RUNNER_REJECTED', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'loop-ef1-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const h = harness(dir);
@@ -1501,16 +1510,14 @@ test('full gated flow: plan → FAIL pauses for decision; abort closes the run; 
   assert.equal(paused.status, 'AWAITING_USER_DECISION');
   assert.equal(paused.pendingDecision.cause, 'plan-rejected-by-critic');
 
-  const blocked = await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
-  assert.match(blocked.args.prompt, /RUNNER_REJECTED/);
-  assert.match(blocked.args.prompt, /AWAITING_DECISION/);
-  assert.match(blocked.args.prompt, /graph_run_decide/);
+  const blocked = await rejectDispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
+  assert.equal(blocked.code, 'AWAITING_DECISION');
+  assert.match(blocked.message, /graph_run_decide/);
   assert.ok(paused.violations.some((entry) => entry.kind === 'gate-blocked-dispatch'));
 
   // Neither a new planner dispatch nor plan replacement can bypass the pause.
-  const smuggler = await dispatch(h, 'graph-planner');
-  assert.match(smuggler.args.prompt, /RUNNER_REJECTED/);
-  assert.match(smuggler.args.prompt, /AWAITING_DECISION/);
+  const smuggler = await rejectDispatch(h, 'graph-planner');
+  assert.equal(smuggler.code, 'AWAITING_DECISION');
   await childIdle(h, 'child-critic');
   await childIdle(h, 'child-planner');
 
@@ -1523,8 +1530,8 @@ test('full gated flow: plan → FAIL pauses for decision; abort closes the run; 
   assert.match(state.failReason, /aborted by user: requirements changed/);
   assert.equal(state.artifacts.review.payload.verdict, 'FAIL');
   assert.equal(state.decision.action, 'abort');
-  const afterAbort = await dispatch(h, 'graph-explorer');
-  assert.match(afterAbort.args.prompt, /RUN_TERMINATED/);
+  const afterAbort = await rejectDispatch(h, 'graph-explorer');
+  assert.equal(afterAbort.code, 'RUN_TERMINATED');
 });
 
 test('implementer cannot be dispatched before review PASS; verifier evidence gates apply end to end', async (t) => {
@@ -1533,9 +1540,8 @@ test('implementer cannot be dispatched before review PASS; verifier evidence gat
   const h = harness(dir);
   await startRun(h);
 
-  const early = await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
-  assert.match(early.args.prompt, /RUNNER_REJECTED/);
-  assert.match(early.args.prompt, /NODE_NOT_FOUND/);
+  const early = await rejectDispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
+  assert.equal(early.code, 'NODE_NOT_FOUND');
 
   await dispatch(h, 'graph-planner');
   await bindChild(h, 'child-planner', 'graph-planner');
@@ -1751,8 +1757,8 @@ test('coordinator nodeId steering binds the requested node, not the sorted one',
   await setupSteerableRun(h);
 
   // Unmarked writer dispatches are rejected; the marker selects impl-b.
-  const plain = await dispatch(h, 'graph-implementer');
-  assert.match(plain.args.prompt, /NODE_ID_REQUIRED/);
+  const plain = await rejectDispatch(h, 'graph-implementer');
+  assert.equal(plain.code, 'NODE_ID_REQUIRED');
   assert.equal(h.store.getRun('root').nodes['impl-a'].attempt, 0);
 
   const steered = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-b]\nwrite the b package' });
@@ -1764,9 +1770,8 @@ test('coordinator nodeId steering binds the requested node, not the sorted one',
 
   // An explicit args.nodeId works too, and an ineligible target is rejected
   // with the precise reason instead of a silent reassignment.
-  const invalid = await dispatch(h, 'graph-implementer', { prompt: 'x', nodeId: 'impl-zzz' });
-  assert.match(invalid.args.prompt, /RUNNER_REJECTED/);
-  assert.match(invalid.args.prompt, /NODE_NOT_FOUND/);
+  const invalid = await rejectDispatch(h, 'graph-implementer', { prompt: 'x', nodeId: 'impl-zzz' });
+  assert.equal(invalid.code, 'NODE_NOT_FOUND');
   assert.ok(h.store.getRun('root').violations.some((entry) => entry.detail.includes('NODE_NOT_FOUND')));
 });
 
@@ -1895,10 +1900,10 @@ test('terminal runs keep read-only tools alive for children and graph_run_new st
   assert.equal(verdict.ok, true, JSON.stringify(verdict));
   assert.equal(h.store.getRun('root').status, 'SUCCEEDED');
 
-  // A post-terminal dispatch is rejected, but read-only tools keep working
-  // for the rejected child through the parent-chain fallback.
-  const blocked = await dispatch(h, 'graph-explorer');
-  assert.match(blocked.args.prompt, /RUNNER_REJECTED/);
+  // A post-terminal dispatch is rejected directly. A late historical child
+  // can still inspect through the parent-chain fallback.
+  const blocked = await rejectDispatch(h, 'graph-explorer');
+  assert.equal(blocked.code, 'RUN_TERMINATED');
   await h.enforcement.onEvent({ event: { type: 'session.created', properties: { info: { id: 'late-child', parentID: 'root' } } } });
   const fromChild = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'late-child', 'graph-explorer')));
   assert.equal(fromChild.status, 'SUCCEEDED');
@@ -1994,9 +1999,8 @@ test('plan before required findings exist rejects early and a corrected resubmis
   assert.match(plan.detail, /findings/);
   assert.deepEqual(h.store.getRun('root'), before);
 
-  const blocked = await dispatch(h, 'graph-plan-critic');
-  assert.match(blocked.args.prompt, /RUNNER_REJECTED/);
-  assert.match(blocked.args.prompt, /NO_READY_NODE/);
+  const blocked = await rejectDispatch(h, 'graph-plan-critic');
+  assert.equal(blocked.code, 'NO_READY_NODE');
 
   // Registering findings unblocks the same dispatch path to completion.
   await dispatch(h, 'graph-explorer');
@@ -2058,8 +2062,8 @@ test('revision exhaustion pauses the run; user reset opens a successor that comp
   assert.equal(exhausted.effect, 'await-decision');
   assert.equal(h.store.getRun('root').status, 'AWAITING_USER_DECISION');
 
-  const blockedDispatch = await dispatch(h, 'graph-planner');
-  assert.match(blockedDispatch.args.prompt, /AWAITING_DECISION/);
+  const blockedDispatch = await rejectDispatch(h, 'graph-planner');
+  assert.equal(blockedDispatch.code, 'AWAITING_DECISION');
   const inspectPaused = JSON.parse(await h.tools.graph_inspect.execute({}, ctx(h, 'root', 'graph-orchestrator')));
   assert.equal(inspectPaused.pendingDecision.cause, 'plan-revisions-exhausted');
 
@@ -2160,9 +2164,8 @@ test('parallel writers: two [nodeId:] implementers run concurrently and complete
   assert.equal(state.nodes['impl-b'].state, 'RUNNING');
 
   // A third implementer is refused while both capacity slots are taken.
-  const third = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-a]\nagain' });
-  assert.match(third.args.prompt, /RUNNER_REJECTED/);
-  assert.match(third.args.prompt, /WRITER_CAPACITY/);
+  const third = await rejectDispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-a]\nagain' });
+  assert.equal(third.code, 'WRITER_CAPACITY');
 
   // Scope enforcement stays per-node while running in parallel.
   const escape = { args: { filePath: join(dir, 'pkg-b', 'from-a.ts'), content: 'x' } };
@@ -2215,10 +2218,9 @@ test('critic approvedParallel downgrade mechanically serializes writers', async 
   const first = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-a]\nwork a' });
   assert.ok(!first.args.prompt.includes('RUNNER_REJECTED'));
   await bindChild(h, 'child-a', 'graph-implementer');
-  const second = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-b]\nwork b' });
-  assert.match(second.args.prompt, /RUNNER_REJECTED/);
-  assert.match(second.args.prompt, /WRITER_CAPACITY/);
-  assert.match(second.args.prompt, /1\/1/);
+  const second = await rejectDispatch(h, 'graph-implementer', { prompt: '[nodeId:impl-b]\nwork b' });
+  assert.equal(second.code, 'WRITER_CAPACITY');
+  assert.match(second.message, /1\/1/);
 });
 
 test('parallel explorers: free dispatches run concurrently under the reader gate and both findings versions survive', async (t) => {
@@ -2242,10 +2244,9 @@ test('parallel explorers: free dispatches run concurrently under the reader gate
   assert.deepEqual(inFlight.map((entry) => entry.bound), [true, true]);
 
   // While both explorers are in flight a third dispatch fills 2/2 capacity.
-  const third = await dispatch(h, 'graph-explorer');
-  assert.match(third.args.prompt, /RUNNER_REJECTED/);
-  assert.match(third.args.prompt, /READER_CAPACITY/);
-  assert.match(third.args.prompt, /2\/2/);
+  const third = await rejectDispatch(h, 'graph-explorer');
+  assert.equal(third.code, 'READER_CAPACITY');
+  assert.match(third.message, /2\/2/);
 
   // Each parallel explorer registers its own findings version while bound.
   const v1 = JSON.parse(await h.tools.graph_submit_findings.execute(
@@ -2324,9 +2325,8 @@ test('crash on the final attempt: refund plus cross-restart task_id continuation
 
   // task_id continuation picks the interrupted session back up across the
   // restart; its side-effect ledger travels with the dispatch.
-  const conflict = await dispatch(h, 'graph-implementer', { prompt: '[nodeId:other-impl]\nwork elsewhere', task_id: 'child-impl' });
-  assert.match(conflict.args.prompt, /TASK_NODE_MISMATCH/);
-  assert.equal(Object.hasOwn(conflict.args, 'task_id'), false);
+  const conflict = await rejectDispatch(h, 'graph-implementer', { prompt: '[nodeId:other-impl]\nwork elsewhere', task_id: 'child-impl' });
+  assert.equal(conflict.code, 'TASK_NODE_MISMATCH');
   assert.equal(restarted.nodes['impl-1'].state, 'PENDING');
   assert.equal(restarted.nodes['impl-1'].attempt, 2);
   assert.deepEqual(h.enforcement.dispatches.inspect('root'), []);
@@ -3222,9 +3222,8 @@ test('baseline flow end to end: pre-change red suite does not block an honest PA
   assert.equal(review.ok, true, JSON.stringify(review));
 
   // The implementer must wait for the baseline: only the baseline verifier is admissible now.
-  const earlyImpl = await dispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
-  assert.match(earlyImpl.args.prompt, /RUNNER_REJECTED/);
-  assert.match(earlyImpl.args.prompt, /base-1/);
+  const earlyImpl = await rejectDispatch(h, 'graph-implementer', { nodeId: 'impl-1' });
+  assert.match(earlyImpl.message, /base-1/);
 
   await dispatch(h, 'graph-verifier', { nodeId: 'base-1' });
   await bindChild(h, 'child-base', 'graph-verifier');

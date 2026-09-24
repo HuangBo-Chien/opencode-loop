@@ -12,6 +12,7 @@ import { createJournalService, createJournaledRunStore } from './journal.mjs';
 import { createJournalTools } from './journal-tools.mjs';
 import { createLessonService, LESSON_KINDS } from './lessons.mjs';
 import { createLessonTools } from './lesson-tools.mjs';
+import { createTaskDefinitionHook } from './task-definition.mjs';
 
 export default async function GraphPlugin(context, options = {}) {
   const settings = parseOptions(options);
@@ -54,6 +55,7 @@ export default async function GraphPlugin(context, options = {}) {
   let hostConfig = null;
   const getToolPermissions = () => toolPermissions;
   const getSubagentDepth = () => hostConfig?.subagent_depth ?? 1;
+  const taskDefinition = createTaskDefinitionHook();
   const enforcement = createEnforcement({ settings: { worktree, journal: settings.journal, lessons: settings.lessons }, store, runner, bindings, client: context.client, lessons: lessonService, getToolPermissions, getSubagentDepth });
   const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches });
   const journalTools = createJournalTools({
@@ -79,7 +81,8 @@ export default async function GraphPlugin(context, options = {}) {
       if (config.subagent_depth === undefined) config.subagent_depth = 2;
       hostConfig = config;
     },
-    tool: { graph_status: createStatusTool(settings, journalService, lessonService, getToolPermissions), ...tools, ...journalTools, ...lessonTools },
+    tool: { graph_status: createStatusTool(settings, journalService, lessonService, getToolPermissions, taskDefinition.status), ...tools, ...journalTools, ...lessonTools },
+    'tool.definition': taskDefinition.onToolDefinition,
     'chat.message': enforcement.onChatMessage,
     'tool.execute.before': enforcement.onToolBefore,
     'tool.execute.after': enforcement.onToolAfter,

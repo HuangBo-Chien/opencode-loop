@@ -520,7 +520,10 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
           .map((node) => ({ id: node.spec.id, deps: checkDeps(node) }))
           .filter((entry) => entry.deps.ok)
           .map((entry) => entry.id);
-        if (others.length) result.detail += `; other admissible ${agent} nodes: ${others.join(', ')}`;
+          if (others.length) {
+            result.detail += `; other admissible ${agent} nodes: ${others.join(', ')}`;
+            result.candidates = others;
+          }
       }
       return result;
     }
@@ -556,7 +559,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     // coordinator decision; malformed markers are rejected by the parser.
     if (result.allowed && autoResolveUnique) {
       if (ready.length > 1) {
-        return { allowed: false, code: 'NODE_ID_REQUIRED', detail: `${agent} requires an explicit nodeId when several nodes are admissible (${ready.map((entry) => entry.node.spec.id).join(', ')}); put [nodeId:<node>] alone on the first prompt line` };
+        return { allowed: false, code: 'NODE_ID_REQUIRED', candidates: ready.map(entry => entry.node.spec.id), detail: `${agent} requires an explicit nodeId when several nodes are admissible (${ready.map((entry) => entry.node.spec.id).join(', ')}); set the nodeId field or use one leading [nodeId:<node>] marker` };
       }
       result.resolvedBy = 'unique-admissible';
     }

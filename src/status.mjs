@@ -98,7 +98,7 @@ function lessonsStatus(options, runtime, unavailable) {
   });
 }
 
-export function createStatusTool(options, journalService, lessonService = null, getToolPermissions = () => null) {
+export function createStatusTool(options, journalService, lessonService = null, getToolPermissions = () => null, getTaskSchema = () => ({ structuredNodeId: 'unobserved', reason: null })) {
   return tool({
     description: 'Report plugin capabilities and enforcement scope. Does not start, inspect, or mutate graph runs (use graph_inspect / graph_run_resume).',
     args: {},
@@ -127,7 +127,8 @@ export function createStatusTool(options, journalService, lessonService = null, 
         workflowMode: 'gated',
         enforcement: 'tool-execute-hooks',
         enforcementScope: 'GRAPH_MANAGED_SESSIONS',
-        enforcementDetail: 'Dispatch admission reserves work by callID; host task metadata and parentage bind sessions before attempts begin. Scope, bash, verdict and evidence gates use tool.execute.before/after hooks and native permissions. Unresolved child bindings fail closed. Rejected task dispatches receive a fresh RUNNER_REJECTED child turn.',
+        dispatch: { taskSchema: getTaskSchema(), rejectionMode: 'tool-error-before-child', targetField: 'nodeId' },
+        enforcementDetail: 'Dispatch admission reserves work by callID; host task metadata and parentage bind sessions before attempts begin. Scope, bash, verdict and evidence gates use tool.execute.before/after hooks and native permissions. Unresolved child bindings fail closed. Rejected task dispatches throw RUNNER_REJECTED before native execution; no rejection-only child is created.',
         enforcementAttested: false,
         runtimeAvailable: true,
         managedRuntimeStatus: 'available',
