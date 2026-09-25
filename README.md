@@ -6,6 +6,15 @@ opencode-loop is a seven-agent **runner-gated** graph workflow with local cross-
 
 The model proposes; the runner decides. Every hook decision is persisted to a run document under `<worktree>/<stateDirectory>/runs/<encoded-runId>.json` (atomic writes, cross-instance lock file; the filename is the percent-encoded run id, so successor runs like `root:2` stay valid on Windows while colon-free names are unchanged), where `runId` is the orchestrator session id — a restart reloads it and continues with counters intact.
 
+On Windows, transient run-state rename `EPERM` is retried against the same temporary
+snapshot, with at most eight rename attempts and a 1,500 ms retry deadline. Persistent
+failures still propagate; the destination is never deleted as a fallback. Store writes
+are FIFO per run, and release drains accepted writes before removing the lock; agent
+parallelism is unchanged. Recovered writes and failures produce advisory host logs under
+`opencode-loop.persistence` with operation IDs, snapshot hashes, attempts and elapsed time.
+See [Windows persistence diagnostics](docs/run-state-eperm-validation.md) for the
+no-model reproducer, native-host evidence and recovery boundaries.
+
 | Gate | Mechanism |
 | --- | --- |
 | Implementer/verifier may only be dispatched when a plan passed review | `tool.execute.before` on `task` consults the runner; illegal dispatches throw `RUNNER_REJECTED` before native task execution, without creating an error-only child session |

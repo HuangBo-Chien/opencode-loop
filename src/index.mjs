@@ -2,6 +2,7 @@ import { parseOptions, resolveWorktree } from './config.mjs';
 import { registerAgents } from './agents.mjs';
 import { createStatusTool } from './status.mjs';
 import { createRunStore } from './run-state.mjs';
+import { createPersistenceLogger } from './run-state-write.mjs';
 import { createRunner } from './runner.mjs';
 import { createSubmitTools } from './submit.mjs';
 import { createEnforcement } from './enforcement.mjs';
@@ -19,7 +20,7 @@ export default async function GraphPlugin(context, options = {}) {
   if (!settings.enabled) return {};
   const worktree = resolveWorktree(context);
 
-  const baseStore = createRunStore({ worktree, stateDirectory: settings.stateDirectory });
+  const baseStore = createRunStore({ worktree, stateDirectory: settings.stateDirectory, onPersistenceEvent: createPersistenceLogger(context.client) });
   const journalStore = createJournalStore({ worktree, stateDirectory: settings.stateDirectory });
   const lessonStore = createJournalStore({ worktree, stateDirectory: settings.stateDirectory, subdirectory: 'lessons', kinds: LESSON_KINDS });
   const embeddingProvider = createEmbeddingProvider();

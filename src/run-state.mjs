@@ -7,10 +7,11 @@
 // When no worktree is available the store degrades to in-memory only.
 
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, open, opendir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, opendir, readFile, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { cleanJson } from './json-safe.mjs';
 import { validateFileClaim } from './task-spec.mjs';
+import { writeRunSnapshot, reportPersistence } from './run-state-write.mjs';
 export const SCHEMA_VERSION = 2;
 export const RUN_STATUSES = Object.freeze(['RUNNING', 'BLOCKED', 'FAILED', 'SUCCEEDED', 'RECOVERY_REQUIRED', 'AWAITING_USER_DECISION', 'ABORTED']);
 export const NODE_STATES = Object.freeze(['PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'SKIPPED', 'STALE', 'INCOMPLETE', 'RECOVERY_REQUIRED']);
@@ -77,8 +78,12 @@ export function sanitizeRun(state) {
 // encodeURIComponent leaves it through and Windows forbids it.
 export const runFileKey = (runId) => encodeURIComponent(runId).replace(/\*/g, '%2A');
 
-export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } = {}) {
+export function createRunStore({ worktree, stateDirectory = '.opencode-loop', onPersistenceEvent } = {}) {
   const memory = new Map();
+  const tails = new Map();
+  const creating = new Map();
+  const releasing = new Map();
+  let sequence = 0;
   const runsDir = typeof worktree === 'string' && worktree ? join(worktree, stateDirectory, 'runs') : null;
   const runFile = (runId) => {
     if (!RUN_ID_PATTERN.test(runId)) throw new TypeError('Invalid run id');
@@ -87,32 +92,50 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } =
 
   async function createRun({ runId, rootSessionId, now, request = null, requestCaptureCompleted = false }) {
     const state = newRun({ runId, rootSessionId, now, request, requestCaptureCompleted });
-    memory.set(runId, state);
-    if (runsDir) {
+    if (memory.has(runId) || creating.has(runId) || releasing.has(runId)) throw new Error(`Run ${runId} is locked by an existing registration or lifecycle operation`);
+    // Defer I/O until the creation reservation is visible to other callers.
+    const result = Promise.resolve().then(async () => {
+      let locked = false;
       try {
-        await mkdir(runsDir, { recursive: true });
+        if (runsDir) {
+          await mkdir(runsDir, { recursive: true });
+          let handle;
+          try { handle = await open(`${runFile(runId)}.lock`, 'wx'); }
+          catch (error) {
+            if (error?.code === 'EEXIST') throw new Error(`Run ${runId} is locked by another instance`);
+            throw error;
+          }
+          locked = true;
+          await handle.close();
+          await persist(state);
+        }
+        memory.set(runId, state);
+        return state;
       } catch (error) {
-        memory.delete(runId);
+        if (locked) {
+          try { await rm(`${runFile(runId)}.lock`, { force: true }); }
+          catch (cleanupError) { reportPersistence(onPersistenceEvent, { runId, phase: 'cleanup-failed', stage: 'lock', code: cleanupError?.code }); }
+        }
         throw error;
       }
-      try {
-        await open(`${runFile(runId)}.lock`, 'wx').then((handle) => handle.close());
-      } catch (error) {
-        memory.delete(runId);
-        if (error?.code === 'EEXIST') throw new Error(`Run ${runId} is locked by another instance`);
-        throw error;
-      }
-      await persist(state);
-    }
-    return state;
+    });
+    creating.set(runId, result);
+    try { return await result; }
+    finally { creating.delete(runId); }
   }
 
-  async function persist(state) {
+  function persist(state) {
+    // Capture before entering the queue: a shared live state can mutate while
+    // an earlier rename is retrying. This queue orders writes, not mutations.
     const frozen = sanitizeRun(state);
     const target = runFile(state.runId);
-    const temporary = `${target}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
-    await writeFile(temporary, `${JSON.stringify(frozen, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-    await rename(temporary, target);
+    const content = `${JSON.stringify(frozen, null, 2)}\n`;
+    const options = { runId: frozen.runId, sequence: ++sequence, onPersistenceEvent };
+    const result = (tails.get(frozen.runId) ?? Promise.resolve()).then(() => writeRunSnapshot(target, content, options));
+    const settled = result.then(() => undefined, () => undefined);
+    tails.set(frozen.runId, settled);
+    void settled.then(() => { if (tails.get(frozen.runId) === settled) tails.delete(frozen.runId); });
+    return result;
   }
 
   async function loadRun(runId) {
@@ -150,14 +173,29 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop' } =
 
   async function saveRun(state) {
     if (!memory.has(state.runId)) throw new Error(`Run ${state.runId} is not registered`);
+    if (releasing.has(state.runId)) throw new Error(`Run ${state.runId} is releasing`);
     state.updatedAt = new Date().toISOString();
     if (runsDir) await persist(state);
     return state;
   }
 
   async function releaseRun(runId) {
-    memory.delete(runId);
-    if (runsDir) await rm(`${runFile(runId)}.lock`, { force: true });
+    if (releasing.has(runId)) return releasing.get(runId);
+    const result = Promise.resolve().then(async () => {
+      // Close admission before waiting; creation and every accepted save must
+      // finish before another instance can acquire the lock.
+      const pendingCreate = creating.get(runId);
+      if (pendingCreate) {
+        try { await pendingCreate; }
+        catch { return; } // Failed creation already cleaned only its own lock.
+      }
+      await tails.get(runId);
+      if (runsDir) await rm(`${runFile(runId)}.lock`, { force: true });
+      memory.delete(runId);
+    });
+    releasing.set(runId, result);
+    try { await result; }
+    finally { releasing.delete(runId); }
   }
 
   async function listRunIds({ limit = 64, offset = 0 } = {}) {
