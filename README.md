@@ -15,6 +15,62 @@ parallelism is unchanged. Recovered writes and failures produce advisory host lo
 See [Windows persistence diagnostics](docs/run-state-eperm-validation.md) for the
 no-model reproducer, native-host evidence and recovery boundaries.
 
+### PR1: durable publication and finite settlement
+
+New production runs use isolated candidate state: a submission or hook transition
+is published only after its snapshot commits. A permanent persistence failure
+latches `PERSISTENCE_FAILED`, fences new dispatches/workspace operations, and
+remains visible in `graph_inspect.infrastructureFault`. It is not a malformed
+payload and must not trigger redoing implementation. Owned terminal/effect events
+can still settle. Once outstanding calls and pending effects have ended, explicit
+`graph_run_resume` establishes a durable recovery boundary before clearing the
+fault. A successful unrelated save does not clear it automatically.
+
+Acceptance now enters **SETTLING**. A programmatic controller checks original
+task/turn evidence and pending effects; it commits **SUCCEEDED** only after all
+work has settled. No additional orchestrator turn or polling is needed. The plugin
+option `settlementTimeoutMs` defaults to **30000**, accepts integer values from
+1000 through 300000, and starts at durable graph acceptance. It does not limit
+normal implementation/test execution. At expiry the run is **FAILED** with
+`SETTLEMENT_TIMEOUT`; unresolved lifetimes remain owned, and late evidence cannot
+upgrade failure to success. Restart does one bounded reconciliation of SETTLING
+and otherwise records `SETTLEMENT_INTERRUPTED`, rather than renewing the budget.
+Before final success the controller rechecks accepted file-hash evidence; drift or
+unavailable evidence fails as `SETTLEMENT_EVIDENCE_CHANGED`.
+Explicit recovery of a final-publication fault likewise retains an interrupted
+failure, never a new allowance or an unproven success.
+
+Historical tool errors are not erased. To resolve an uncertain effect, a verifier
+may submit `resolvedEffects: [{ sessionId, callID }]` on a nonbaseline PASS, with
+an existing evidence artifact and `probed` findings. Only uncertain effects of
+this verifier or directly consumed implement/verify dependencies are eligible. The runner binds resolution
+to the original effect hash and valid verification artifact; a plain PASS does
+not silently resolve unknown effects. `graph_inspect.uncertainEffects` lists
+bounded original identities for investigation.
+
+`graph_inspect.accounting` reports observed phase durations, root/child and
+role/phase usage, first observed edit/write timing, change-to-run-end timing, and
+persistence retries. Detailed diagnostic snapshots are separate from authoritative
+run state at `<stateDirectory>/metrics/<encoded-runId>.<process-epoch>.json`.
+They contain no prompts or artifact bodies. Set plugin option `phaseAccounting`
+to `false` to disable these optional measurements without weakening any gate.
+
+Accounting covers the current process's observed messages, not unobserved provider
+helpers. Missing usage and restart gaps remain unknown; completed message updates
+are deduplicated. Role/phase assignment is at the first observed message event,
+not an inferred provider request start. Concurrent work intervals overlap and
+their sum is **not** wall elapsed time. Totals use host `tokens.total` when present,
+otherwise input plus output; reasoning/cache are separate reported fields. Each
+run retains at most 4096 message identities and 1024 phase intervals; capacity
+overflow makes exact totals unknown rather than evicting identities and recounting
+replays. Diagnostics are advisory and may be unavailable after abrupt process loss.
+
+Existing historical runs remain readable. Restart OpenCode to load the changed
+plugin. Verification scenarios are specified in the
+[PR1 design](docs/superpowers/specs/2026-09-26-pr1-reliability-design.md).
+Host reads use the pinned plugin API's SDK v1 argument contract. Getter-only host
+properties are supported; this is not an SDK v2 flattened-parameter migration.
+
 | Gate | Mechanism |
 | --- | --- |
 | Implementer/verifier may only be dispatched when a plan passed review | `tool.execute.before` on `task` consults the runner; illegal dispatches throw `RUNNER_REJECTED` before native task execution, without creating an error-only child session |

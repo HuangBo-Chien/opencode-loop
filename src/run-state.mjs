@@ -13,7 +13,7 @@ import { cleanJson } from './json-safe.mjs';
 import { validateFileClaim } from './task-spec.mjs';
 import { writeRunSnapshot, reportPersistence } from './run-state-write.mjs';
 export const SCHEMA_VERSION = 2;
-export const RUN_STATUSES = Object.freeze(['RUNNING', 'BLOCKED', 'FAILED', 'SUCCEEDED', 'RECOVERY_REQUIRED', 'AWAITING_USER_DECISION', 'ABORTED']);
+export const RUN_STATUSES = Object.freeze(['RUNNING', 'BLOCKED', 'SETTLING', 'FAILED', 'SUCCEEDED', 'RECOVERY_REQUIRED', 'AWAITING_USER_DECISION', 'ABORTED']);
 export const NODE_STATES = Object.freeze(['PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'SKIPPED', 'STALE', 'INCOMPLETE', 'RECOVERY_REQUIRED']);
 export const ARTIFACT_STATUSES = Object.freeze(['valid', 'stale', 'superseded']);
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -90,8 +90,9 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop', on
     return join(runsDir, `${runFileKey(runId)}.json`);
   };
 
-  async function createRun({ runId, rootSessionId, now, request = null, requestCaptureCompleted = false }) {
+  async function createRun({ runId, rootSessionId, now, request = null, requestCaptureCompleted = false, lifecycleVersion }) {
     const state = newRun({ runId, rootSessionId, now, request, requestCaptureCompleted });
+    if (lifecycleVersion === 1) state.lifecycleVersion = 1;
     if (memory.has(runId) || creating.has(runId) || releasing.has(runId)) throw new Error(`Run ${runId} is locked by an existing registration or lifecycle operation`);
     // Defer I/O until the creation reservation is visible to other callers.
     const result = Promise.resolve().then(async () => {

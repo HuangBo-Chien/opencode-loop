@@ -7,6 +7,7 @@ import { assertSettlementCapacity } from './runner.mjs';
 import { sanitizeRun } from './run-state.mjs';
 import { repairSettlementPending } from './artifact-dependencies.mjs';
 import { captureHandoff, retainHandoffPayloads, handoffInputsMatch } from './artifact-handoffs.mjs';
+import { createBoundedHostReader } from './host-read.mjs';
 
 const NOW = () => new Date().toISOString();
 const key = (root, call) => JSON.stringify([root, call]);
@@ -117,6 +118,8 @@ function projectIdleEvidence(runId, reservations, evidence) {
 const COMPACTION_CONTINUE = 'Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.';
 const COMPACTION_OVERFLOW = "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n";
 export function createDispatchBindings({ store, runner, bindings, client, getSubagentDepth = () => 2 }) {
+  const hostReader = createBoundedHostReader(client);
+  if (store.transaction) client = hostReader.client;
   const records = new Map();
   const parents = new Map();
   const tails = new Map();
@@ -170,7 +173,26 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
   }
 
   function exclusive(runId, operation) {
-    const result = (tails.get(runId) ?? Promise.resolve()).then(operation);
+    const result = (tails.get(runId) ?? Promise.resolve()).then(async () => {
+      try { return await (store.transaction ? store.transaction(runId, operation) : operation()); }
+      finally {
+        if (store.fault?.(runId)) {
+          // A failed publication may have changed private working records. Rebuild
+          // only this run from its last durable ledger; never free an admitted call.
+          const state = store.committed(runId);
+          if (state) {
+            for (const [id, r] of records) if (r.runId === runId) records.delete(id);
+            for (const r of state.dispatchReservations ?? []) records.set(key(callerOf(r), r.callID), structuredClone(r));
+            for (const b of bindings.values()) if (b.runId === runId && !b.root) {
+              const owner = (state.dispatchReservations ?? []).find(r => r.sessionId === b.sessionId && r.dispatchId === b.dispatchId && r.bound);
+              b.active = !!owner;
+              b.settlementOnly = true;
+            }
+            publishIdleHistory(runId, state.idleEventIds ?? [], state.pendingIdleEvidence ?? []);
+          }
+        }
+      }
+    });
     const settled = result.then(() => undefined, () => undefined);
     tails.set(runId, settled);
     void settled.then(() => { if (tails.get(runId) === settled) tails.delete(runId); });
@@ -196,6 +218,7 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
 
   function current(binding) {
     if (!owns(binding)) return false;
+    if (store.fault?.(binding.runId)) return false;
     const state = store.getRun(binding.runId);
     if (binding.nested) {
       const parent = bindings.get(binding.callerSessionId);
@@ -238,6 +261,7 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
     let target = targetDecision.nodeId;
     let targetSource = targetDecision.source;
     return exclusive(root.runId, async () => {
+      if (store.fault?.(root.runId)) return denied('PERSISTENCE_FAILED', 'infrastructure failure; stop new work and recover explicitly after settlement');
       const state = store.getRun(root.runId);
       if (!state) return denied('RUN_GONE', 'owning run is unavailable');
       const rootSessionId = state.rootSessionId;
@@ -449,10 +473,10 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
     // not block a freshly admitted reservation for the same session: allow
     // the overwrite. An active binding still refuses the collision.
     const established = bindings.get(record.sessionId);
-    if (!state || !record.settlementOnly && (!['RUNNING', 'AWAITING_USER_DECISION'].includes(state.status) || (state.artifacts.plan?.version ?? 0) !== record.planVersion)
+    if (!state || !record.settlementOnly && ((!['RUNNING', 'AWAITING_USER_DECISION', 'SETTLING'].includes(state.status) && !state.settlement) || (state.artifacts.plan?.version ?? 0) !== record.planVersion)
       || parents.get(record.sessionId) !== callerOf(record) || (established && established.active !== false)) return;
     const parent = bindings.get(record.callerSessionId);
-    const settlementOnly = record.settlementOnly === true || record.nested && (!current(parent) || parent.dispatchId !== record.callerDispatchId)
+    const settlementOnly = !!store.fault?.(record.runId) || state.status === 'SETTLING' || !!state.settlement || record.settlementOnly === true || record.nested && (!current(parent) || parent.dispatchId !== record.callerDispatchId)
       || state.status === 'AWAITING_USER_DECISION' && !record.started && !!record.nodeId;
     if (record.nodeId && !record.settlementOnly) {
       const node = state.nodes[record.nodeId];
@@ -827,7 +851,13 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
     const recordKey = key(part.sessionID, part.callID);
     const record = records.get(recordKey);
     if (!record) return;
-    await exclusive(record.runId, () => applyPart(part, recordKey, record));
+    await exclusive(record.runId, () => {
+      const currentRecord = records.get(recordKey);
+      // Reconciliation replaces private objects but not immutable admission
+      // identities. A queued terminal event must survive that replacement.
+      if (!currentRecord || currentRecord.dispatchId !== record.dispatchId || currentRecord.turnToken !== record.turnToken) return;
+      return applyPart(part, recordKey, currentRecord);
+    });
   }
 
   // Also used by serialized restart reconciliation; never nests the run queue.
@@ -1039,7 +1069,7 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
   // must also survive a restart BEFORE the replacement graph reaches a pause.
   async function recoverPaused(state) {
     const paused = state.status === 'AWAITING_USER_DECISION';
-    if (!paused && !hasRecoveryIssues(state) && !state.dispatchReservations?.some((r) => r?.settlementOnly || r?.nested)) return;
+    if (!paused && state.status !== 'SETTLING' && !state.settlement && !store.fault?.(state.runId) && !hasRecoveryIssues(state) && !state.dispatchReservations?.some((r) => r?.settlementOnly || r?.nested)) return;
     const idleEventIds = [...new Set((state.idleEventIds ?? []).slice(-256))];
     const recoveryRecords = new Map();
     const recoveryBindings = new Map();
@@ -1183,5 +1213,12 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
     }
   }
 
-  return Object.freeze({ admit, onSession, onPart, onIdle, onMessage, onUserPrompt, reconcileSession, ensureSession, invalidate, revokeExecution, exclusive, managed, owns, current, runForSession, inspect, recoverPaused });
+  // Caller already owns the run queue; one total budget covers all host reads.
+  async function reconcileRun(runId, remaining) {
+    return hostReader.withBudget(remaining, async () => {
+      const state = store.getRun(runId);
+      if (state) await recoverPaused(state);
+    });
+  }
+  return Object.freeze({ admit, onSession, onPart, onIdle, onMessage, onUserPrompt, reconcileSession, reconcileRun, ensureSession, invalidate, revokeExecution, exclusive, managed, owns, current, runForSession, inspect, recoverPaused });
 }

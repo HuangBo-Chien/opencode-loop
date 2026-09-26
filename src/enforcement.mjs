@@ -14,6 +14,7 @@ import { assertSettlementCapacity, isUncertainEffect } from './runner.mjs';
 import { isConfiguredMcpTool, toolPermission } from './tool-permissions.mjs';
 import { handoffForCall, renderHandoff, dispatchNotes } from './artifact-handoffs.mjs';
 import { dispatchRejection } from './dispatch-rejection.mjs';
+import { createBoundedHostReader } from './host-read.mjs';
 
 const READ_ONLY_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-multimodal']);
 // Tools that never mutate run state or the workspace stay available to graph
@@ -90,6 +91,8 @@ function learningsPrompt(state) {
 }
 
 export function createEnforcement({ settings, store, runner, bindings, client, getSubagentDepth = () => 2, dispatches = createDispatchBindings({ store, runner, bindings, client, getSubagentDepth }), lessons = null, getToolPermissions = () => null }) {
+  const hostReader = createBoundedHostReader(client);
+  if (store.transaction) client = hostReader.client;
   const deniedCalls = new Map();
   const startedCalls = new Map();
   const observedToolParts = new Map();
@@ -120,6 +123,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
     if (!isConfiguredMcpTool(policy, tool)) return null;
     const binding = bindings.get(sessionID);
     if (!binding && !dispatches.managed(sessionID)) return null;
+    if (store.fault?.(binding?.runId)) return 'PERSISTENCE_FAILED: infrastructure fault; new MCP work is fenced';
     if (!binding || store.getRun(binding.runId)?.status !== 'RUNNING' || !binding.root && !dispatches.current(binding)) {
       return 'BINDING_UNAVAILABLE: configured MCP tools require a RUNNING run and an active, verified dispatch';
     }
@@ -209,7 +213,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
           state.status = 'RECOVERY_REQUIRED';
           await store.saveRun(state);
         }
-        if (state.status === 'AWAITING_USER_DECISION' || state.dispatchReservations?.some((r) => r.settlementOnly || r.nested)) {
+        if (state.status !== 'SETTLING' && (state.status === 'AWAITING_USER_DECISION' || state.settlement || store.fault?.(state.runId) || state.dispatchReservations?.some((r) => r.settlementOnly || r.nested))) {
           await dispatches.recoverPaused(state);
         }
         const pendingEffectsBeforeRecovery = state.pendingEffects?.length ?? 0;
@@ -218,7 +222,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
             startedCalls.set(callKey(effect.sessionId, effect.callID), { ...effect });
           }
         }
-        await recoverEffectOutcomes(state);
+        if (state.status !== 'SETTLING') await recoverEffectOutcomes(state);
         // A durable tool outcome can remove the last blocker from a turn already
         // witnessed above. Reconcile once in this same serialized restart rather
         // than requiring another host event (which may never be delivered).
@@ -324,6 +328,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
       }
       const state = store.getRun(binding.runId);
       if (!state) throw new Error('BINDING_UNAVAILABLE: owning run is unavailable; stop and report the limitation');
+      store.assertHealthy?.(binding.runId);
       const args = output.args ??= {};
       const formattingKey = callKey(sessionID, callID);
       if (formattedCalls.get(formattingKey) === JSON.stringify(args)
@@ -371,9 +376,10 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
           const dependencies = new Set(spec.dependsOn ?? []);
           const uncertain = state.sideEffects.filter((effect) => dependencies.has(effect.nodeId) && isUncertainEffect(effect));
           if (uncertain.length) {
-            const allTargets = [...new Set(uncertain.map((effect) => `${effect.nodeId} ${effect.tool}: ${String(effect.target).slice(0, 512)}`))];
+            const allTargets = [...new Set(uncertain.map((effect) => `${effect.nodeId} ${effect.tool}: ${String(effect.target).slice(0, 512)} (sessionId=${effect.sessionId ?? 'unknown'}, callID=${effect.callID ?? 'unknown'})`))];
             const targets = allTargets.slice(0, 8);
             authoritative.push(`[RUNNER] ${uncertain.length} uncertain tool outcome(s) across ${allTargets.length} target(s), ${targets.length} shown: ${targets.join(' | ')}. Full details remain in the run side-effect ledger. Errors may have no or partial effects; independently inspect these targets, including unclaimed paths, before PASS.`);
+            authoritative.push('[RUNNER] After resolving effects of this verifier or directly consumed implement/verify dependencies, submit resolvedEffects:[{sessionId,callID}] with PASS, an existing evidence artifact and probed findings. Historical errors remain recorded; unresolved effects block final settlement. graph_inspect lists uncertain effect identities.');
           }
         }
         if (spec && spec.kind === 'plan') {
@@ -600,6 +606,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
     await dispatches.ensureSession(sessionID);
     const binding = bindings.get(sessionID);
     const work = () => {
+      if (requireActive && binding && !['graph_run_resume', 'graph_inspect', 'graph_artifact_read'].includes(input?.tool)) store.assertHealthy?.(binding.runId);
       if (requireActive && pausedEffect(binding, input?.tool)) throw new Error('BINDING_UNAVAILABLE: the run is paused; only settlement of already-started work is permitted');
       if (requireActive && !binding?.root && dispatches.managed(sessionID) && !dispatches.current(binding) && !canCloseout(binding, input?.tool)) {
         throw new Error('BINDING_UNAVAILABLE: this session has no active, verified dispatch (its previous dispatch finished, was rejected, or was revoked); stop working, report this reason back, and let the coordinator re-dispatch');
@@ -624,12 +631,18 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
       return result;
     },
     onPermissionAsk: (input, output) => childOperation(input, output, async (i, o) => {
+      if (!READ_ONLY_TOOLS.has(i?.type) && store.fault?.(bindings.get(i?.sessionID)?.runId)) { o.status = 'deny'; return; }
       if (configuredToolDenial(i?.sessionID, i?.type)) { o.status = 'deny'; return; }
       if (pausedEffect(bindings.get(i?.sessionID), i?.type)) { o.status = 'deny'; return; }
       if (!READ_ONLY_TOOLS.has(i?.type) && dispatches.managed(i?.sessionID) && !bindings.get(i.sessionID)?.root && !dispatches.current(bindings.get(i.sessionID)) && !canCloseout(bindings.get(i.sessionID), i?.type)) { o.status = 'deny'; return; }
       return onPermissionAsk(i, o);
     }),
     onEvent, dispatches,
+    reconcileSettlement: (runId, remaining) => hostReader.withBudget(remaining, async () => {
+      const state = store.getRun(runId);
+      if (state) await recoverEffectOutcomes(state);
+      await dispatches.reconcileRun(runId, remaining);
+    }),
     internals: Object.freeze({ bindings, deniedCalls, decideWriteBinding, toWorkspaceRelative, READ_ONLY_TOOLS }),
   });
 }

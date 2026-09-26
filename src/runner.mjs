@@ -11,6 +11,7 @@
 //   artifacts invalidate downstream results conservatively.
 
 import { cleanJson } from './json-safe.mjs';
+import { resolveEffectClaims } from './effect-resolution.mjs';
 import { captureVerificationPause, prepareVerificationRetry } from './recovery-policy.mjs';
 import { artifactRef, canonicalRef, exactRef, lineageIndex, consumedRefs, publishArtifact, retainedLineage, validateRepairTargets, repairClosure, applyRepair, repairSettlementPending } from './artifact-dependencies.mjs';
 import { matchScopePath, normalizeScopePath, validateFileClaim, validateTaskGraph, validateDependencies, canonicalOutput, ARTIFACT_REF_PATTERN } from './task-spec.mjs';
@@ -357,7 +358,7 @@ function completeIfDone(state, now) {
   if (state.repairPlanRevision) return false;
   const nodes = Object.values(state.nodes);
   if (nodes.length && nodes.every((node) => node.state === 'SUCCEEDED' || node.state === 'SKIPPED')) {
-    state.status = 'SUCCEEDED';
+    state.status = state.lifecycleVersion === 1 ? 'SETTLING' : 'SUCCEEDED';
     state.blockedReason = null;
     state.updatedAt = now;
     return true;
@@ -836,7 +837,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     return result;
   }
 
-  function verificationTransition(state, { nodeId, verdict, commands = [], artifacts = [], probed = [], skipped = [], changeRefs = null, summary = '', snapshot = {}, effectiveTargets, now }) {
+  function verificationTransition(state, { nodeId, verdict, commands = [], artifacts = [], probed = [], skipped = [], resolvedEffects = [], changeRefs = null, summary = '', snapshot = {}, effectiveTargets, now }) {
     if (state.status === 'AWAITING_USER_DECISION') return { ok: false, code: 'AWAITING_DECISION', detail: 'paused submissions are closeout evidence only' };
     if (TERMINAL_RUN.has(state.status)) return { ok: false, code: 'RUN_TERMINATED', detail: state.failReason ?? 'run already finished' };
     const node = state.nodes[nodeId];
@@ -845,6 +846,8 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     const evidence = { payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot,
       basedOn: changeRefs ?? node.consumedRefs ?? [] };
     const reject = (code, detail) => trackRejection(state, node, code, detail, now, evidence);
+    const resolution = resolveEffectClaims(state, node, resolvedEffects, { verdict, artifacts, probed });
+    if (!resolution.ok) return reject('INVALID_EFFECT_RESOLUTION', resolution.detail);
 
     // Baseline capture: pre-change suite evidence recorded before any
     // implement node writes. The artifact is what later PASS verdicts match
@@ -902,7 +905,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       const name = `verification:${nodeId}`;
       const previous = state.artifacts[name];
       const version = previous ? previous.version + 1 : 1;
-      publishArtifact(state, name, { kind: 'verification', nodeId, version, basedOn: changeRefs ?? [...new Set([...(node.consumedRefs ?? []), ...refs])], payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot, status: 'valid', createdAt: now });
+      publishArtifact(state, name, { kind: 'verification', nodeId, version, basedOn: changeRefs ?? [...new Set([...(node.consumedRefs ?? []), ...refs])], payload: { verdict, commands, summary, artifacts, probed, skipped, ...(resolution.resolutions.length ? { resolvedEffects: resolution.resolutions } : {}) }, snapshot, status: 'valid', createdAt: now });
       node.producedRef = `${name}@${version}`;
       node.state = 'SUCCEEDED';
       node.repairEvidence = null;

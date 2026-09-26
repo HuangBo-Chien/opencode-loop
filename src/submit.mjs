@@ -33,7 +33,7 @@ function artifactPathProblem(input) {
   return checked.ok ? null : checked.detail;
 }
 
-export function createSubmitTools({ store, runner, bindings, worktree, dispatches }) {
+export function createSubmitTools({ store, runner, bindings, worktree, dispatches, accounting }) {
   function runFor(context) {
     const binding = bindings.get(context.sessionID);
     if (!binding) return { error: rejected('NOT_GRAPH_SESSION', 'this session is not part of a graph run; work is dispatched by graph-orchestrator through native task') };
@@ -104,7 +104,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
           : args.intent === 'light' ? 'dispatch the implement node directly (critic-free light lane); verification evidence gates still apply' : 'await plan critique before implementation';
         return reply({ ok: true, planVersion: result.version, mode: result.mode, runToken: runToken(located.state.runId), order: graph.order, lanes, next });
       } catch (error) {
-        return rejected('PAYLOAD_INVALID', error.message);
+        return rejected(error.code === 'PERSISTENCE_FAILED' ? error.code : 'PAYLOAD_INVALID', error.message);
       }
     },
   });
@@ -177,6 +177,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       artifacts: z.array(z.string().min(1).max(512)).max(32).default([]),
       probed: z.array(z.string().max(2000)).max(16).default([]),
       skipped: z.array(z.string().max(2000)).max(16).default([]),
+      resolvedEffects: z.array(z.object({ sessionId: z.string().min(1).max(256), callID: z.string().min(1).max(256) })).max(128).optional(),
       summary: z.string().max(2000).optional(),
     },
     async execute(args, context) {
@@ -258,7 +259,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         Object.assign(located.state, candidate);
         return reply({ ok: true, artifact: `findings@${version}` });
       } catch (error) {
-        return rejected('PAYLOAD_INVALID', error.message);
+        return rejected(error.code === 'PERSISTENCE_FAILED' ? error.code : 'PAYLOAD_INVALID', error.message);
       }
     },
   });
@@ -295,6 +296,14 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       const state = store.getRun(runId) ?? (store.loadRun ? await store.loadRun(runId) : null);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
       const report = runner.inspect(state);
+      if (accounting) report.accounting = accounting.inspect(runId);
+      if (state.lifecycleVersion === 1) {
+        const effects = state.sideEffects.filter(isUncertainEffect);
+        report.uncertainEffects = { count: effects.length, entries: effects.slice(0, 128).map(e => ({
+          nodeId: e.nodeId ?? null, sessionId: e.sessionId ?? null, callID: e.callID ?? null, tool: e.tool,
+          target: typeof e.target === 'string' ? e.target.slice(0, 512) : null,
+        })) };
+      }
       // Honest deliverable progress: bash-created artifacts (venv binaries,
       // symlinks, generated checkpoints) never enter the edit/write ledger
       // or the filesTouched claim, so the runner's ledger-only numbers can
@@ -315,7 +324,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         const stillPending = declared.filter((file) => !covered.has(file) && !existsSync(join(worktree, file)));
         node.deliverables = { total: declared.length, done: declared.length - stillPending.length, pending: stillPending.slice(0, 8) };
       }
-      return reply({ ...report, ...handoffManifest(state, args), ...(dispatches ? { dispatches: dispatches.inspect(state.runId) } : {}) });
+      return reply({ ...report, ...handoffManifest(state, args), ...(state.lifecycleVersion === 1 ? { settlement: state.settlement ?? null } : {}), ...(store.fault ? { infrastructureFault: store.fault(runId) } : {}), ...(dispatches ? { dispatches: dispatches.inspect(state.runId) } : {}) });
     },
   });
 
@@ -331,6 +340,9 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
       if (state.status !== 'SUCCEEDED' && state.status !== 'FAILED' && state.status !== 'ABORTED') {
         return rejected('RUN_NOT_TERMINAL', `the current run is ${state.status}; finish, recover or decide it first`);
+      }
+      if (state.lifecycleVersion === 1 && (state.dispatchReservations?.length || state.dispatchRecoveryIssues?.length || state.pendingEffects?.length || dispatches?.inspect(state.runId).length)) {
+        return rejected('DISPATCH_PENDING', 'Outstanding host lifetimes/effects must settle before starting a successor');
       }
       dispatches?.invalidate(state.runId);
       let runId = null;
@@ -360,6 +372,12 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (!binding?.root) return rejected('NOT_GRAPH_SESSION', 'only the orchestrator of this run may resume it');
       const state = store.getRun(binding.runId);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
+      if (store.recover && store.fault(state.runId)) {
+        const settling = state.status === 'SETTLING';
+        await store.recover(state.runId);
+        if (settling) return reply({ ok: true, status: state.status, next: 'Infrastructure recovered; interrupted settlement is recorded as failed, without a fresh budget or success claim.' });
+      }
+      if (state.status === 'SETTLING') return rejected('SETTLEMENT_PENDING', 'The controller is settling accepted work; do not resume or dispatch');
       if (state.status === 'AWAITING_USER_DECISION') return rejected('AWAITING_DECISION', 'the run remains paused; existing children must settle before graph_run_decide');
       if (repairSettlementPending(state)) return rejected('REPAIR_SETTLEMENT_PENDING', 'revoked repair lifetimes and pending effects must settle before resume; inspect the outstanding dispatches');
       if (state.status !== 'SUCCEEDED' && state.status !== 'FAILED' && state.status !== 'ABORTED') dispatches?.invalidate(state.runId);
@@ -537,9 +555,15 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       const binding = bindings.get(context.sessionID);
       return binding ? dispatches.exclusive(binding.runId, () => {
         const state = store.getRun(binding.runId);
+        if (store.fault?.(binding.runId) && name !== 'graph_inspect' && name !== 'graph_artifact_read' && name !== 'graph_run_resume') {
+          return rejected('PERSISTENCE_FAILED', 'Infrastructure failure; stop new submissions. Owned host events can settle; use explicit recovery after settlement.');
+        }
         if (name === 'graph_submit_findings' && binding.nested) return rejected('NESTED_CONSULT_ONLY', 'return observations to the caller through the native task response; no findings or closeout');
         if (name.startsWith('graph_submit_') && state?.status === 'AWAITING_USER_DECISION') {
           return settlePaused(name, definition, args, context, binding, state);
+        }
+        if (name.startsWith('graph_submit_') && state?.lifecycleVersion === 1 && state.status !== 'RUNNING') {
+          return rejected('RUN_NOT_EXECUTING', 'Accepted work is settling or terminal; do not publish new graph artifacts.');
         }
         return definition.execute(args, context);
       }) : definition.execute(args, context);
