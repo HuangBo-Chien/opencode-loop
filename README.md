@@ -1,14 +1,136 @@
 # opencode-loop
 
-opencode-loop is a seven-agent **runner-gated** graph workflow with local cross-run journal memory and a lesson knowledge base for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
+opencode-loop provides a **runner-gated** Direct path for bounded tasks and an on-demand seven-role Graph workflow, with local cross-run journal memory and a lesson knowledge base for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
+
+## Direct execution
+
+New runs default to `executionStrategy: "auto"`. For a bounded task with clear,
+mechanically testable acceptance, the orchestrator establishes a Direct contract
+and dispatches one `graph-implementer`. That worker explores, edits, executes the
+declared checks and repairs failures in the same session. A planner, critic and
+LLM verifier are not required for this path. File count alone is not a reason to
+select Graph: use Graph when work needs decomposition or independent semantic
+review. Explicit requests for Graph take precedence.
+
+The root calls `graph_direct_start` with `requirement`, `rationale`, `acceptance`,
+literal-file `writeScope`, required `deliverables` and 1–8 named `checks`:
+
+```json
+{
+  "requirement": "Fix the parser's empty-input behavior",
+  "rationale": "A bounded parser fix with an existing regression test",
+  "acceptance": ["The parser handles empty input and the regression suite passes"],
+  "writeScope": ["src/parser.mjs", "test/parser.test.mjs"],
+  "deliverables": ["src/parser.mjs", "test/parser.test.mjs"],
+  "checks": [
+    {"id": "parser-tests", "command": "node --test test/parser.test.mjs", "cwd": ".", "timeoutMs": 60000}
+  ]
+}
+```
+
+The worker calls `graph_direct_check({"checkId":"parser-tests"})`. The runner
+selects the frozen command, requests native shell permission, records its actual
+exit status and binds its result to the current contract, dispatch and workspace
+revision. `checksRun` text cannot substitute for this evidence. The worker then
+uses `graph_submit_change` for node `direct`, declaring touched/deleted files and
+unresolved work. Missing, failed or stale checks cannot produce acceptance.
+
+Direct captures a starting file inventory, including pre-existing dirty contents
+and Git-ignored source. It checks the actual delta against scope and declared
+files. Inventories exclude `.git`, `node_modules` and the configured state
+directory; these are infrastructure outside Direct's acceptance boundary, not
+authorized write targets. Symlinks, special files and inventories exceeding the
+bounded capture limits require Graph. Direct commands must run in the foreground
+and terminate their own children; detached/background services are unsupported.
+This is not an operating-system process or filesystem sandbox.
+
+Only the root can revise a settled contract or call
+`graph_direct_escalate({"rationale":"Independent review is required"})` to move
+to Graph. Acceptance still enters PR1's finite settlement process; an unfinished
+child or unknown effect cannot be declared successful. Set plugin option
+`executionStrategy: "graph"` to retain the previous Graph/light route. Existing
+saved runs retain their original strategy when resumed.
+
+Direct failure-budget exhaustion pauses the run with its evidence preserved;
+it does not grant another editing round. Unknown interrupted check outcomes also
+require a user decision after the admitted host work settles. Successful checks
+must be repeated after any workspace change, including check-generated output.
+
+See [PR2 verification and host probe](docs/pr2-direct-validation.md) for evidence
+and measurement limits.
 
 ## How the gate works
 
 The model proposes; the runner decides. Every hook decision is persisted to a run document under `<worktree>/<stateDirectory>/runs/<encoded-runId>.json` (atomic writes, cross-instance lock file; the filename is the percent-encoded run id, so successor runs like `root:2` stay valid on Windows while colon-free names are unchanged), where `runId` is the orchestrator session id — a restart reloads it and continues with counters intact.
 
+On Windows, transient run-state rename `EPERM` is retried against the same temporary
+snapshot, with at most eight rename attempts and a 1,500 ms retry deadline. Persistent
+failures still propagate; the destination is never deleted as a fallback. Store writes
+are FIFO per run, and release drains accepted writes before removing the lock; agent
+parallelism is unchanged. Recovered writes and failures produce advisory host logs under
+`opencode-loop.persistence` with operation IDs, snapshot hashes, attempts and elapsed time.
+See [Windows persistence diagnostics](docs/run-state-eperm-validation.md) for the
+no-model reproducer, native-host evidence and recovery boundaries.
+
+### PR1: durable publication and finite settlement
+
+New production runs use isolated candidate state: a submission or hook transition
+is published only after its snapshot commits. A permanent persistence failure
+latches `PERSISTENCE_FAILED`, fences new dispatches/workspace operations, and
+remains visible in `graph_inspect.infrastructureFault`. It is not a malformed
+payload and must not trigger redoing implementation. Owned terminal/effect events
+can still settle. Once outstanding calls and pending effects have ended, explicit
+`graph_run_resume` establishes a durable recovery boundary before clearing the
+fault. A successful unrelated save does not clear it automatically.
+
+Acceptance now enters **SETTLING**. A programmatic controller checks original
+task/turn evidence and pending effects; it commits **SUCCEEDED** only after all
+work has settled. No additional orchestrator turn or polling is needed. The plugin
+option `settlementTimeoutMs` defaults to **30000**, accepts integer values from
+1000 through 300000, and starts at durable graph acceptance. It does not limit
+normal implementation/test execution. At expiry the run is **FAILED** with
+`SETTLEMENT_TIMEOUT`; unresolved lifetimes remain owned, and late evidence cannot
+upgrade failure to success. Restart does one bounded reconciliation of SETTLING
+and otherwise records `SETTLEMENT_INTERRUPTED`, rather than renewing the budget.
+Before final success the controller rechecks accepted file-hash evidence; drift or
+unavailable evidence fails as `SETTLEMENT_EVIDENCE_CHANGED`.
+Explicit recovery of a final-publication fault likewise retains an interrupted
+failure, never a new allowance or an unproven success.
+
+Historical tool errors are not erased. To resolve an uncertain effect, a verifier
+may submit `resolvedEffects: [{ sessionId, callID }]` on a nonbaseline PASS, with
+an existing evidence artifact and `probed` findings. Only uncertain effects of
+this verifier or directly consumed implement/verify dependencies are eligible. The runner binds resolution
+to the original effect hash and valid verification artifact; a plain PASS does
+not silently resolve unknown effects. `graph_inspect.uncertainEffects` lists
+bounded original identities for investigation.
+
+`graph_inspect.accounting` reports observed phase durations, root/child and
+role/phase usage, first observed edit/write timing, change-to-run-end timing, and
+persistence retries. Detailed diagnostic snapshots are separate from authoritative
+run state at `<stateDirectory>/metrics/<encoded-runId>.<process-epoch>.json`.
+They contain no prompts or artifact bodies. Set plugin option `phaseAccounting`
+to `false` to disable these optional measurements without weakening any gate.
+
+Accounting covers the current process's observed messages, not unobserved provider
+helpers. Missing usage and restart gaps remain unknown; completed message updates
+are deduplicated. Role/phase assignment is at the first observed message event,
+not an inferred provider request start. Concurrent work intervals overlap and
+their sum is **not** wall elapsed time. Totals use host `tokens.total` when present,
+otherwise input plus output; reasoning/cache are separate reported fields. Each
+run retains at most 4096 message identities and 1024 phase intervals; capacity
+overflow makes exact totals unknown rather than evicting identities and recounting
+replays. Diagnostics are advisory and may be unavailable after abrupt process loss.
+
+Existing historical runs remain readable. Restart OpenCode to load the changed
+plugin. Verification scenarios are specified in the
+[PR1 design](docs/superpowers/specs/2026-09-26-pr1-reliability-design.md).
+Host reads use the pinned plugin API's SDK v1 argument contract. Getter-only host
+properties are supported; this is not an SDK v2 flattened-parameter migration.
+
 | Gate | Mechanism |
 | --- | --- |
-| Implementer/verifier may only be dispatched when a plan passed review | `tool.execute.before` on `task` consults the runner; illegal dispatches are rewritten into an explicit `RUNNER_REJECTED` child turn (soft block — the child session still spawns, reports the rejection, and burns no work) |
+| Workers require an accepted contract | Direct requires its persisted root-owned contract; Graph requires its plan/review gates (light omits the critic). `tool.execute.before` on `task` consults the runner; illegal dispatches throw `RUNNER_REJECTED` before native task execution, without creating an error-only child session |
 | Exhaustion and rejection pause the run for an explicit user decision; nothing may be dispatched while paused | Runner verdict table: PASS advances, REVISE returns to the planner (capped by `maxPlanRevisions`), FAIL and every exhausted budget (plan revisions, node attempts, the verification repair loop) move the run to `AWAITING_USER_DECISION` with a recorded `pendingDecision` cause; UNVERIFIED likewise pauses the run for a user decision (`AWAITING_USER_DECISION` via `graph_run_decide`), with the verdict and its evidence preserved as a superseded verification artifact; identical consecutive verification rejections (an unchanged payload resubmitted after a content-level rejection) trip a `runner-rejection` circuit breaker that pauses the run the same way. The user then decides through `graph_run_decide` (native `ask`): **abort** marks the run irreversibly `ABORTED` (terminal, all evidence preserved), **reset** archives the run in place and opens a fresh successor run |
 | Writes stay inside the assigned `writeScope` | `permission.ask` denies out-of-scope `edit` **and `write`** (and implementer `bash` without `allowShell`) for bound graph sessions before execution; violations are recorded. For `allowShell` implementers and read-only specialists, a best-effort static screen also rejects shell commands whose write targets (redirections, `tee`/`cp`/`mv`/`rm`/`dd of=`/`sed -i`/`truncate`/heredocs) resolve inside the workspace but outside the allowed scope |
 | `testsPassed`-style claims are not trusted | Verdicts travel only through `graph_submit_*` tools; `PASS` requires at least one cited command with `exitCode 0` (plus at least one existing `artifacts` evidence path when any verified implement node declared `deliverables` — missing files are rejected as `ARTIFACT_MISSING`); nonzero commands are tolerated only when they match a still-valid `baseline` entry (same command and exit code), and change submissions are cross-checked against the runner's own edit ledger (undisclosed files fail the node) |
@@ -75,7 +197,78 @@ Native host acceptance is separate from unit tests. See the reproducible
 
 ## Structured handoff
 
-Work packages are `TaskSpec` nodes (`id`, `kind`, `agent`, `dependsOn`, `inputs`/`outputs` artifact refs, `writeScope`, optional `deliverables`, `acceptance`, optional `baseline` on verify nodes, `maxAttempts`/`allowShell`). `deliverables` is an optional literal file list within the implement node's writeScope; `graph_inspect` uses it as the denominator for mechanical progress reporting (per-node side-effect counts, last activity, deliverable completion). Large or multi-phase work should be decomposed into smaller nodes rather than reporting mid-flight: a small node is a frequent, fully verified checkpoint whose progress the runner observes mechanically and whose failures stay isolated. For run-unique lanes, `writeScope`/`deliverables` entries may use the `{{run}}` token — the runner expands it to the run's unique path token before validation, echoes the expanded literal paths in the submit response, and repeats them in the dispatch ack so the bound implementer's ground truth comes from the runner; unsubstituted placeholders (`<run>`, `{{...}}` leftovers) are rejected at submission. `graph_submit_plan` validates the graph — unique ids, resolvable dependencies, no cycles, pairwise-disjoint write scopes, mandatory review-before-implement and implement-before-verify gates, no write nodes for plan-only intents, and the **artifact naming contract** (declared `outputs` must equal the runner-assigned name for the kind — `findings`, `plan`, `review`, `change:<id>`, `verification:<id>`, `baseline:<id>` — or be omitted, and `inputs` may only reference names some runner-managed artifact can satisfy, so a node can never wait on a name nothing produces) — before it ever reaches run state; an `INVALID_GRAPH` rejection carries a compact TaskSpec schema summary (kind↔agent mapping, bare artifact `outputs`, naming rules, gate rules) so the planner can fix the submission without guessing. Each role then delivers through its own tool: `graph_submit_review`, `graph_submit_change`, `graph_submit_verification`, `graph_submit_findings`; `graph_inspect` reports node states, attempts, blockers, artifact versions, per-node mechanical progress (side-effect counts, last activity, deliverable completion when declared) and a Mermaid diagram; `graph_run_resume` performs crash recovery; `graph_run_new` starts a successor run after a terminal one.
+### Dispatch snapshots and artifact reads
+
+The runner, rather than coordinator transcription, delivers formal upstream data:
+
+| Recipient | Handoff contents |
+| --- | --- |
+| Planner | Current complete findings (`summary`, all `evidence`, `learnings`), existing plan (including superseded revision context) and latest review when present, plus declared inputs/dependencies for a bound node |
+| Plan critic | Complete submitted plan and the review node's consumed inputs/dependencies |
+| Implementer | Complete plan and consumed inputs/dependencies; its own acceptance, writeScope and deliverables remain directly injected |
+| Verifier | Complete plan and consumed inputs/dependencies, including direct upstream change artifacts (`filesTouched`, `checksRun`, `unresolved`, `risks`); its acceptance remains directly injected |
+
+Each non-nested dispatch reserves an immutable **handoff** with exact artifact refs,
+SHA-256 digests, UTF-8 byte counts and `inline`/`read` delivery markers. Whole artifacts
+up to 4 KiB are inlined within an 8 KiB aggregate payload budget. Larger artifacts
+are **not truncated**: the prompt supplies a handoff ID and the receiver reads them
+through the read-only tool:
+
+```text
+graph_artifact_read({ handoffId: "<ID from the dispatch>", ref: "findings@1", offset: 0, limit: 4000 })
+```
+
+The response contains `text` (serialized artifact JSON), `sha256`, `totalChars`,
+`offset`, and `nextOffset`. Concatenate pages until `nextOffset` is null; do not treat
+the first page as the complete artifact. Offsets count UTF-16 code units; the limit
+is 1–8000 (default 4000), with at most one extra code unit to keep a surrogate pair
+intact. The complete artifact includes its original status and provenance; a
+snapshot is context, **not new approval or proof that its claims are true**.
+
+Payloads are content-addressed strings in the existing run JSON (`handoffPayloads`),
+shared by dispatch receipts instead of copied per agent. They survive restart and
+latest-slot replacement while an active or retained settled dispatch references
+them. Existing run/settlement size limits still apply: admission fails explicitly
+if it cannot reserve the complete handoff and settlement headroom. Unreferenced
+payloads are pruned during dispatch persistence. This is bounded dispatch retention,
+not an unlimited historical artifact archive or a new resolver for old graph inputs.
+Only the current findings artifact is delivered in full automatically; the existing
+bounded multi-version learnings/carry-over context remains supplementary.
+
+`graph_inspect.handoffs` exposes bounded summaries of retained call/session/node
+identities, plan versions and artifact delivery counts. Use `handoffOffset` and
+`handoffLimit` (default 8, maximum 16), following `handoffPage.nextOffset` to null.
+To see exact refs, hashes, sizes, delivery modes and `consumed` flags for a handoff,
+call `graph_artifact_read({handoffId})` **without ref**: this pages manifest entries
+(offset counts entries; limit defaults to 16 and must be 1–16), also through
+`nextOffset=null`. Neither inspection path dumps complete artifact payloads.
+Specialists can distinguish a prepared handoff from an observed child prompt through
+`promptObserved` (the native `chat.message` anchor); this is not proof that the model
+read or understood every page. `errorCode` preserves binding failures. Specialists
+may read only their own authenticated dispatch generation; the root orchestrator may
+inspect retained handoffs in its own run. Nested image consultations have no graph
+handoff. Missing, corrupt, foreign or legacy-unrecorded snapshots produce explicit
+errors, never an implicit read of the latest version. Reading all pages is a role
+instruction, not an additional mechanical approval gate.
+
+Consumed dependencies are checked again before binding: a version change between
+reservation and binding reports `HANDOFF_INPUT_CHANGED` without charging an attempt.
+A continuation of a RUNNING attempt retains consumed snapshots; a fresh attempt
+captures its newly admitted versions. Planner `basedOn` cannot silently reference a
+newer version of evidence already present in its handoff; request a fresh planning
+dispatch when that evidence changes.
+
+Coordinator prose is marked `[DISPATCH NOTES]`. Any copied `[RUNNER...]` labels in
+it are demoted to `[DISPATCH_QUOTE...]`; the text remains available as supplementary
+context, but cannot pose as a second runner contract. Only the generated acceptance
+block is authoritative. Identical repeated formatting of the same admitted call is
+idempotent within the plugin instance. Coordinators should send short fresh prompts
+with the structured `nodeId` field (or a leading legacy marker), not copy previously injected prompts.
+
+After updating the installed plugin, quit and restart OpenCode. Existing messages
+are not rewritten; verify the new handoff on a newly dispatched task.
+
+Work packages are `TaskSpec` nodes (`id`, `kind`, `agent`, `dependsOn`, `inputs`/`outputs` artifact refs, `writeScope`, optional `deliverables`, `acceptance`, optional `baseline` on verify nodes, `maxAttempts`/`allowShell`). `deliverables` is an optional literal file list within the implement node's writeScope; `graph_inspect` uses it as the denominator for mechanical progress reporting (per-node side-effect counts, last activity, deliverable completion). Large or multi-phase work should be decomposed into smaller nodes rather than reporting mid-flight: a small node is a frequent, fully verified checkpoint whose progress the runner observes mechanically and whose failures stay isolated. For run-unique lanes, `writeScope`/`deliverables` entries may use the `{{run}}` token — the runner expands it to the run's unique path token before validation, echoes the expanded literal paths in the submit response, and repeats them in the dispatch ack so the bound implementer's ground truth comes from the runner; unsubstituted placeholders (`<run>`, `{{...}}` leftovers) are rejected at submission. That ack also injects the node's `acceptance` criteria verbatim as `[RUNNER] acceptance` lines — the work contract for implement nodes, the verification contract for verify nodes, pinned to plan@version — and acceptance entries are validated single-line and free of the `{{run}}` token (quote the expanded literal paths instead), since acceptance is never token-expanded. `graph_submit_plan` validates the graph — unique ids, resolvable dependencies, no cycles, pairwise-disjoint write scopes, mandatory review-before-implement and implement-before-verify gates, no write nodes for plan-only intents, and the **artifact naming contract** (declared `outputs` must equal the runner-assigned name for the kind — `findings`, `plan`, `review`, `change:<id>`, `verification:<id>`, `baseline:<id>` — or be omitted, and `inputs` may only reference names some runner-managed artifact can satisfy, so a node can never wait on a name nothing produces) — before it ever reaches run state; an `INVALID_GRAPH` rejection carries a compact TaskSpec schema summary (kind↔agent mapping, bare artifact `outputs`, naming rules, gate rules) so the planner can fix the submission without guessing. Each role then delivers through its own tool: `graph_submit_review`, `graph_submit_change`, `graph_submit_verification`, `graph_submit_findings`; `graph_inspect` reports node states, attempts, blockers, artifact versions, per-node mechanical progress (side-effect counts, last activity, deliverable completion when declared) and a Mermaid diagram; `graph_run_resume` performs crash recovery; `graph_run_new` starts a successor run after a terminal one.
 
 ### Artifact liveness at plan submission
 
@@ -91,7 +284,7 @@ A node may read its own currently-valid prior output before publishing its succe
 
 ### Light path (critic-free small changes)
 
-`intent: "light"` is a routing lane for mechanical, low-risk fixes (copy, formatting, single-file typos): the review node is omitted, the single implement node depends directly on the plan node, and the critic session is skipped — **at most one implement node** is enforced at validation. Every mechanical gate is unchanged: writeScope confinement, the edit ledger cross-check, deliverables-backed artifact evidence and the verify-after-implement gate all still apply; only the advisory quality review is waived. The change artifact cites `plan@v` instead of `review@v`. Use the full `change` flow (with exploration) for cross-file, async, database or otherwise high-risk work — the orchestrator prompt encodes this routing.
+Within the Graph strategy, `intent: "light"` retains the existing route for mechanical, low-risk fixes: the review node is omitted, the single implement node depends directly on the plan node, and the critic session is skipped — **at most one implement node** is enforced at validation. Every mechanical gate is unchanged: writeScope confinement, the edit ledger cross-check, deliverables-backed artifact evidence and the verify-after-implement gate all still apply; only the advisory quality review is waived. The change artifact cites `plan@v` instead of `review@v`. Light still uses a planner and verifier; Direct is the default recommendation for eligible ordinary tasks. Use the full `change` flow when risk or independent work requires its review/dependency structure, not merely because several files change.
 
 ### Baseline: separating pre-existing failures from regressions
 
@@ -165,13 +358,14 @@ Structured submissions carry a bounded evidence vocabulary beyond file claims:
 
 ### Dispatch and recovery
 
-- **Strict dispatch targets:** every implementer/verifier dispatch should explicitly name its node; `task_id` continuations and nested consultations always must. For native `task`, put a single `[nodeId: implement-setup]` marker **alone on the first prompt line**, with the task description starting on the next line. LF/CRLF and surrounding header whitespace are accepted; `[nodeId:impl-b] do B` is rejected. The hook also accepts an explicit `nodeId` argument when supplied by a caller; if both sources are present, both must be valid and equal. Malformed targets return `INVALID_NODE_ID`, and conflicting sources return `CONFLICTING_NODE_ID`; no malformed writer target ever falls back to sorted selection. A **missing** target on a fresh root dispatch is auto-resolved only when exactly one node of that role is admissible — the dispatch ack labels the assignment `auto-resolved` and the dispatch record exposes `autoResolved` — while several admissible candidates reject with `NODE_ID_REQUIRED` and the candidate list, and missing targets on `task_id` continuations always reject with `NODE_ID_REQUIRED`. An explicitly targeted node that is not yet admissible names the other admissible nodes of that role in its `NODE_NOT_ADMISSIBLE` detail. Other roles retain their existing unmarked/free dispatch behavior; body quotations are not target metadata.
+- **Structured dispatch targets:** prefer the optional `nodeId` field exposed on native `task` through `tool.definition`. It is optional globally: ordinary tasks and nested image consultations do not require it. The runner consumes it before native decoding, and records `targetSource` (`argument`, `marker`, `task-id`, `unique-admissible`, or `none`; old records report `legacy`). A valid field selects the node regardless of prompt layout; recognizable contradictory leading markers return `CONFLICTING_NODE_ID`. Without the field, a single leading first-line `[nodeId:implement-setup]` remains supported, including same-line task text and LF/CRLF whitespace. Multiple leading markers or invalid legacy IDs return `INVALID_NODE_ID`; examples in later prose never select a node. A missing target on a fresh root dispatch auto-resolves only when exactly one node is admissible; multiple candidates return `NODE_ID_REQUIRED` with a bounded candidate list. Valid `task_id` continuations can omit the target only when the runner authenticates their original node. Explicitly targeted but ineligible nodes return `NODE_NOT_ADMISSIBLE`, not silent reassignment.
+- **Direct rejection:** a rejected graph task throws `RUNNER_REJECTED(code)` from the before-hook. The diagnostic contains bounded `code`, `detail`, `callID`, `targetSource`, `requestedNodeId`, `candidates`/`candidatesTotal` and `nextAction`: `correct-target`, `wait-for-completion`, `inspect-run`, `revise-plan`, or `user-decision`. Input arguments remain intact, and no rejection-only child is launched. Format rejections create neither reservations nor attempts. Dependency, pause, capacity and repair gates remain authoritative; a rejection is not a prompt to copy and resend.
 - The runner validates exactly the requested node (existence, role match, admissibility, attempts, writer capacity) and either binds it or rejects the dispatch with the precise reason (`NODE_NOT_FOUND`, `NODE_NOT_ADMISSIBLE`, `ATTEMPTS_EXHAUSTED`, `WRITER_CAPACITY`, `READER_CAPACITY`). Every bound dispatch confirms the assignment with a `[RUNNER] Assigned nodeId` prompt line and uses that same node for scope enforcement and submissions. This guarantees target identity, not the semantics of arbitrary prose: implementers/verifiers must stop and report if the task body contradicts the assigned node or scope.
 - Implementers run in parallel under a bounded writer-capacity gate: at most `min(maxImplementerParallel, critic approvedParallel)` implement nodes may be RUNNING (or reserved) at once, and their write scopes are pairwise disjoint by plan validation. Concurrent dispatch reservations occupy the **explicitly requested** nodes; a duplicate reservation reports `DISPATCH_PENDING`. Host metadata correlates calls by parent session and callID, regardless of session creation or metadata arrival order. Verifiers, critics and planners keep one-in-flight semantics.
 - Explorers and multimodal analysts run in parallel under a mirrored reader-capacity gate: at most `maxParallel` exploration/analysis tasks (free consultation reservations plus node-bound explore/analyze work, one shared budget) may be in flight at once; excess dispatches are rejected with `READER_CAPACITY`, and an active `task_id` continuation never self-blocks. The orchestrator prompt asks for same-turn multi-dispatch of independent exploration aspects.
 - The critic is never freely admitted: its verdict can only travel through a bound review node, so when the review node exists but is not yet admissible the dispatch is rejected up front with `NO_READY_NODE` and the waiting reasons (plus the artifact-naming hint when an input references a name nothing produces) instead of stranding a child session that could never submit. Explorer, planner and multimodal keep free consultation because their findings/plan submissions do not require a node binding.
 - `task_id` may continue the same active RUNNING attempt and role in the same run without charging another attempt. It may also **resume any node the session last worked on** when that node is `INCOMPLETE`/`PENDING`/`STALE` with attempts left — including a REVISE'd planner, a critic re-reviewing after a re-plan, or an implementer in the repair loop — because `submitPlan` preserves node session ids across plan replacement. A new attempt is charged, the recorded side-effect ledger travels with the dispatch, and the previous execution binding is superseded without erasing any outstanding host lifetime. Pre-dispatch idle receipts are retained as fenced, bounded hints; they are never completion authority for a new call. Read-only role sessions with a revoked or missing binding may still be continued by identity: the reservation carries the session id and host metadata plus the bounded parentage lookup re-verify the relationship before any work is trusted; write-role continuations always require state-verified identity. After a plugin restart the in-memory binding is rebuilt from run state the same way, so an interrupted implementer conversation can be picked back up instead of starting over. Sessions without a usable dispatch fail with an actionable `BINDING_UNAVAILABLE` that tells the child to stop and report instead of retrying.
-- An explicit continuation target must match the node belonging to that session, including after restart. A mismatch returns `TASK_NODE_MISMATCH` **before** creating a reservation, charging an attempt or revoking the original binding. Continue with the original node's marker, or dispatch the other node using its own valid session or a fresh session. The rejected task is rewritten to a fresh `RUNNER_REJECTED` child turn; it is not sent into the original session. A valid active-attempt continuation still works at full writer capacity and is not charged twice.
+- An explicit continuation target must match the node belonging to that session, including after restart. A mismatch returns `TASK_NODE_MISMATCH` **before** creating a reservation, charging an attempt or revoking the original binding. Omit nodeId for an authenticated same-node continuation, explicitly name that same node, or dispatch the other node with its own valid session. Unknown/foreign task IDs never fall back to a different ready node. The rejected call is a tool error, not a message sent into the original session or a new child. A valid active-attempt continuation still works at full writer capacity and is not charged twice.
 - Revision and repair evidence is relayed mechanically: dispatching a plan node after a REVISE verdict injects the critic's findings into the task prompt, and dispatching an implement node after a FAILED verification (now recorded as a durable superseded `verification:<id>` artifact) injects the failure summary and failing commands — fresh sessions and task_id continuations both receive it, no coordinator relay required.
 - Read-only tools (`read`, `glob`, `grep`, `list`, `graph_status`, `graph_inspect`, `graph_journal_search`, `graph_journal_read`) are never collaterally blocked by the dispatch-binding gate. Rejected or finished children resolve the owning run through the host-verified parent chain, so inspection and journal history stay available even after a run reaches a terminal state. Write paths keep failing closed.
 - `graph_run_decide(action, reason)` delivers the user's decision for a run paused at `AWAITING_USER_DECISION` (or deliberately rotates/terminates a quiet run). A user-provided reason is required, and native permission `ask` means the host confirms with the human before the tool runs. **abort** irreversibly marks the run `ABORTED`: findings, plans, reviews, violations and dispatch history stay untouched, dispatch is closed (`RUN_TERMINATED`), and the terminal run projects a journal summary with the reason. **reset** archives the run in place — original status, `pendingDecision`, counters and evidence remain, plus a `decision` record and `successorRunId` — and creates a fresh successor run whose counters start at zero; it re-walks the explorer → planner → critic gates and never replays implementer work or recorded side effects. The successor run carries a bounded `carryOver` digest (predecessor id, reset reason, the archived run's final rejection findings, and a findings summary aggregating the last 3 retained versions: summaries joined and capped, learnings newest-first capped at 8 items) that is reported by `graph_inspect` and injected into the new explorer/planner dispatch prompts with a revalidation mandate, so prior lessons are consumed instead of re-derived — and re-rejected. Both actions require no `RUNNING` nodes and no outstanding dispatch reservations first.
@@ -233,12 +427,24 @@ Denied-tool calls retain their original run/node/session/dispatch/call identity 
 - Consumed call IDs are retained in bounded run history (900 calls/run; 128 outstanding reservations), within the sanitizer's 1,000-element array ceiling, so recovery cannot reuse a revoked call ID. A failed binding save can be retried with the same dispatch identity without incrementing the attempt twice; inspect reports `BINDING_PERSISTENCE_FAILED` while the save is unresolved.
 - `graph_inspect` includes pending/bound dispatches, remaining attempts, binding status, last submission failure and a recovery hint. Review attempts and `maxPlanRevisions` are independent budgets. Plan replacement is refused while a review, implementation or verification node is still RUNNING.
 
-When upgrading from the earlier optional-target behavior, keep an explicit first-line marker in all implementer/verifier task templates — including single-node, parallel and recovery calls; the fresh-dispatch unique-admissible auto-resolve is a degraded-context safety net, not a license to omit markers (parallel multi-dispatch with markers omitted still rejects while more than one candidate is admissible). For example:
+Use a structured target on new implementer/verifier calls, especially parallel dispatches. Native task's required fields and background availability are preserved; the extension does not replace its compiled decoder. For example:
 
-```text
-[nodeId:implement-setup]
-Implement the setup work package within its declared writeScope.
+```json
+{
+  "description": "Implement setup package",
+  "subagent_type": "graph-implementer",
+  "nodeId": "implement-setup",
+  "prompt": "Implement the assigned package; use the runner contract and handoff."
+}
 ```
+
+`graph_status.dispatch.taskSchema` reports `unobserved`, `available`, or `unavailable`
+for model-facing schema extension. Foreground JSON Schema is extended immutably;
+background-capable Effect schemas are projected from the actual host definition
+using pinned `effect@4.0.0-beta.83`, preserving native fields. Unsupported shapes or
+conflicting nodeId properties are left unchanged and reported; use the legacy
+leading marker when the field is unavailable. This capability report does not
+attest end-to-end native execution or model compliance.
 
 Quit and restart OpenCode after updating the plugin so the new hooks and agent prompts are loaded.
 
@@ -473,6 +679,7 @@ The default plugin function accepts `(context, options)`. Supported options are 
 | --- | --- | --- |
 | `enabled` | `true` | Boolean; false returns no hooks |
 | `setDefaultAgent` | `false` | Boolean; true selects `graph-orchestrator` |
+| `executionStrategy` | `"auto"` | `"auto"` prefers Direct for bounded, mechanically verifiable tasks; `"graph"` retains the Graph/light workflow |
 | `models` | `{}` | Map of seven full agent names to nonempty model strings, max 256 characters, no surrounding whitespace or control characters |
 | `toolPermissions` | `{ shared: {}, agents: {} }` | Shared and per-role allow/ask/deny rules for LSP and configured MCP namespaces; see above |
 | `maxAttempts` | `3` | Integer 1–20; enforced per-node attempt budget (including the first attempt) and the verification repair loop cap |
@@ -496,7 +703,7 @@ The unit suite covers the sanitizer, TaskSpec/graph validation, the run and jour
 
 What remains explicitly **not** claimed:
 
-- `RUNNER_REJECTED` is a soft block: the child session is created and consumes a small turn, because `tool.execute.before` cannot abort a call.
+- `RUNNER_REJECTED` relies on the native host awaiting the before-hook before executing task. Source/SDK-shaped tests cover this ordering; host/model acceptance is separate evidence (see `docs/structured-dispatch-host-probe.md`).
 - Established graph bindings do not restrict read paths; read-only tools are exempt from the binding gate entirely. Unknown child bindings fail closed (except read-only tools) until host identity is resolved. Resource locks are not a shell sandbox — `allowShell` implementers and read-only specialists get a best-effort static write-target screen (redirections, common write commands, heredocs; tracked `cd`), which fails open on anything it cannot confidently resolve; commands with effects outside the workspace remain governed only by native permissions.
 - Submit-tool caller binding relies on host-provided tool context, task progress metadata (`callID`, `parentSessionId`, `sessionId`) and child parentage. Event races and bounded lookup are covered by simulations; a host that changes these semantics needs re-verification on the pinned build.
 - Verifier `bash` remains a native `ask`; the runner never answers prompts on the user's behalf except to DENY rule violations.

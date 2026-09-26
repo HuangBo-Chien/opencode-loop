@@ -31,12 +31,21 @@ async function harness(agent = 'graph-implementer', count = 2) {
   return { store, runner, state, bindings, enforcement, dispatch, session, metadata };
 }
 
+async function rejected(h, ...args) {
+  let error;
+  await assert.rejects(h.dispatch(...args), failure => {
+    error = failure;
+    return failure.name === 'DispatchRejection';
+  });
+  return error;
+}
+
 for (const agent of ['graph-implementer', 'graph-verifier']) {
   test(`strict target: ${agent} auto-resolves a single admissible candidate`, async () => {
     const h = await harness(agent, 1);
     const args = await h.dispatch('auto', 'Work on the only task');
     assert.doesNotMatch(args.prompt, /RUNNER_REJECTED/);
-    assert.ok(args.prompt.includes(`[RUNNER] Assigned nodeId: a (auto-resolved: the only admissible node for this role right now; always include [nodeId:...] on the first prompt line). Submit only this node.`), args.prompt);
+    assert.ok(args.prompt.includes(`[RUNNER] Assigned nodeId: a (auto-resolved: the only admissible node for this role right now; prefer the structured nodeId field). Submit only this node.`), args.prompt);
     assert.ok(args.prompt.includes('Work on the only task'));
     assert.match(args.prompt, /\n\[RUNNER_TASK_CALL:[a-f0-9-]{36}\]$/);
     assert.equal(h.state.nodes.a.attempt, 0); // reservation never charges
@@ -52,10 +61,9 @@ for (const agent of ['graph-implementer', 'graph-verifier']) {
 
   test(`strict target: ${agent} with several admissible candidates still requires an explicit marker`, async () => {
     const h = await harness(agent, 2);
-    const args = await h.dispatch('missing', 'Work on task B');
-    assert.match(args.prompt, /RUNNER_REJECTED/);
-    assert.match(args.prompt, /NODE_ID_REQUIRED/);
-    assert.match(args.prompt, /a, b/); // the candidate list
+    const error = await rejected(h, 'missing', 'Work on task B');
+    assert.equal(error.code, 'NODE_ID_REQUIRED');
+    assert.deepEqual(error.diagnostic.candidates, ['a', 'b']);
     assert.deepEqual(h.enforcement.dispatches.inspect('root'), []);
     assert.ok(Object.values(h.state.nodes).every((node) => node.state === 'PENDING' && node.attempt === 0));
   });
@@ -118,7 +126,6 @@ test('strict target: a valid but nonexistent target does not create dispatch his
 });
 
 const invalidTargets = [
-  ['inline marker', '[nodeId:b] Implement B', {}, 'INVALID_NODE_ID'],
   ['empty marker', '[nodeId:]\nImplement B', {}, 'INVALID_NODE_ID'],
   ['illegal marker', '[nodeId:b/c]\nImplement B', {}, 'INVALID_NODE_ID'],
   ['unclosed marker', '[nodeId:b\nImplement B', {}, 'INVALID_NODE_ID'],
@@ -128,15 +135,13 @@ const invalidTargets = [
   ['non-string argument', '[nodeId:b]\nImplement B', { nodeId: 42 }, 'INVALID_NODE_ID'],
   ['illegal argument', '[nodeId:b]\nImplement B', { nodeId: 'a/b' }, 'INVALID_NODE_ID'],
   ['conflicting sources', '[nodeId:b]\nImplement B', { nodeId: 'a' }, 'CONFLICTING_NODE_ID'],
-  ['valid argument cannot mask malformed marker', '[nodeId:b] Implement B', { nodeId: 'b' }, 'INVALID_NODE_ID'],
   ['second-line marker is not a target', 'Implement B\n[nodeId:b]', {}, 'NODE_ID_REQUIRED'],
 ];
 for (const [name, prompt, extra, code] of invalidTargets) {
   test(`strict target: ${name} is rejected before reservation`, async () => {
     const h = await harness();
-    const args = await h.dispatch('bad', prompt, extra);
-    assert.match(args.prompt, /RUNNER_REJECTED/);
-    assert.ok(args.prompt.includes(code), args.prompt);
+    const error = await rejected(h, 'bad', prompt, extra);
+    assert.equal(error.code, code);
     assert.deepEqual(h.enforcement.dispatches.inspect('root'), []);
     assert.deepEqual(h.state.dispatchCallIds ?? [], []);
     assert.equal(h.state.nodes.a.attempt, 0);
@@ -146,6 +151,8 @@ for (const [name, prompt, extra, code] of invalidTargets) {
 
 for (const [name, prompt, extra] of [
   ['marker', '[nodeId:b]\nImplement B', {}],
+  ['inline marker', '[nodeId:b] Implement B', {}],
+  ['inline marker with argument', '[nodeId:b] Implement B', { nodeId: 'b' }],
   ['CRLF and surrounding whitespace', ' \t[nodeId: b]\t\r\nImplement B', {}],
   ['argument', 'Implement B', { nodeId: 'b' }],
   ['matching sources', '[nodeId:b]\nImplement B', { nodeId: 'b' }],
@@ -182,22 +189,16 @@ for (const agent of ['graph-implementer', 'graph-verifier']) {
       const beforeBinding = h.bindings.get('child-a');
       const beforeDispatches = h.enforcement.dispatches.inspect('root');
       const beforeCalls = [...h.state.dispatchCallIds];
-      const conflict = await h.dispatch('conflict', '[nodeId:b]\nImplement B', { task_id: 'child-a' });
-      assert.match(conflict.prompt, /RUNNER_REJECTED/);
-      assert.match(conflict.prompt, /TASK_NODE_MISMATCH/);
-      assert.equal(Object.hasOwn(conflict, 'task_id'), false);
+      const conflict = await rejected(h, 'conflict', '[nodeId:b]\nImplement B', { task_id: 'child-a' });
+      assert.equal(conflict.code, 'TASK_NODE_MISMATCH');
       assert.deepEqual(h.state.nodes.a, beforeNode);
       assert.equal(h.bindings.get('child-a'), beforeBinding);
       assert.deepEqual(h.enforcement.dispatches.inspect('root'), beforeDispatches);
       assert.deepEqual(h.state.dispatchCallIds, beforeCalls);
 
-      const missing = await h.dispatch('missing', 'Continue A', { task_id: 'child-a' });
-      assert.match(missing.prompt, /NODE_ID_REQUIRED/);
-      assert.equal(Object.hasOwn(missing, 'task_id'), false);
-      assert.deepEqual(h.enforcement.dispatches.inspect('root'), beforeDispatches);
-
-      const valid = await h.dispatch('continue-a', '[nodeId:a]\nContinue A', { task_id: 'child-a' });
+      const valid = await h.dispatch('continue-a', 'Continue A', { task_id: 'child-a' });
       assert.match(valid.prompt, /Assigned nodeId: a/);
+      assert.equal(h.enforcement.dispatches.inspect('root').find(r => r.callID === 'continue-a').targetSource, 'task-id');
       assert.equal(h.state.nodes.a.attempt, 1); // reservation never charges
       await h.metadata('continue-a', 'child-a', valid);
       assert.equal(h.bindings.get('child-a').nodeId, 'a');
@@ -295,18 +296,14 @@ test('strict target: direct admission with several candidates lists them in the 
 test('dispatch without subagent_type is AGENT_REQUIRED; an unknown role stays INVALID_AGENT', async () => {
   const h = await harness('graph-implementer', 1);
   const missing = { args: { description: 'no-role', prompt: 'hello' } };
-  await h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID: 'no-role' }, missing);
-  assert.match(missing.args.prompt, /RUNNER_REJECTED/);
-  assert.ok(missing.args.prompt.includes('AGENT_REQUIRED'), missing.args.prompt);
-  assert.ok(missing.args.prompt.includes('subagent_type'), missing.args.prompt);
-  assert.equal(missing.args.subagent_type, 'graph-explorer');
+  await assert.rejects(h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID: 'no-role' }, missing), /RUNNER_REJECTED\(AGENT_REQUIRED\)/);
+  assert.equal(missing.args.prompt, 'hello');
+  assert.equal(missing.args.subagent_type, undefined);
   assert.deepEqual(h.enforcement.dispatches.inspect('root'), []);
 
   const unknown = { args: { description: 'bad-role', subagent_type: 'graph-minion', prompt: 'hello' } };
-  await h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID: 'bad-role' }, unknown);
-  assert.match(unknown.args.prompt, /RUNNER_REJECTED/);
-  assert.ok(unknown.args.prompt.includes('INVALID_AGENT'), unknown.args.prompt);
-  assert.ok(unknown.args.prompt.includes('graph-minion'), unknown.args.prompt);
+  await assert.rejects(h.enforcement.onToolBefore({ tool: 'task', sessionID: 'root', callID: 'bad-role' }, unknown), /RUNNER_REJECTED\(INVALID_AGENT\)/);
+  assert.equal(unknown.args.prompt, 'hello');
   assert.equal(h.state.violations.some((v) => v.detail.includes('AGENT_REQUIRED')), true);
 });
 

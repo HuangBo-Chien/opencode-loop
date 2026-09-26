@@ -34,8 +34,10 @@ function validateStateDirectory(value) {
 export function parseOptions(input = {}) {
   record(input, 'plugin');
   const defaults = {
-    enabled: true, setDefaultAgent: false, models: {},
+    enabled: true, setDefaultAgent: false, models: {}, executionStrategy: 'auto',
     maxAttempts: 3, maxParallel: 4, maxImplementerParallel: 2,
+    settlementTimeoutMs: 30000,
+    phaseAccounting: true,
     stateDirectory: '.opencode-loop', maxPlanRevisions: undefined, enforcement: 'hooks',
     journal: { enabled: true, includeUserRequest: true, semanticSearch: true, maxUserRequestChars: 8000 },
     lessons: { enabled: true, injectMax: 4 },
@@ -46,7 +48,11 @@ export function parseOptions(input = {}) {
     if (!Object.hasOwn(Object.getOwnPropertyDescriptor(input, key), 'value')) throw new TypeError('Plugin options must contain values, not getters');
   }
   const options = { ...defaults, ...input };
-  for (const name of ['enabled', 'setDefaultAgent']) {
+  if (!['auto', 'graph'].includes(options.executionStrategy)) throw new TypeError('executionStrategy must be auto or graph');
+  if (!Number.isInteger(options.settlementTimeoutMs) || options.settlementTimeoutMs < 1000 || options.settlementTimeoutMs > 300000) {
+    throw new TypeError('settlementTimeoutMs must be an integer from 1000 to 300000');
+  }
+  for (const name of ['enabled', 'setDefaultAgent', 'phaseAccounting']) {
     if (typeof options[name] !== 'boolean') throw new TypeError(`${name} must be a boolean`);
   }
   for (const [name, upper] of [['maxAttempts', 20], ['maxParallel', 16], ['maxImplementerParallel', 4]]) {

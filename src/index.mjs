@@ -2,6 +2,10 @@ import { parseOptions, resolveWorktree } from './config.mjs';
 import { registerAgents } from './agents.mjs';
 import { createStatusTool } from './status.mjs';
 import { createRunStore } from './run-state.mjs';
+import { createPersistenceLogger } from './run-state-write.mjs';
+import { createReliableRunStore } from './run-reliability.mjs';
+import { createSettlementController } from './settlement.mjs';
+import { createRunAccounting } from './run-accounting.mjs';
 import { createRunner } from './runner.mjs';
 import { createSubmitTools } from './submit.mjs';
 import { createEnforcement } from './enforcement.mjs';
@@ -12,13 +16,18 @@ import { createJournalService, createJournaledRunStore } from './journal.mjs';
 import { createJournalTools } from './journal-tools.mjs';
 import { createLessonService, LESSON_KINDS } from './lessons.mjs';
 import { createLessonTools } from './lesson-tools.mjs';
+import { createTaskDefinitionHook } from './task-definition.mjs';
 
 export default async function GraphPlugin(context, options = {}) {
   const settings = parseOptions(options);
   if (!settings.enabled) return {};
   const worktree = resolveWorktree(context);
 
-  const baseStore = createRunStore({ worktree, stateDirectory: settings.stateDirectory });
+  const persistenceLog = createPersistenceLogger(context.client);
+  const accounting = createRunAccounting({ worktree, stateDirectory: settings.stateDirectory, enabled: settings.phaseAccounting });
+  const baseStore = createReliableRunStore(createRunStore({ worktree, stateDirectory: settings.stateDirectory,
+    onPersistenceEvent: event => { accounting.persistence(event); return persistenceLog(event); } }),
+    { onCommit: accounting.commit, onFault: event => persistenceLog({ ...event, phase: 'failed', stage: 'publication' }) });
   const journalStore = createJournalStore({ worktree, stateDirectory: settings.stateDirectory });
   const lessonStore = createJournalStore({ worktree, stateDirectory: settings.stateDirectory, subdirectory: 'lessons', kinds: LESSON_KINDS });
   const embeddingProvider = createEmbeddingProvider();
@@ -54,8 +63,11 @@ export default async function GraphPlugin(context, options = {}) {
   let hostConfig = null;
   const getToolPermissions = () => toolPermissions;
   const getSubagentDepth = () => hostConfig?.subagent_depth ?? 1;
-  const enforcement = createEnforcement({ settings: { worktree, journal: settings.journal, lessons: settings.lessons }, store, runner, bindings, client: context.client, lessons: lessonService, getToolPermissions, getSubagentDepth });
-  const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches });
+  const taskDefinition = createTaskDefinitionHook();
+  const enforcement = createEnforcement({ settings: { ...settings, worktree }, store, runner, bindings, client: context.client, lessons: lessonService, getToolPermissions, getSubagentDepth });
+  const settlement = createSettlementController({ store, exclusive: enforcement.dispatches.exclusive,
+    reconcile: enforcement.reconcileSettlement, timeoutMs: settings.settlementTimeoutMs, worktree, stateDirectory: settings.stateDirectory });
+  const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches, accounting, settings });
   const journalTools = createJournalTools({
     journalService,
     store,
@@ -79,11 +91,29 @@ export default async function GraphPlugin(context, options = {}) {
       if (config.subagent_depth === undefined) config.subagent_depth = 2;
       hostConfig = config;
     },
-    tool: { graph_status: createStatusTool(settings, journalService, lessonService, getToolPermissions), ...tools, ...journalTools, ...lessonTools },
-    'chat.message': enforcement.onChatMessage,
+    tool: { graph_status: createStatusTool(settings, journalService, lessonService, getToolPermissions, taskDefinition.status), ...tools, ...journalTools, ...lessonTools },
+    'tool.definition': taskDefinition.onToolDefinition,
+    'chat.message': async (input, output) => {
+      const existing = bindings.has(input?.sessionID);
+      await enforcement.onChatMessage(input, output);
+      const id = bindings.get(input?.sessionID)?.runId;
+      if (!existing && id && store.getRun(id)?.status === 'SETTLING') await settlement.restore(id);
+    },
     'tool.execute.before': enforcement.onToolBefore,
     'tool.execute.after': enforcement.onToolAfter,
     'permission.ask': enforcement.onPermissionAsk,
-    event: enforcement.onEvent,
+    event: async input => {
+      if (input?.event?.type === 'server.instance.disposed') { settlement.close(); await accounting.close(); }
+      if (input?.event?.type === 'message.updated') {
+        const info = input.event.properties?.info;
+        const binding = bindings.get(info?.sessionID);
+        if (binding) accounting.message(info, binding);
+      }
+      await enforcement.onEvent(input);
+      const p = input?.event?.properties;
+      const sessionId = p?.part?.sessionID ?? p?.info?.sessionID ?? p?.sessionID;
+      const runId = bindings.get(sessionId)?.runId ?? enforcement.dispatches.runForSession(sessionId);
+      if (runId && store.getRun(runId)?.status === 'SETTLING') await settlement.tick(runId);
+    },
   };
 }

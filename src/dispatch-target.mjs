@@ -2,8 +2,9 @@ const NODE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 export const TARGET_REQUIRED_AGENTS = new Set(['graph-implementer', 'graph-verifier']);
 
-// Only strict target roles reject malformed marker-like text. Other roles may
-// mention nodeId syntax in ordinary prose without turning it into metadata.
+// A structured nodeId is authoritative. Legacy routing reads only a leading
+// first-line marker, never examples later in prose. Preserve recognizable
+// conflicts even when the coordinator supplies the new field.
 export function parseNodeIdHint(args, { strict = false } = {}) {
   const source = args && typeof args === 'object' ? args : {};
   const hasArgument = Object.hasOwn(source, 'nodeId');
@@ -12,14 +13,25 @@ export function parseNodeIdHint(args, { strict = false } = {}) {
   }
   const prompt = typeof source.prompt === 'string' ? source.prompt : '';
   const firstLine = prompt.split('\n', 1)[0] ?? '';
-  const match = firstLine.match(/^\s*\[nodeId:\s*([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\]\s*$/);
-  if (!match && strict && /\[\s*nodeId\b/i.test(firstLine)) {
-    return { allowed: false, code: 'INVALID_NODE_ID', detail: 'put exactly one [nodeId:target-node] marker alone on the first prompt line, then put the task description on the next line' };
+  const markers = [];
+  let rest = firstLine, malformed = false;
+  // Only an adjacent leading marker sequence carries routing intent. Once
+  // ordinary prose starts, examples (even on this same line) remain prose.
+  while (/^\s*\[\s*nodeId\b/i.test(rest)) {
+    const marker = rest.match(/^\s*\[\s*nodeId:\s*([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\]/i);
+    if (!marker) { malformed = true; break; }
+    markers.push(marker[1]);
+    rest = rest.slice(marker[0].length);
   }
-  if (hasArgument && match && source.nodeId !== match[1]) {
-    return { allowed: false, code: 'CONFLICTING_NODE_ID', detail: `nodeId argument ${source.nodeId} conflicts with first-line marker ${match[1]}; both must name the same node` };
+  if (hasArgument) {
+    const conflict = markers.find(marker => marker !== source.nodeId);
+    if (conflict) return { allowed: false, code: 'CONFLICTING_NODE_ID', detail: `nodeId argument ${source.nodeId} conflicts with leading marker ${conflict}; remove the contradictory marker or correct nodeId` };
+    return { allowed: true, nodeId: source.nodeId, source: 'argument' };
   }
-  return { allowed: true, nodeId: hasArgument ? source.nodeId : match?.[1] ?? null };
+  if (strict && (malformed || markers.length > 1)) {
+    return { allowed: false, code: 'INVALID_NODE_ID', detail: 'set nodeId to one valid node ID, or use exactly one leading [nodeId:target-node] marker; same-line task text is allowed' };
+  }
+  return { allowed: true, nodeId: markers[0] ?? null, source: markers.length ? 'marker' : 'none' };
 }
 
 export function resolveNodeIdHint(args, desiredNodeId = null, { strict = false } = {}) {
@@ -33,5 +45,5 @@ export function resolveNodeIdHint(args, desiredNodeId = null, { strict = false }
   if (desired !== null && parsed.nodeId !== null && desired !== parsed.nodeId) {
     return { allowed: false, code: 'CONFLICTING_NODE_ID', detail: `dispatch target ${desired} conflicts with supplied nodeId ${parsed.nodeId}; both must name the same node` };
   }
-  return { allowed: true, nodeId: desired ?? parsed.nodeId };
+  return { allowed: true, nodeId: desired ?? parsed.nodeId, source: parsed.source === 'none' && desired !== null ? 'argument' : parsed.source };
 }

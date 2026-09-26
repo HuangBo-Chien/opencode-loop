@@ -10,6 +10,10 @@ import { cleanJson } from './json-safe.mjs';
 import { assertSettlementCapacity, isUncertainEffect } from './runner.mjs';
 import { publishArtifact, validateRepairTargets, verificationFiles, repairSettlementPending } from './artifact-dependencies.mjs';
 import { validateTaskGraph, expandRunTokens, runToken, validateFileClaim } from './task-spec.mjs';
+import { readHandoff, handoffManifest, plannerHandoffConflict } from './artifact-handoffs.mjs';
+import { createDirectTools } from './direct-tools.mjs';
+import { captureWorkspace } from './direct-workspace.mjs';
+import { acceptDirect, directPending, validateDirectChange } from './direct.mjs';
 
 const z = tool.schema;
 const NOW = () => new Date().toISOString();
@@ -32,7 +36,7 @@ function artifactPathProblem(input) {
   return checked.ok ? null : checked.detail;
 }
 
-export function createSubmitTools({ store, runner, bindings, worktree, dispatches }) {
+export function createSubmitTools({ store, runner, bindings, worktree, dispatches, accounting, settings = {} }) {
   function runFor(context) {
     const binding = bindings.get(context.sessionID);
     if (!binding) return { error: rejected('NOT_GRAPH_SESSION', 'this session is not part of a graph run; work is dispatched by graph-orchestrator through native task') };
@@ -66,6 +70,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (wrong) return wrong;
       const located = runFor(context);
       if (located.error) return located.error;
+      if (located.state.mode === 'direct') return rejected('DIRECT_CONTRACT_ACTIVE', 'Root must settle and escalate Direct before submitting a Graph plan');
       if (Object.values(located.state.nodes).some((node) => node.state === 'RUNNING' && ['review', 'implement', 'verify'].includes(node.spec.kind))) {
         return rejected('RUN_BUSY', 'finish or recover in-flight review/implementation/verification before replacing the plan');
       }
@@ -81,6 +86,8 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         ].join(' '));
       }
       try {
+        const conflict = plannerHandoffConflict(located.state, located.binding, args.basedOn ?? []);
+        if (conflict) return rejected('HANDOFF_INPUT_CHANGED', conflict);
         const candidate = structuredClone(located.state);
         const result = runner.submitPlan(candidate, {
           intent: args.intent,
@@ -101,7 +108,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
           : args.intent === 'light' ? 'dispatch the implement node directly (critic-free light lane); verification evidence gates still apply' : 'await plan critique before implementation';
         return reply({ ok: true, planVersion: result.version, mode: result.mode, runToken: runToken(located.state.runId), order: graph.order, lanes, next });
       } catch (error) {
-        return rejected('PAYLOAD_INVALID', error.message);
+        return rejected(error.code === 'PERSISTENCE_FAILED' ? error.code : 'PAYLOAD_INVALID', error.message);
       }
     },
   });
@@ -138,7 +145,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       summary: z.string().min(1).max(2000),
       checksRun: z.array(z.string().max(2000)).max(16).default([]),
       unresolved: z.array(z.string().max(2000)).max(16).default([]),
-      risks: z.array(z.string().max(2000)).max(16).default([]),
+      risks: z.array(z.string().max(2000).refine((entry) => !/[\n\r]/.test(entry), 'risks entries must be single-line')).max(16).default([]),
     },
     async execute(args, context) {
       const wrong = requireRole(context, 'graph-implementer');
@@ -155,11 +162,20 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         await store.saveRun(located.state);
         return reply(checked);
       }
-      const snapshot = await store.hashFiles(checked.claimed);
-      const result = runner.submitChange(located.state, { ...args, snapshot, now: NOW() });
+      let directResult;
+      if (located.state.mode === 'direct') {
+        let inventory;
+        try { inventory = await captureWorkspace(worktree, settings); }
+        catch (error) { return rejected('DIRECT_WORKSPACE_UNSUPPORTED', error.message); }
+        directResult = validateDirectChange(located.state, { ...located.binding, sessionId: context.sessionID }, args, inventory);
+        if (!directResult.ok) return reply(directResult);
+      }
+      const snapshot = directResult?.snapshot ?? await store.hashFiles(checked.claimed);
+      const result = runner.submitChange(located.state, { ...args, ...(directResult ? { checksRun: directResult.checks } : {}), snapshot, now: NOW() });
+      if (result.ok && directResult) acceptDirect(located.state, directResult, NOW());
       await store.saveRun(located.state);
       if (!result.ok) return reply(result);
-      return reply({ ok: true, changeVersion: result.version, next: 'verification follows' });
+      return reply({ ok: true, changeVersion: result.version, next: directResult ? 'runner acceptance recorded; stop and let host lifetime settle' : 'verification follows' });
     },
   });
 
@@ -174,6 +190,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       artifacts: z.array(z.string().min(1).max(512)).max(32).default([]),
       probed: z.array(z.string().max(2000)).max(16).default([]),
       skipped: z.array(z.string().max(2000)).max(16).default([]),
+      resolvedEffects: z.array(z.object({ sessionId: z.string().min(1).max(256), callID: z.string().min(1).max(256) })).max(128).optional(),
       summary: z.string().max(2000).optional(),
     },
     async execute(args, context) {
@@ -226,7 +243,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       nodeId: z.string().min(1).max(128).optional(),
       summary: z.string().min(1).max(4000),
       evidence: z.array(z.string().max(2000)).max(32).default([]),
-      learnings: z.array(z.string().max(2000)).max(16).default([]),
+      learnings: z.array(z.string().max(2000).refine((entry) => !/[\n\r]/.test(entry), 'learnings entries must be single-line')).max(16).default([]),
     },
     async execute(args, context) {
       if (context.agent !== 'graph-explorer' && context.agent !== 'graph-multimodal') {
@@ -255,15 +272,33 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         Object.assign(located.state, candidate);
         return reply({ ok: true, artifact: `findings@${version}` });
       } catch (error) {
-        return rejected('PAYLOAD_INVALID', error.message);
+        return rejected(error.code === 'PERSISTENCE_FAILED' ? error.code : 'PAYLOAD_INVALID', error.message);
       }
     },
   });
 
+  const graph_artifact_read = tool({
+    description: 'Read an exact artifact snapshot from your dispatch handoff. With ref, returns JSON text pages (limit 1..8000, default 4000 UTF-16 units), SHA-256 and nextOffset; concatenate through nextOffset=null. Omit ref to page its manifest entries (limit 1..16, default 16). Never substitutes latest. Root may inspect retained handoffs in its own run.',
+    args: {
+      handoffId: z.string().min(1).max(128), ref: z.string().min(1).max(256).optional(),
+      offset: z.number().int().min(0).optional(), limit: z.number().int().min(1).max(8000).optional(),
+    },
+    async execute(args, context) {
+      const binding = bindings.get(context.sessionID);
+      if (!binding || binding.agent !== context.agent || binding.nested
+        || !binding.root && dispatches && !dispatches.owns(binding, { settled: true })) {
+        return rejected('HANDOFF_UNAVAILABLE', 'An authenticated owner of this handoff is required.');
+      }
+      const state = store.getRun(binding.runId);
+      if (!state) return rejected('RUN_GONE', 'The owning run is unavailable.');
+      return reply(readHandoff(state, binding, args));
+    },
+  });
+
   const graph_inspect = tool({
-    description: 'Inspect the current graph run: node states, attempts, blockers, artifact versions and validity, plus a Mermaid diagram. Read-only.',
-    args: {},
-    async execute(_args, context) {
+    description: 'Inspect the current graph run: node states, attempts, blockers, artifact versions, validity and Mermaid diagram. Handoff summaries are paginated (handoffOffset, handoffLimit); follow handoffPage.nextOffset. Read an individual manifest with graph_artifact_read, omitting ref. Read-only.',
+    args: { handoffOffset: z.number().int().min(0).optional(), handoffLimit: z.number().int().min(1).max(16).optional() },
+    async execute(args, context) {
       if (!context.agent?.startsWith('graph-')) return rejected('NOT_GRAPH_AGENT', 'graph inspection is reserved for graph agents');
       const binding = bindings.get(context.sessionID);
       // Read-only and binding-free by design: managed children without their
@@ -274,6 +309,14 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       const state = store.getRun(runId) ?? (store.loadRun ? await store.loadRun(runId) : null);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
       const report = runner.inspect(state);
+      if (accounting) report.accounting = accounting.inspect(runId);
+      if (state.lifecycleVersion === 1) {
+        const effects = state.sideEffects.filter(isUncertainEffect);
+        report.uncertainEffects = { count: effects.length, entries: effects.slice(0, 128).map(e => ({
+          nodeId: e.nodeId ?? null, sessionId: e.sessionId ?? null, callID: e.callID ?? null, tool: e.tool,
+          target: typeof e.target === 'string' ? e.target.slice(0, 512) : null,
+        })) };
+      }
       // Honest deliverable progress: bash-created artifacts (venv binaries,
       // symlinks, generated checkpoints) never enter the edit/write ledger
       // or the filesTouched claim, so the runner's ledger-only numbers can
@@ -294,7 +337,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         const stillPending = declared.filter((file) => !covered.has(file) && !existsSync(join(worktree, file)));
         node.deliverables = { total: declared.length, done: declared.length - stillPending.length, pending: stillPending.slice(0, 8) };
       }
-      return reply({ ...report, ...(dispatches ? { dispatches: dispatches.inspect(state.runId) } : {}) });
+      return reply({ ...report, ...handoffManifest(state, args), ...(state.lifecycleVersion === 1 ? { settlement: state.settlement ?? null } : {}), ...(store.fault ? { infrastructureFault: store.fault(runId) } : {}), ...(dispatches ? { dispatches: dispatches.inspect(state.runId) } : {}) });
     },
   });
 
@@ -311,6 +354,9 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (state.status !== 'SUCCEEDED' && state.status !== 'FAILED' && state.status !== 'ABORTED') {
         return rejected('RUN_NOT_TERMINAL', `the current run is ${state.status}; finish, recover or decide it first`);
       }
+      if (state.lifecycleVersion === 1 && (state.dispatchReservations?.length || state.dispatchRecoveryIssues?.length || state.pendingEffects?.length || dispatches?.inspect(state.runId).length)) {
+        return rejected('DISPATCH_PENDING', 'Outstanding host lifetimes/effects must settle before starting a successor');
+      }
       dispatches?.invalidate(state.runId);
       let runId = null;
       for (let counter = 2; counter <= 99; counter += 1) {
@@ -320,7 +366,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         break;
       }
       if (!runId) return rejected('RUN_LIMIT', 'this session reached its successor-run limit');
-      await store.createRun({ runId, rootSessionId: state.rootSessionId, now: NOW(), request: null, requestCaptureCompleted: true });
+      await store.createRun({ runId, rootSessionId: state.rootSessionId, now: NOW(), request: null, requestCaptureCompleted: true, executionStrategy: settings.executionStrategy ?? 'graph' });
       state.successorRunId = runId;
       await store.saveRun(state);
       bindings.set(context.sessionID, { runId, agent: context.agent, nodeId: null, root: true });
@@ -339,6 +385,12 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (!binding?.root) return rejected('NOT_GRAPH_SESSION', 'only the orchestrator of this run may resume it');
       const state = store.getRun(binding.runId);
       if (!state) return rejected('RUN_GONE', 'the owning run no longer exists');
+      if (store.recover && store.fault(state.runId)) {
+        const settling = state.status === 'SETTLING';
+        await store.recover(state.runId);
+        if (settling) return reply({ ok: true, status: state.status, next: 'Infrastructure recovered; interrupted settlement is recorded as failed, without a fresh budget or success claim.' });
+      }
+      if (state.status === 'SETTLING') return rejected('SETTLEMENT_PENDING', 'The controller is settling accepted work; do not resume or dispatch');
       if (state.status === 'AWAITING_USER_DECISION') return rejected('AWAITING_DECISION', 'the run remains paused; existing children must settle before graph_run_decide');
       if (repairSettlementPending(state)) return rejected('REPAIR_SETTLEMENT_PENDING', 'revoked repair lifetimes and pending effects must settle before resume; inspect the outstanding dispatches');
       if (state.status !== 'SUCCEEDED' && state.status !== 'FAILED' && state.status !== 'ABORTED') dispatches?.invalidate(state.runId);
@@ -418,7 +470,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         break;
       }
       if (!runId) return rejected('RUN_LIMIT', 'this session reached its successor-run limit');
-      const created = await store.createRun({ runId, rootSessionId: state.rootSessionId, now: NOW(), request: null, requestCaptureCompleted: true });
+      const created = await store.createRun({ runId, rootSessionId: state.rootSessionId, now: NOW(), request: null, requestCaptureCompleted: true, executionStrategy: settings.executionStrategy ?? 'graph' });
       // Carry a bounded digest of the archived run into the successor so the
       // new explorer/planner start from its lessons (revalidation mandatory)
       // instead of re-deriving everything — and re-collecting the same
@@ -466,7 +518,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
 
   const definitions = {
       graph_submit_plan, graph_submit_review, graph_submit_change, graph_submit_verification,
-      graph_submit_findings, graph_inspect, graph_run_resume, graph_run_new, graph_run_decide,
+      graph_submit_findings, graph_inspect, graph_artifact_read, graph_run_resume, graph_run_new, graph_run_decide,
   };
   // Paused submissions are validated with the same public schemas and semantic
   // checks, on an isolated state copy. Only bounded, non-gating closeout evidence
@@ -516,13 +568,20 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       const binding = bindings.get(context.sessionID);
       return binding ? dispatches.exclusive(binding.runId, () => {
         const state = store.getRun(binding.runId);
+        if (directPending(state) && name !== 'graph_inspect' && name !== 'graph_artifact_read') return rejected('DIRECT_EFFECT_PENDING', 'A Direct command is pending; wait for its durable result');
+        if (store.fault?.(binding.runId) && name !== 'graph_inspect' && name !== 'graph_artifact_read' && name !== 'graph_run_resume') {
+          return rejected('PERSISTENCE_FAILED', 'Infrastructure failure; stop new submissions. Owned host events can settle; use explicit recovery after settlement.');
+        }
         if (name === 'graph_submit_findings' && binding.nested) return rejected('NESTED_CONSULT_ONLY', 'return observations to the caller through the native task response; no findings or closeout');
         if (name.startsWith('graph_submit_') && state?.status === 'AWAITING_USER_DECISION') {
           return settlePaused(name, definition, args, context, binding, state);
+        }
+        if (name.startsWith('graph_submit_') && state?.lifecycleVersion === 1 && state.status !== 'RUNNING') {
+          return rejected('RUN_NOT_EXECUTING', 'Accepted work is settling or terminal; do not publish new graph artifacts.');
         }
         return definition.execute(args, context);
       }) : definition.execute(args, context);
     },
   }]));
-  return Object.freeze({ tools: Object.freeze(tools) });
+  return Object.freeze({ tools: Object.freeze({ ...tools, ...createDirectTools({ store, runner, bindings, worktree, dispatches, settings }) }) });
 }

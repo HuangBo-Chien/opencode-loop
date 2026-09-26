@@ -126,7 +126,9 @@ test('roles provide distinct evidence contracts, submit duties and capability li
 test('dispatch prompts require explicit writer targets and stop on task conflicts', async () => {
   const definitions = await agents();
   const coordinator = definitions['graph-orchestrator'].prompt;
-  assert.match(coordinator, /implementer\/verifier.*每次.*task_id.*必須.*獨占/);
+  assert.match(coordinator, /implementer\/verifier.*結構化 nodeId/);
+  assert.match(coordinator, /已核實.*續接可省略 nodeId/);
+  assert.match(coordinator, /不建立子 session/);
   for (const code of ['NODE_ID_REQUIRED', 'INVALID_NODE_ID', 'CONFLICTING_NODE_ID', 'TASK_NODE_MISMATCH']) {
     assert.ok(coordinator.includes(code), code);
   }
@@ -134,6 +136,13 @@ test('dispatch prompts require explicit writer targets and stop on task conflict
   for (const role of ['graph-implementer', 'graph-verifier']) {
     assert.match(definitions[role].prompt, /任務正文.*衝突.*停止.*回報/);
   }
+  assert.match(coordinator, /不得重抄 acceptance/);
+  assert.match(coordinator, /acceptance 注入行衝突時以注入版為準/);
+  assert.match(definitions['graph-implementer'].prompt, /\[RUNNER\] acceptance/);
+  assert.match(definitions['graph-implementer'].prompt, /逐字工作契約/);
+  assert.match(definitions['graph-implementer'].prompt, /任務正文與 acceptance 注入行矛盾時以注入版為準/);
+  assert.match(definitions['graph-verifier'].prompt, /逐字驗證契約/);
+  assert.match(definitions['graph-verifier'].prompt, /任務正文與 acceptance 注入行矛盾時以注入版為準/);
 });
 
 test('all roles receive capability-aware code navigation guidance with distinct uses', async () => {

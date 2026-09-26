@@ -140,6 +140,12 @@ export function validateTaskSpec(spec, { maxAttemptsCeiling = 20 } = {}) {
       if (field === 'inputs' && !ARTIFACT_REF_PATTERN.test(entry)) fail(`${entry}: invalid artifact reference (expected name or name@version)`);
       if (field === 'outputs' && !NAME_PATTERN.test(entry)) fail(`${entry}: invalid artifact name`);
       if ((field === 'writeScope' || field === 'acceptance') && !nonemptyText(entry)) fail(`${field} entries must be nonempty text`);
+      // Dispatch injects acceptance verbatim as runner-owned lines; embedded
+      // newlines could forge column-0 [RUNNER] directives, so one line only.
+      if (field === 'acceptance' && /[\n\r]/.test(entry)) fail('acceptance entries must be single-line criteria');
+      // Acceptance is prose and never token-expanded; a literal {{run}} would
+      // become a dead contract pointing at a path that can never exist.
+      if (field === 'acceptance' && /\{\{\s*run\s*\}\}/i.test(entry)) fail(`acceptance: ${entry}: quote the expanded literal paths from the submit response, never the {{run}} token`);
       if (field === 'writeScope' && nonemptyText(entry) && !normalizeScopePath(entry)) fail(`${entry}: writeScope entries must be relative workspace paths or globs`);
       if (field === 'writeScope' && nonemptyText(entry) && /[<>{}]/.test(entry)) fail(`${entry}: unsubstituted template placeholder; use the {{run}} token (expanded by the runner before validation) or a literal path`);
     }

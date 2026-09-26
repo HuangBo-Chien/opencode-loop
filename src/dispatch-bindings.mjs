@@ -6,6 +6,8 @@ import { cleanJson } from './json-safe.mjs';
 import { assertSettlementCapacity } from './runner.mjs';
 import { sanitizeRun } from './run-state.mjs';
 import { repairSettlementPending } from './artifact-dependencies.mjs';
+import { captureHandoff, retainHandoffPayloads, handoffInputsMatch } from './artifact-handoffs.mjs';
+import { createBoundedHostReader } from './host-read.mjs';
 
 const NOW = () => new Date().toISOString();
 const key = (root, call) => JSON.stringify([root, call]);
@@ -116,6 +118,8 @@ function projectIdleEvidence(runId, reservations, evidence) {
 const COMPACTION_CONTINUE = 'Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.';
 const COMPACTION_OVERFLOW = "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n";
 export function createDispatchBindings({ store, runner, bindings, client, getSubagentDepth = () => 2 }) {
+  const hostReader = createBoundedHostReader(client);
+  if (store.transaction) client = hostReader.client;
   const records = new Map();
   const parents = new Map();
   const tails = new Map();
@@ -141,15 +145,26 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
   // consultation may still have an active host child when a sibling pauses.
   async function persist(state, omit = () => false, extra = {}, reserve = false) {
     const dispatchReservations = (extra.dispatchReservations ?? [...records.values()].filter((r) => r.runId === state.runId && !omit(r))).map((r) => ({ ...r }));
+    const payloads = { ...(state.handoffPayloads ?? {}) };
+    const existingCalls = new Set((state.dispatchReservations ?? []).map(r => key(callerOf(r), r.callID)));
+    if (reserve) for (const record of dispatchReservations) {
+      if (!record.handoff && !record.nested && !existingCalls.has(key(callerOf(record), record.callID))) record.handoff = captureHandoff(state, record, payloads);
+    }
+    const handoffPayloads = retainHandoffPayloads([...dispatchReservations, ...(extra.settledDispatches ?? state.settledDispatches ?? [])], payloads);
     const idleEventIds = [...(seenIdleEvents.get(state.runId) ?? new Set(state.idleEventIds ?? []))].slice(-256);
     // Receipts are hints, not completion authority. Bound total ownership refs
     // (not just each array), and discard references as reservations retire.
     const pendingIdleEvidence = projectIdleEvidence(state.runId, dispatchReservations, extra.pendingIdleEvidence ?? [...idleEvidence.values()].flat());
-    const saved = { ...state, ...extra, dispatchReservations, idleEventIds, pendingIdleEvidence };
+    const saved = { ...state, ...extra, dispatchReservations, idleEventIds, pendingIdleEvidence, handoffPayloads };
     if (reserve) assertSettlementCapacity(saved);
     cleanJson(saved, { maxBytes: 1_048_576, maxValues: 20_000, maxDepth: 32 });
     await store.saveRun(saved);
     state.dispatchReservations = dispatchReservations;
+    state.handoffPayloads = handoffPayloads;
+    for (const record of dispatchReservations) {
+      const live = records.get(key(callerOf(record), record.callID));
+      if (live && record.handoff) live.handoff = record.handoff;
+    }
     state.idleEventIds = idleEventIds;
     state.pendingIdleEvidence = saved.pendingIdleEvidence;
     state.updatedAt = saved.updatedAt;
@@ -158,7 +173,26 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
   }
 
   function exclusive(runId, operation) {
-    const result = (tails.get(runId) ?? Promise.resolve()).then(operation);
+    const result = (tails.get(runId) ?? Promise.resolve()).then(async () => {
+      try { return await (store.transaction ? store.transaction(runId, operation) : operation()); }
+      finally {
+        if (store.fault?.(runId)) {
+          // A failed publication may have changed private working records. Rebuild
+          // only this run from its last durable ledger; never free an admitted call.
+          const state = store.committed(runId);
+          if (state) {
+            for (const [id, r] of records) if (r.runId === runId) records.delete(id);
+            for (const r of state.dispatchReservations ?? []) records.set(key(callerOf(r), r.callID), structuredClone(r));
+            for (const b of bindings.values()) if (b.runId === runId && !b.root) {
+              const owner = (state.dispatchReservations ?? []).find(r => r.sessionId === b.sessionId && r.dispatchId === b.dispatchId && r.bound);
+              b.active = !!owner;
+              b.settlementOnly = true;
+            }
+            publishIdleHistory(runId, state.idleEventIds ?? [], state.pendingIdleEvidence ?? []);
+          }
+        }
+      }
+    });
     const settled = result.then(() => undefined, () => undefined);
     tails.set(runId, settled);
     void settled.then(() => { if (tails.get(runId) === settled) tails.delete(runId); });
@@ -184,6 +218,7 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
 
   function current(binding) {
     if (!owns(binding)) return false;
+    if (store.fault?.(binding.runId)) return false;
     const state = store.getRun(binding.runId);
     if (binding.nested) {
       const parent = bindings.get(binding.callerSessionId);
@@ -223,17 +258,16 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
     const agent = args?.subagent_type;
     const targetDecision = resolveNodeIdHint(args, desiredNodeId, { strict: TARGET_REQUIRED_AGENTS.has(agent) });
     if (!targetDecision.allowed) return targetDecision;
-    const target = targetDecision.nodeId;
-    if (target === null && TARGET_REQUIRED_AGENTS.has(agent) && (args.task_id !== undefined || nested)) {
-      // Strict-target roles keep an explicit marker for continuations (the
-      // session's prior node is an identity, not a fresh choice) and for
-      // nested callers. A fresh root dispatch may fall through to the
-      // runner's unique-admissible auto-resolve inside the lock.
-      return denied('NODE_ID_REQUIRED', `${agent} requires an explicit nodeId for every dispatch, including task_id continuations and single-node graphs; put [nodeId:target-node] alone on the first prompt line`);
-    }
+    let target = targetDecision.nodeId;
+    let targetSource = targetDecision.source;
     return exclusive(root.runId, async () => {
+      if (store.fault?.(root.runId)) return denied('PERSISTENCE_FAILED', 'infrastructure failure; stop new work and recover explicitly after settlement');
       const state = store.getRun(root.runId);
       if (!state) return denied('RUN_GONE', 'owning run is unavailable');
+      if ((state.pendingEffects ?? []).some(e => e.tool === 'graph_direct_check')) return denied('DIRECT_EFFECT_PENDING', 'Direct command must settle before any dispatch or continuation');
+      if (state.mode === 'direct' && (agent !== 'graph-implementer' || (state.direct?.failures ?? 0) >= runner.maxAttempts)) return denied('DIRECT_CONTRACT_ACTIVE', 'Direct contract or failure budget requires root escalation after settlement');
+      const preContract = state.executionStrategy === 'auto' && state.mode === 'unknown';
+      if (preContract && (state.preContractDispatches ?? 0) >= runner.maxAttempts) return denied('EXPLORATION_BUDGET_EXHAUSTED', 'Free exploration budget exhausted; freeze Direct contract or explicitly select Graph');
       const rootSessionId = state.rootSessionId;
       if (bindings.get(callerSessionId) !== root || nested && (!NESTED_CALLERS.has(root.agent) || !current(root))) {
         return denied('BINDING_UNAVAILABLE', 'nested consultation requires an active authenticated specialist dispatch');
@@ -246,16 +280,24 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
       if (!Number.isSafeInteger(depthLimit) || depthLimit < (nested ? 2 : 1)) {
         return denied('SUBAGENT_DEPTH_LIMIT', `native subagent_depth must be at least ${nested ? 2 : 1} for this dispatch; respect the configured limit and report it, or change host configuration and restart`);
       }
+      // Even an active same-session continuation must see a paused/terminated
+      // run's real blocker rather than being told to try a fresh session.
+      if (state.status !== 'RUNNING') return runner.admitDispatch(state, { agent, now: NOW(), nodeId: target });
       const recordKey = key(callerSessionId, callID);
       const turnToken = randomUUID();
       const used = state.dispatchCallIds ?? [];
       const previousCallIds = state.dispatchCallIds;
+      const previousExploration = state.preContractDispatches;
       const previousBinding = args.task_id ? bindings.get(args.task_id) : null;
       const recordDispatch = () => {
         state.dispatchCallIds = [...used, recordKey];
+        if (preContract) state.preContractDispatches = (state.preContractDispatches ?? 0) + 1;
+        const record = records.get(recordKey);
+        record.targetSource = targetSource === 'none' && record.autoResolved ? 'unique-admissible' : targetSource;
       };
       const failedReservation = () => {
         records.delete(recordKey);
+        if (previousExploration === undefined) delete state.preContractDispatches; else state.preContractDispatches = previousExploration;
         if (previousCallIds) state.dispatchCallIds = previousCallIds; else delete state.dispatchCallIds;
         if (previousBinding) bindings.set(args.task_id, previousBinding);
         return denied('DISPATCH_PERSISTENCE_FAILED', 'could not durably reserve task and settlement headroom; inspect storage/capacity');
@@ -308,8 +350,10 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
         // plugin restart, but the run state still records which session last
         // worked each node. Rebuild the continuation identity from state.
         if (!previous) {
-          const resumed = Object.values(state.nodes).find((node) => node.sessionId === args.task_id
+          const matches = Object.values(state.nodes).filter((node) => node.sessionId === args.task_id
             && node.spec.agent === agent && ['PENDING', 'INCOMPLETE', 'STALE'].includes(node.state));
+          if (matches.length > 1) return denied('TASK_NODE_MISMATCH', 'task_id has ambiguous persisted node ownership; inspect the run before continuing');
+          const resumed = matches[0];
           if (resumed) previous = { runId: root.runId, agent, nodeId: resumed.spec.id, sessionId: args.task_id, root: false, active: false };
           else if (CONTINUABLE_ROLES.has(agent)) {
             if (!await rootContinuationOwned(state, args.task_id, agent)) {
@@ -320,7 +364,16 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
         }
         const sameRole = previous && !previous.root && previous.runId === root.runId && previous.agent === agent;
         if (sameRole && previous.nodeId && target !== null && target !== previous.nodeId) {
-          return denied('TASK_NODE_MISMATCH', `requested node ${target} conflicts with this task_id's node ${previous.nodeId}; continue ${previous.nodeId} with its matching marker, or dispatch ${target} with its own session or a fresh session`);
+          return denied('TASK_NODE_MISMATCH', `requested node ${target} conflicts with this task_id's node ${previous.nodeId}; continue ${previous.nodeId}, or dispatch ${target} with its own session or a fresh session`);
+        }
+        const previousNode = sameRole && previous.nodeId ? state.nodes[previous.nodeId] : null;
+        if (target === null && previousNode && (current(previous)
+          || previousNode.sessionId === args.task_id && ['PENDING', 'INCOMPLETE', 'STALE'].includes(previousNode.state))) {
+          target = previous.nodeId;
+          targetSource = 'task-id';
+        }
+        if (target && repairSettlementPending(state, target)) {
+          return denied('REPAIR_SETTLEMENT_PENDING', `${target} has revoked host lifetimes or pending effects; wait for exact terminal/effect settlement before replacement`);
         }
         if (sameRole && current(previous)) {
           records.set(recordKey, { runId: root.runId, rootSessionId, callerSessionId, callID, agent, turnToken,
@@ -427,10 +480,10 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
     // not block a freshly admitted reservation for the same session: allow
     // the overwrite. An active binding still refuses the collision.
     const established = bindings.get(record.sessionId);
-    if (!state || !record.settlementOnly && (!['RUNNING', 'AWAITING_USER_DECISION'].includes(state.status) || (state.artifacts.plan?.version ?? 0) !== record.planVersion)
+    if (!state || !record.settlementOnly && ((!['RUNNING', 'AWAITING_USER_DECISION', 'SETTLING'].includes(state.status) && !state.settlement) || (state.artifacts.plan?.version ?? 0) !== record.planVersion)
       || parents.get(record.sessionId) !== callerOf(record) || (established && established.active !== false)) return;
     const parent = bindings.get(record.callerSessionId);
-    const settlementOnly = record.settlementOnly === true || record.nested && (!current(parent) || parent.dispatchId !== record.callerDispatchId)
+    const settlementOnly = !!store.fault?.(record.runId) || state.status === 'SETTLING' || !!state.settlement || record.settlementOnly === true || record.nested && (!current(parent) || parent.dispatchId !== record.callerDispatchId)
       || state.status === 'AWAITING_USER_DECISION' && !record.started && !!record.nodeId;
     if (record.nodeId && !record.settlementOnly) {
       const node = state.nodes[record.nodeId];
@@ -439,6 +492,11 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
         // only its lifetime, never charge or grant workspace capability.
         if (!node || !['PENDING', 'INCOMPLETE', 'STALE'].includes(node.state)) return;
       } else if (!record.started) {
+        if (!handoffInputsMatch(state, record)) {
+          record.errorCode = 'HANDOFF_INPUT_CHANGED';
+          await persist(state);
+          return;
+        }
         // Re-validate the reserved node specifically. Reservations are
         // authoritative; a re-sorted choice must not silently reassign work.
         const decision = runner.admitDispatch(state, { agent: record.agent, now: NOW(), nodeId: record.nodeId });
@@ -800,7 +858,13 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
     const recordKey = key(part.sessionID, part.callID);
     const record = records.get(recordKey);
     if (!record) return;
-    await exclusive(record.runId, () => applyPart(part, recordKey, record));
+    await exclusive(record.runId, () => {
+      const currentRecord = records.get(recordKey);
+      // Reconciliation replaces private objects but not immutable admission
+      // identities. A queued terminal event must survive that replacement.
+      if (!currentRecord || currentRecord.dispatchId !== record.dispatchId || currentRecord.turnToken !== record.turnToken) return;
+      return applyPart(part, recordKey, currentRecord);
+    });
   }
 
   // Also used by serialized restart reconciliation; never nests the run queue.
@@ -831,8 +895,11 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
       if (!record.acknowledged) record.idleSeen = true;
       if (!record.bound && record.started) await bind(record);
       else if (!record.bound) {
-        await persist(store.getRun(record.runId), (r) => r === record);
-        records.delete(recordKey);
+        if (record.handoff) await finish(record.sessionId, record.dispatchId);
+        else {
+          await persist(store.getRun(record.runId), (r) => r === record);
+          records.delete(recordKey);
+        }
       } else await consumeIdle(record.sessionId);
     }
   }
@@ -990,6 +1057,7 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
       : hasRecoveryIssues(state) ? [{ code: 'INVALID_RECOVERY_ISSUES' }] : [];
     return [...[...records.values()].filter((r) => r.runId === runId).map((r) => ({
       callID: r.callID, nodeId: r.nodeId, agent: r.agent, sessionId: r.sessionId, bound: r.bound, continuation: r.continuation,
+      targetSource: r.targetSource ?? 'legacy',
       callerSessionId: callerOf(r), nested: r.nested === true, ...(r.nested ? { callerDispatchId: r.callerDispatchId } : {}),
       resumed: r.resumed === true, targeted: r.targeted === true, autoResolved: r.autoResolved === true,
       ...(r.repairRevoked ? { repairRevoked: true } : {}),
@@ -1008,7 +1076,7 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
   // must also survive a restart BEFORE the replacement graph reaches a pause.
   async function recoverPaused(state) {
     const paused = state.status === 'AWAITING_USER_DECISION';
-    if (!paused && !hasRecoveryIssues(state) && !state.dispatchReservations?.some((r) => r?.settlementOnly || r?.nested)) return;
+    if (!paused && state.status !== 'SETTLING' && !state.settlement && !store.fault?.(state.runId) && !hasRecoveryIssues(state) && !state.dispatchReservations?.some((r) => r?.settlementOnly || r?.nested)) return;
     const idleEventIds = [...new Set((state.idleEventIds ?? []).slice(-256))];
     const recoveryRecords = new Map();
     const recoveryBindings = new Map();
@@ -1152,5 +1220,12 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
     }
   }
 
-  return Object.freeze({ admit, onSession, onPart, onIdle, onMessage, onUserPrompt, reconcileSession, ensureSession, invalidate, revokeExecution, exclusive, managed, owns, current, runForSession, inspect, recoverPaused });
+  // Caller already owns the run queue; one total budget covers all host reads.
+  async function reconcileRun(runId, remaining) {
+    return hostReader.withBudget(remaining, async () => {
+      const state = store.getRun(runId);
+      if (state) await recoverPaused(state);
+    });
+  }
+  return Object.freeze({ admit, onSession, onPart, onIdle, onMessage, onUserPrompt, reconcileSession, reconcileRun, ensureSession, invalidate, revokeExecution, exclusive, managed, owns, current, runForSession, inspect, recoverPaused });
 }

@@ -11,6 +11,7 @@
 //   artifacts invalidate downstream results conservatively.
 
 import { cleanJson } from './json-safe.mjs';
+import { resolveEffectClaims } from './effect-resolution.mjs';
 import { captureVerificationPause, prepareVerificationRetry } from './recovery-policy.mjs';
 import { artifactRef, canonicalRef, exactRef, lineageIndex, consumedRefs, publishArtifact, retainedLineage, validateRepairTargets, repairClosure, applyRepair, repairSettlementPending } from './artifact-dependencies.mjs';
 import { matchScopePath, normalizeScopePath, validateFileClaim, validateTaskGraph, validateDependencies, canonicalOutput, ARTIFACT_REF_PATTERN } from './task-spec.mjs';
@@ -303,7 +304,7 @@ export function depsSatisfied(state, node) {
 // Exhaustion and fundamental rejection no longer fail the run silently: the
 // run pauses for an explicit user decision (graph_run_decide). Nodes, attempt
 // counters, artifacts and violations stay exactly as they were for audit.
-function pauseForDecision(state, cause, detail, now, identity = {}) {
+export function pauseForDecision(state, cause, detail, now, identity = {}) {
   state.status = 'AWAITING_USER_DECISION';
   if (!state.pendingDecision) {
     state.pauseSequence = (state.pauseSequence ?? 0) + 1;
@@ -357,7 +358,7 @@ function completeIfDone(state, now) {
   if (state.repairPlanRevision) return false;
   const nodes = Object.values(state.nodes);
   if (nodes.length && nodes.every((node) => node.state === 'SUCCEEDED' || node.state === 'SKIPPED')) {
-    state.status = 'SUCCEEDED';
+    state.status = state.lifecycleVersion === 1 ? 'SETTLING' : 'SUCCEEDED';
     state.blockedReason = null;
     state.updatedAt = now;
     return true;
@@ -453,6 +454,9 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   }
 
   function admitDispatch(state, { agent, now, nodeId = null, excludeNodeIds = null, consultOnly = false, autoResolveUnique = false }) {
+    if ((state.pendingEffects ?? []).some(e => e.tool === 'graph_direct_check')) return { allowed: false, code: 'DIRECT_EFFECT_PENDING', detail: 'Direct check must settle before dispatch' };
+    if (state.mode === 'direct' && agent !== 'graph-implementer') return { allowed: false, code: 'DIRECT_CONTRACT_ACTIVE', detail: 'Direct uses only its assigned implementer; root must explicitly escalate for other roles' };
+    if (state.mode === 'direct' && (state.direct?.failures ?? 0) >= maxAttempts) return { allowed: false, code: 'DIRECT_BUDGET_EXHAUSTED', detail: 'Direct global failure budget exhausted; root may escalate after settlement' };
     if (TERMINAL_RUN.has(state.status)) {
       return { allowed: false, code: 'RUN_TERMINATED', detail: state.failReason ? `run failed: ${state.failReason}` : 'run already finished' };
     }
@@ -520,7 +524,10 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
           .map((node) => ({ id: node.spec.id, deps: checkDeps(node) }))
           .filter((entry) => entry.deps.ok)
           .map((entry) => entry.id);
-        if (others.length) result.detail += `; other admissible ${agent} nodes: ${others.join(', ')}`;
+          if (others.length) {
+            result.detail += `; other admissible ${agent} nodes: ${others.join(', ')}`;
+            result.candidates = others;
+          }
       }
       return result;
     }
@@ -556,7 +563,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     // coordinator decision; malformed markers are rejected by the parser.
     if (result.allowed && autoResolveUnique) {
       if (ready.length > 1) {
-        return { allowed: false, code: 'NODE_ID_REQUIRED', detail: `${agent} requires an explicit nodeId when several nodes are admissible (${ready.map((entry) => entry.node.spec.id).join(', ')}); put [nodeId:<node>] alone on the first prompt line` };
+        return { allowed: false, code: 'NODE_ID_REQUIRED', candidates: ready.map(entry => entry.node.spec.id), detail: `${agent} requires an explicit nodeId when several nodes are admissible (${ready.map((entry) => entry.node.spec.id).join(', ')}); set the nodeId field or use one leading [nodeId:<node>] marker` };
       }
       result.resolvedBy = 'unique-admissible';
     }
@@ -833,7 +840,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     return result;
   }
 
-  function verificationTransition(state, { nodeId, verdict, commands = [], artifacts = [], probed = [], skipped = [], changeRefs = null, summary = '', snapshot = {}, effectiveTargets, now }) {
+  function verificationTransition(state, { nodeId, verdict, commands = [], artifacts = [], probed = [], skipped = [], resolvedEffects = [], changeRefs = null, summary = '', snapshot = {}, effectiveTargets, now }) {
     if (state.status === 'AWAITING_USER_DECISION') return { ok: false, code: 'AWAITING_DECISION', detail: 'paused submissions are closeout evidence only' };
     if (TERMINAL_RUN.has(state.status)) return { ok: false, code: 'RUN_TERMINATED', detail: state.failReason ?? 'run already finished' };
     const node = state.nodes[nodeId];
@@ -842,6 +849,8 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     const evidence = { payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot,
       basedOn: changeRefs ?? node.consumedRefs ?? [] };
     const reject = (code, detail) => trackRejection(state, node, code, detail, now, evidence);
+    const resolution = resolveEffectClaims(state, node, resolvedEffects, { verdict, artifacts, probed });
+    if (!resolution.ok) return reject('INVALID_EFFECT_RESOLUTION', resolution.detail);
 
     // Baseline capture: pre-change suite evidence recorded before any
     // implement node writes. The artifact is what later PASS verdicts match
@@ -899,7 +908,7 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
       const name = `verification:${nodeId}`;
       const previous = state.artifacts[name];
       const version = previous ? previous.version + 1 : 1;
-      publishArtifact(state, name, { kind: 'verification', nodeId, version, basedOn: changeRefs ?? [...new Set([...(node.consumedRefs ?? []), ...refs])], payload: { verdict, commands, summary, artifacts, probed, skipped }, snapshot, status: 'valid', createdAt: now });
+      publishArtifact(state, name, { kind: 'verification', nodeId, version, basedOn: changeRefs ?? [...new Set([...(node.consumedRefs ?? []), ...refs])], payload: { verdict, commands, summary, artifacts, probed, skipped, ...(resolution.resolutions.length ? { resolvedEffects: resolution.resolutions } : {}) }, snapshot, status: 'valid', createdAt: now });
       node.producedRef = `${name}@${version}`;
       node.state = 'SUCCEEDED';
       node.repairEvidence = null;
@@ -1120,7 +1129,12 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     }
     const mermaid = ['graph TD', ...nodes.map((node) => `  ${node.id}["${node.id} · ${node.kind} · ${node.state}${node.attempt ? ` · try ${node.attempt}` : ''}"]`), ...edges.map(([from, to]) => `  ${from} --> ${to}`)].join('\n');
     return {
-      runId: state.runId, status: state.status, mode: state.mode, failReason: state.failReason,
+      runId: state.runId, status: state.status, mode: state.mode, executionStrategy: state.executionStrategy ?? 'graph', failReason: state.failReason,
+      ...(state.direct ? { direct: { contractVersion: state.artifacts['direct-contract']?.version ?? null, failures: state.direct.failures,
+        remainingFailures: Math.max(0, maxAttempts - state.direct.failures), baselineRevision: state.direct.baseline.revision,
+        acceptedRevision: state.direct.acceptedRevision ?? null, evidenceCount: state.direct.evidence.length,
+        evidence: state.direct.evidence.slice(-16).map(({ checkId, status, exitCode, uncertain, revision, contractVersion, sessionId, dispatchId, attempt }) =>
+          ({ checkId, status, exitCode, uncertain, revision, contractVersion, sessionId, dispatchId, attempt })) } } : {}),
       pendingDecision: state.pendingDecision ?? null,
       pauseId: state.pendingDecision?.pauseId ?? null,
       recoveryUsed: state.recoveryUsed ?? 0,
@@ -1165,6 +1179,6 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   return Object.freeze({
     admitDispatch, beginNode, attachSession, submitPlan, submitReview, checkChange, submitChange, submitVerification,
     recordSideEffect, recordViolation, captureRequest, completeRequestCapture, markIncomplete, resumeRun, reconcileNode, revalidateArtifacts, inspect,
-    abortRun, archiveForReset, prepareRetry, implementerCapacity, readerCapacity, taintAttempt,
+    abortRun, archiveForReset, prepareRetry, implementerCapacity, readerCapacity, taintAttempt, maxAttempts,
   });
 }

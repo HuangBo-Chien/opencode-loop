@@ -972,6 +972,14 @@ test('plugin composition projects terminal saves and exposes Task 5 journal tool
   ));
   assert.equal(review.ok, true, JSON.stringify(review));
 
+  const settling = JSON.parse(await hooks.tool.graph_inspect.execute({}, context(sessionID, 'graph-orchestrator')));
+  assert.equal(settling.status, 'SETTLING');
+  for (const [agent, child] of [['graph-planner', 'plugin-planner'], ['graph-plan-critic', 'plugin-critic']]) {
+    await hooks.event({ event: { type: 'message.part.updated', properties: { part: {
+      type: 'tool', tool: 'task', sessionID, callID: `call-${agent}`,
+      state: { status: 'completed', input: { subagent_type: agent }, metadata: { parentSessionId: sessionID, sessionId: child } },
+    } } } });
+  }
   const store = createJournalStore({ worktree, globalDirectory });
   const entry = await store.read('project', summaryId(worktree, sessionID));
   assert.equal(entry.metadata.status, 'SUCCEEDED');

@@ -679,6 +679,7 @@ export function createJournaledRunStore(runStore, journalService, lessonService 
   }
 
   return Object.freeze({
+    ...runStore,
     createRun(...args) { return runStore.createRun(...args); },
     loadRun(...args) { return runStore.loadRun(...args); },
     getRun(...args) { return runStore.getRun(...args); },
