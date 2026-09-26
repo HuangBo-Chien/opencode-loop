@@ -80,7 +80,7 @@ function scopeMatches(patterns, candidate) {
  * returned as a workspace-relative path (or null when it resolves outside the
  * workspace) so the caller can compare it against scope patterns.
  */
-export function extractShellWriteTargets(command, toWorkspaceRelative) {
+export function extractShellWriteTargets(command, toWorkspaceRelative, initialCwd = '') {
   if (typeof command !== 'string' || !command.length) return [];
   const scanned = stripQuotedSpans(stripHeredocs(command.slice(0, MAX_SCAN_CHARS)));
   const targets = [];
@@ -92,7 +92,7 @@ export function extractShellWriteTargets(command, toWorkspaceRelative) {
     if (!raw.startsWith('&') && !/^\d+$/.test(raw)) targets.push(raw);
   }
 
-  let cwd = '';
+  let cwd = initialCwd;
   let outside = false;
   for (const segment of scanned.split(SEGMENT_SPLIT)) {
     const tokens = segment.trim().split(/\s+/).filter(Boolean);
@@ -145,8 +145,8 @@ export function extractShellWriteTargets(command, toWorkspaceRelative) {
 
 // Returns the first workspace-relative write target that is outside every
 // pattern, or null when nothing conclusively escapes.
-export function firstOutOfScopeShellWrite(command, patterns, toWorkspaceRelative) {
-  for (const target of extractShellWriteTargets(command, toWorkspaceRelative)) {
+export function firstOutOfScopeShellWrite(command, patterns, toWorkspaceRelative, initialCwd = '') {
+  for (const target of extractShellWriteTargets(command, toWorkspaceRelative, initialCwd)) {
     if (target !== null && !scopeMatches(patterns, target)) return target;
   }
   return null;

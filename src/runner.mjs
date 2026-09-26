@@ -304,7 +304,7 @@ export function depsSatisfied(state, node) {
 // Exhaustion and fundamental rejection no longer fail the run silently: the
 // run pauses for an explicit user decision (graph_run_decide). Nodes, attempt
 // counters, artifacts and violations stay exactly as they were for audit.
-function pauseForDecision(state, cause, detail, now, identity = {}) {
+export function pauseForDecision(state, cause, detail, now, identity = {}) {
   state.status = 'AWAITING_USER_DECISION';
   if (!state.pendingDecision) {
     state.pauseSequence = (state.pauseSequence ?? 0) + 1;
@@ -454,6 +454,9 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   }
 
   function admitDispatch(state, { agent, now, nodeId = null, excludeNodeIds = null, consultOnly = false, autoResolveUnique = false }) {
+    if ((state.pendingEffects ?? []).some(e => e.tool === 'graph_direct_check')) return { allowed: false, code: 'DIRECT_EFFECT_PENDING', detail: 'Direct check must settle before dispatch' };
+    if (state.mode === 'direct' && agent !== 'graph-implementer') return { allowed: false, code: 'DIRECT_CONTRACT_ACTIVE', detail: 'Direct uses only its assigned implementer; root must explicitly escalate for other roles' };
+    if (state.mode === 'direct' && (state.direct?.failures ?? 0) >= maxAttempts) return { allowed: false, code: 'DIRECT_BUDGET_EXHAUSTED', detail: 'Direct global failure budget exhausted; root may escalate after settlement' };
     if (TERMINAL_RUN.has(state.status)) {
       return { allowed: false, code: 'RUN_TERMINATED', detail: state.failReason ? `run failed: ${state.failReason}` : 'run already finished' };
     }
@@ -1126,7 +1129,12 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
     }
     const mermaid = ['graph TD', ...nodes.map((node) => `  ${node.id}["${node.id} · ${node.kind} · ${node.state}${node.attempt ? ` · try ${node.attempt}` : ''}"]`), ...edges.map(([from, to]) => `  ${from} --> ${to}`)].join('\n');
     return {
-      runId: state.runId, status: state.status, mode: state.mode, failReason: state.failReason,
+      runId: state.runId, status: state.status, mode: state.mode, executionStrategy: state.executionStrategy ?? 'graph', failReason: state.failReason,
+      ...(state.direct ? { direct: { contractVersion: state.artifacts['direct-contract']?.version ?? null, failures: state.direct.failures,
+        remainingFailures: Math.max(0, maxAttempts - state.direct.failures), baselineRevision: state.direct.baseline.revision,
+        acceptedRevision: state.direct.acceptedRevision ?? null, evidenceCount: state.direct.evidence.length,
+        evidence: state.direct.evidence.slice(-16).map(({ checkId, status, exitCode, uncertain, revision, contractVersion, sessionId, dispatchId, attempt }) =>
+          ({ checkId, status, exitCode, uncertain, revision, contractVersion, sessionId, dispatchId, attempt })) } } : {}),
       pendingDecision: state.pendingDecision ?? null,
       pauseId: state.pendingDecision?.pauseId ?? null,
       recoveryUsed: state.recoveryUsed ?? 0,
@@ -1171,6 +1179,6 @@ export function createRunner({ maxAttempts, maxPlanRevisions, implementerParalle
   return Object.freeze({
     admitDispatch, beginNode, attachSession, submitPlan, submitReview, checkChange, submitChange, submitVerification,
     recordSideEffect, recordViolation, captureRequest, completeRequestCapture, markIncomplete, resumeRun, reconcileNode, revalidateArtifacts, inspect,
-    abortRun, archiveForReset, prepareRetry, implementerCapacity, readerCapacity, taintAttempt,
+    abortRun, archiveForReset, prepareRetry, implementerCapacity, readerCapacity, taintAttempt, maxAttempts,
   });
 }

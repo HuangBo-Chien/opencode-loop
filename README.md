@@ -1,6 +1,63 @@
 # opencode-loop
 
-opencode-loop is a seven-agent **runner-gated** graph workflow with local cross-run journal memory and a lesson knowledge base for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
+opencode-loop provides a **runner-gated** Direct path for bounded tasks and an on-demand seven-role Graph workflow, with local cross-run journal memory and a lesson knowledge base for the official OpenCode `1.18.25` plugin API. The coordinator still drives native `task` dispatch, but a mechanical runner owns run state: dispatch admission, write-scope confinement, attempt counters, verdict gates and version-bound evidence are enforced by plugin hooks, not by prompts alone. The package name is provisional; no public npm release is claimed.
+
+## Direct execution
+
+New runs default to `executionStrategy: "auto"`. For a bounded task with clear,
+mechanically testable acceptance, the orchestrator establishes a Direct contract
+and dispatches one `graph-implementer`. That worker explores, edits, executes the
+declared checks and repairs failures in the same session. A planner, critic and
+LLM verifier are not required for this path. File count alone is not a reason to
+select Graph: use Graph when work needs decomposition or independent semantic
+review. Explicit requests for Graph take precedence.
+
+The root calls `graph_direct_start` with `requirement`, `rationale`, `acceptance`,
+literal-file `writeScope`, required `deliverables` and 1–8 named `checks`:
+
+```json
+{
+  "requirement": "Fix the parser's empty-input behavior",
+  "rationale": "A bounded parser fix with an existing regression test",
+  "acceptance": ["The parser handles empty input and the regression suite passes"],
+  "writeScope": ["src/parser.mjs", "test/parser.test.mjs"],
+  "deliverables": ["src/parser.mjs", "test/parser.test.mjs"],
+  "checks": [
+    {"id": "parser-tests", "command": "node --test test/parser.test.mjs", "cwd": ".", "timeoutMs": 60000}
+  ]
+}
+```
+
+The worker calls `graph_direct_check({"checkId":"parser-tests"})`. The runner
+selects the frozen command, requests native shell permission, records its actual
+exit status and binds its result to the current contract, dispatch and workspace
+revision. `checksRun` text cannot substitute for this evidence. The worker then
+uses `graph_submit_change` for node `direct`, declaring touched/deleted files and
+unresolved work. Missing, failed or stale checks cannot produce acceptance.
+
+Direct captures a starting file inventory, including pre-existing dirty contents
+and Git-ignored source. It checks the actual delta against scope and declared
+files. Inventories exclude `.git`, `node_modules` and the configured state
+directory; these are infrastructure outside Direct's acceptance boundary, not
+authorized write targets. Symlinks, special files and inventories exceeding the
+bounded capture limits require Graph. Direct commands must run in the foreground
+and terminate their own children; detached/background services are unsupported.
+This is not an operating-system process or filesystem sandbox.
+
+Only the root can revise a settled contract or call
+`graph_direct_escalate({"rationale":"Independent review is required"})` to move
+to Graph. Acceptance still enters PR1's finite settlement process; an unfinished
+child or unknown effect cannot be declared successful. Set plugin option
+`executionStrategy: "graph"` to retain the previous Graph/light route. Existing
+saved runs retain their original strategy when resumed.
+
+Direct failure-budget exhaustion pauses the run with its evidence preserved;
+it does not grant another editing round. Unknown interrupted check outcomes also
+require a user decision after the admitted host work settles. Successful checks
+must be repeated after any workspace change, including check-generated output.
+
+See [PR2 verification and host probe](docs/pr2-direct-validation.md) for evidence
+and measurement limits.
 
 ## How the gate works
 
@@ -73,7 +130,7 @@ properties are supported; this is not an SDK v2 flattened-parameter migration.
 
 | Gate | Mechanism |
 | --- | --- |
-| Implementer/verifier may only be dispatched when a plan passed review | `tool.execute.before` on `task` consults the runner; illegal dispatches throw `RUNNER_REJECTED` before native task execution, without creating an error-only child session |
+| Workers require an accepted contract | Direct requires its persisted root-owned contract; Graph requires its plan/review gates (light omits the critic). `tool.execute.before` on `task` consults the runner; illegal dispatches throw `RUNNER_REJECTED` before native task execution, without creating an error-only child session |
 | Exhaustion and rejection pause the run for an explicit user decision; nothing may be dispatched while paused | Runner verdict table: PASS advances, REVISE returns to the planner (capped by `maxPlanRevisions`), FAIL and every exhausted budget (plan revisions, node attempts, the verification repair loop) move the run to `AWAITING_USER_DECISION` with a recorded `pendingDecision` cause; UNVERIFIED likewise pauses the run for a user decision (`AWAITING_USER_DECISION` via `graph_run_decide`), with the verdict and its evidence preserved as a superseded verification artifact; identical consecutive verification rejections (an unchanged payload resubmitted after a content-level rejection) trip a `runner-rejection` circuit breaker that pauses the run the same way. The user then decides through `graph_run_decide` (native `ask`): **abort** marks the run irreversibly `ABORTED` (terminal, all evidence preserved), **reset** archives the run in place and opens a fresh successor run |
 | Writes stay inside the assigned `writeScope` | `permission.ask` denies out-of-scope `edit` **and `write`** (and implementer `bash` without `allowShell`) for bound graph sessions before execution; violations are recorded. For `allowShell` implementers and read-only specialists, a best-effort static screen also rejects shell commands whose write targets (redirections, `tee`/`cp`/`mv`/`rm`/`dd of=`/`sed -i`/`truncate`/heredocs) resolve inside the workspace but outside the allowed scope |
 | `testsPassed`-style claims are not trusted | Verdicts travel only through `graph_submit_*` tools; `PASS` requires at least one cited command with `exitCode 0` (plus at least one existing `artifacts` evidence path when any verified implement node declared `deliverables` — missing files are rejected as `ARTIFACT_MISSING`); nonzero commands are tolerated only when they match a still-valid `baseline` entry (same command and exit code), and change submissions are cross-checked against the runner's own edit ledger (undisclosed files fail the node) |
@@ -227,7 +284,7 @@ A node may read its own currently-valid prior output before publishing its succe
 
 ### Light path (critic-free small changes)
 
-`intent: "light"` is a routing lane for mechanical, low-risk fixes (copy, formatting, single-file typos): the review node is omitted, the single implement node depends directly on the plan node, and the critic session is skipped — **at most one implement node** is enforced at validation. Every mechanical gate is unchanged: writeScope confinement, the edit ledger cross-check, deliverables-backed artifact evidence and the verify-after-implement gate all still apply; only the advisory quality review is waived. The change artifact cites `plan@v` instead of `review@v`. Use the full `change` flow (with exploration) for cross-file, async, database or otherwise high-risk work — the orchestrator prompt encodes this routing.
+Within the Graph strategy, `intent: "light"` retains the existing route for mechanical, low-risk fixes: the review node is omitted, the single implement node depends directly on the plan node, and the critic session is skipped — **at most one implement node** is enforced at validation. Every mechanical gate is unchanged: writeScope confinement, the edit ledger cross-check, deliverables-backed artifact evidence and the verify-after-implement gate all still apply; only the advisory quality review is waived. The change artifact cites `plan@v` instead of `review@v`. Light still uses a planner and verifier; Direct is the default recommendation for eligible ordinary tasks. Use the full `change` flow when risk or independent work requires its review/dependency structure, not merely because several files change.
 
 ### Baseline: separating pre-existing failures from regressions
 
@@ -622,6 +679,7 @@ The default plugin function accepts `(context, options)`. Supported options are 
 | --- | --- | --- |
 | `enabled` | `true` | Boolean; false returns no hooks |
 | `setDefaultAgent` | `false` | Boolean; true selects `graph-orchestrator` |
+| `executionStrategy` | `"auto"` | `"auto"` prefers Direct for bounded, mechanically verifiable tasks; `"graph"` retains the Graph/light workflow |
 | `models` | `{}` | Map of seven full agent names to nonempty model strings, max 256 characters, no surrounding whitespace or control characters |
 | `toolPermissions` | `{ shared: {}, agents: {} }` | Shared and per-role allow/ask/deny rules for LSP and configured MCP namespaces; see above |
 | `maxAttempts` | `3` | Integer 1–20; enforced per-node attempt budget (including the first attempt) and the verification repair loop cap |

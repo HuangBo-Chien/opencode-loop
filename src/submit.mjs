@@ -11,6 +11,9 @@ import { assertSettlementCapacity, isUncertainEffect } from './runner.mjs';
 import { publishArtifact, validateRepairTargets, verificationFiles, repairSettlementPending } from './artifact-dependencies.mjs';
 import { validateTaskGraph, expandRunTokens, runToken, validateFileClaim } from './task-spec.mjs';
 import { readHandoff, handoffManifest, plannerHandoffConflict } from './artifact-handoffs.mjs';
+import { createDirectTools } from './direct-tools.mjs';
+import { captureWorkspace } from './direct-workspace.mjs';
+import { acceptDirect, directPending, validateDirectChange } from './direct.mjs';
 
 const z = tool.schema;
 const NOW = () => new Date().toISOString();
@@ -33,7 +36,7 @@ function artifactPathProblem(input) {
   return checked.ok ? null : checked.detail;
 }
 
-export function createSubmitTools({ store, runner, bindings, worktree, dispatches, accounting }) {
+export function createSubmitTools({ store, runner, bindings, worktree, dispatches, accounting, settings = {} }) {
   function runFor(context) {
     const binding = bindings.get(context.sessionID);
     if (!binding) return { error: rejected('NOT_GRAPH_SESSION', 'this session is not part of a graph run; work is dispatched by graph-orchestrator through native task') };
@@ -67,6 +70,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       if (wrong) return wrong;
       const located = runFor(context);
       if (located.error) return located.error;
+      if (located.state.mode === 'direct') return rejected('DIRECT_CONTRACT_ACTIVE', 'Root must settle and escalate Direct before submitting a Graph plan');
       if (Object.values(located.state.nodes).some((node) => node.state === 'RUNNING' && ['review', 'implement', 'verify'].includes(node.spec.kind))) {
         return rejected('RUN_BUSY', 'finish or recover in-flight review/implementation/verification before replacing the plan');
       }
@@ -158,11 +162,20 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         await store.saveRun(located.state);
         return reply(checked);
       }
-      const snapshot = await store.hashFiles(checked.claimed);
-      const result = runner.submitChange(located.state, { ...args, snapshot, now: NOW() });
+      let directResult;
+      if (located.state.mode === 'direct') {
+        let inventory;
+        try { inventory = await captureWorkspace(worktree, settings); }
+        catch (error) { return rejected('DIRECT_WORKSPACE_UNSUPPORTED', error.message); }
+        directResult = validateDirectChange(located.state, { ...located.binding, sessionId: context.sessionID }, args, inventory);
+        if (!directResult.ok) return reply(directResult);
+      }
+      const snapshot = directResult?.snapshot ?? await store.hashFiles(checked.claimed);
+      const result = runner.submitChange(located.state, { ...args, ...(directResult ? { checksRun: directResult.checks } : {}), snapshot, now: NOW() });
+      if (result.ok && directResult) acceptDirect(located.state, directResult, NOW());
       await store.saveRun(located.state);
       if (!result.ok) return reply(result);
-      return reply({ ok: true, changeVersion: result.version, next: 'verification follows' });
+      return reply({ ok: true, changeVersion: result.version, next: directResult ? 'runner acceptance recorded; stop and let host lifetime settle' : 'verification follows' });
     },
   });
 
@@ -353,7 +366,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         break;
       }
       if (!runId) return rejected('RUN_LIMIT', 'this session reached its successor-run limit');
-      await store.createRun({ runId, rootSessionId: state.rootSessionId, now: NOW(), request: null, requestCaptureCompleted: true });
+      await store.createRun({ runId, rootSessionId: state.rootSessionId, now: NOW(), request: null, requestCaptureCompleted: true, executionStrategy: settings.executionStrategy ?? 'graph' });
       state.successorRunId = runId;
       await store.saveRun(state);
       bindings.set(context.sessionID, { runId, agent: context.agent, nodeId: null, root: true });
@@ -457,7 +470,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
         break;
       }
       if (!runId) return rejected('RUN_LIMIT', 'this session reached its successor-run limit');
-      const created = await store.createRun({ runId, rootSessionId: state.rootSessionId, now: NOW(), request: null, requestCaptureCompleted: true });
+      const created = await store.createRun({ runId, rootSessionId: state.rootSessionId, now: NOW(), request: null, requestCaptureCompleted: true, executionStrategy: settings.executionStrategy ?? 'graph' });
       // Carry a bounded digest of the archived run into the successor so the
       // new explorer/planner start from its lessons (revalidation mandatory)
       // instead of re-deriving everything — and re-collecting the same
@@ -555,6 +568,7 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       const binding = bindings.get(context.sessionID);
       return binding ? dispatches.exclusive(binding.runId, () => {
         const state = store.getRun(binding.runId);
+        if (directPending(state) && name !== 'graph_inspect' && name !== 'graph_artifact_read') return rejected('DIRECT_EFFECT_PENDING', 'A Direct command is pending; wait for its durable result');
         if (store.fault?.(binding.runId) && name !== 'graph_inspect' && name !== 'graph_artifact_read' && name !== 'graph_run_resume') {
           return rejected('PERSISTENCE_FAILED', 'Infrastructure failure; stop new submissions. Owned host events can settle; use explicit recovery after settlement.');
         }
@@ -569,5 +583,5 @@ export function createSubmitTools({ store, runner, bindings, worktree, dispatche
       }) : definition.execute(args, context);
     },
   }]));
-  return Object.freeze({ tools: Object.freeze(tools) });
+  return Object.freeze({ tools: Object.freeze({ ...tools, ...createDirectTools({ store, runner, bindings, worktree, dispatches, settings }) }) });
 }

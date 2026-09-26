@@ -32,7 +32,7 @@ function validateRequestCapture(request, requestCaptureCompleted) {
   }
 }
 
-export function newRun({ runId, rootSessionId, now, request = null, requestCaptureCompleted = false }) {
+export function newRun({ runId, rootSessionId, now, request = null, requestCaptureCompleted = false, executionStrategy = 'graph' }) {
   if (typeof runId !== 'string' || !RUN_ID_PATTERN.test(runId)) throw new TypeError('Invalid run id');
   if (typeof rootSessionId !== 'string' || !RUN_ID_PATTERN.test(rootSessionId)) throw new TypeError('Invalid root session id');
   const initialRequest = request === null ? null : cleanJson(request);
@@ -44,6 +44,7 @@ export function newRun({ runId, rootSessionId, now, request = null, requestCaptu
     createdAt: now,
     updatedAt: now,
     mode: 'unknown',
+    executionStrategy,
     status: 'RUNNING',
     blockedReason: null,
     failReason: null,
@@ -65,6 +66,8 @@ export function sanitizeRun(state) {
   }
   else if (cleaned.schemaVersion !== SCHEMA_VERSION) throw new TypeError('Run state schema version mismatch');
   validateRequestCapture(cleaned.request, cleaned.requestCaptureCompleted);
+  if (cleaned.executionStrategy === undefined) cleaned = { ...cleaned, executionStrategy: 'graph' };
+  if (!['auto', 'graph'].includes(cleaned.executionStrategy)) throw new TypeError('Run state has invalid execution strategy');
   if (!RUN_STATUSES.includes(cleaned.status)) throw new TypeError('Run state has invalid status');
   for (const node of Object.values(cleaned.nodes ?? {})) {
     if (!NODE_STATES.includes(node.state)) throw new TypeError('Run state has invalid node state');
@@ -90,8 +93,8 @@ export function createRunStore({ worktree, stateDirectory = '.opencode-loop', on
     return join(runsDir, `${runFileKey(runId)}.json`);
   };
 
-  async function createRun({ runId, rootSessionId, now, request = null, requestCaptureCompleted = false, lifecycleVersion }) {
-    const state = newRun({ runId, rootSessionId, now, request, requestCaptureCompleted });
+  async function createRun({ runId, rootSessionId, now, request = null, requestCaptureCompleted = false, lifecycleVersion, executionStrategy }) {
+    const state = newRun({ runId, rootSessionId, now, request, requestCaptureCompleted, executionStrategy });
     if (lifecycleVersion === 1) state.lifecycleVersion = 1;
     if (memory.has(runId) || creating.has(runId) || releasing.has(runId)) throw new Error(`Run ${runId} is locked by an existing registration or lifecycle operation`);
     // Defer I/O until the creation reservation is visible to other callers.

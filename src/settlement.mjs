@@ -1,6 +1,7 @@
 // Finite, programmatic host settlement. This controller never dispatches work.
 import { randomUUID } from 'node:crypto';
 import { unresolvedEffects } from './effect-resolution.mjs';
+import { captureWorkspace } from './direct-workspace.mjs';
 
 export function settlementBlockers(state) {
   const blockers = [];
@@ -16,7 +17,7 @@ export function settlementBlockers(state) {
   return blockers;
 }
 
-export function createSettlementController({ store, exclusive, reconcile, timeoutMs = 30000,
+export function createSettlementController({ store, exclusive, reconcile, timeoutMs = 30000, worktree, stateDirectory = '.opencode-loop',
   clock = () => performance.now(), schedule = setTimeout, cancel = clearTimeout } = {}) {
   const runs = new Map();
   let closed = false;
@@ -67,6 +68,17 @@ export function createSettlementController({ store, exclusive, reconcile, timeou
       const blockers = settlementBlockers(state);
       if (reconciliationFailed) blockers.push('host reconciliation unavailable');
       let evidenceChanged = false;
+      if (!blockers.length && state.mode === 'direct' && clock() < deadline) {
+        let timer;
+        try {
+          const inventory = await Promise.race([captureWorkspace(worktree, { stateDirectory }), new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('Direct revision deadline')), Math.max(1, Math.ceil(deadline - clock())));
+          })]);
+          evidenceChanged = inventory.revision !== state.direct?.acceptedRevision;
+        } catch { evidenceChanged = true; }
+        finally { clearTimeout(timer); }
+        if (evidenceChanged) blockers.push('accepted workspace revision changed or unavailable');
+      }
       if (!blockers.length && clock() < deadline) {
         const snapshots = Object.values(state.artifacts).filter(a => a.status === 'valid').map(a => a.snapshot ?? {});
         const files = [...new Set(snapshots.flatMap(Object.keys))];

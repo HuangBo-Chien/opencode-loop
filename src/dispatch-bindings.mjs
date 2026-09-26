@@ -264,6 +264,10 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
       if (store.fault?.(root.runId)) return denied('PERSISTENCE_FAILED', 'infrastructure failure; stop new work and recover explicitly after settlement');
       const state = store.getRun(root.runId);
       if (!state) return denied('RUN_GONE', 'owning run is unavailable');
+      if ((state.pendingEffects ?? []).some(e => e.tool === 'graph_direct_check')) return denied('DIRECT_EFFECT_PENDING', 'Direct command must settle before any dispatch or continuation');
+      if (state.mode === 'direct' && (agent !== 'graph-implementer' || (state.direct?.failures ?? 0) >= runner.maxAttempts)) return denied('DIRECT_CONTRACT_ACTIVE', 'Direct contract or failure budget requires root escalation after settlement');
+      const preContract = state.executionStrategy === 'auto' && state.mode === 'unknown';
+      if (preContract && (state.preContractDispatches ?? 0) >= runner.maxAttempts) return denied('EXPLORATION_BUDGET_EXHAUSTED', 'Free exploration budget exhausted; freeze Direct contract or explicitly select Graph');
       const rootSessionId = state.rootSessionId;
       if (bindings.get(callerSessionId) !== root || nested && (!NESTED_CALLERS.has(root.agent) || !current(root))) {
         return denied('BINDING_UNAVAILABLE', 'nested consultation requires an active authenticated specialist dispatch');
@@ -283,14 +287,17 @@ export function createDispatchBindings({ store, runner, bindings, client, getSub
       const turnToken = randomUUID();
       const used = state.dispatchCallIds ?? [];
       const previousCallIds = state.dispatchCallIds;
+      const previousExploration = state.preContractDispatches;
       const previousBinding = args.task_id ? bindings.get(args.task_id) : null;
       const recordDispatch = () => {
         state.dispatchCallIds = [...used, recordKey];
+        if (preContract) state.preContractDispatches = (state.preContractDispatches ?? 0) + 1;
         const record = records.get(recordKey);
         record.targetSource = targetSource === 'none' && record.autoResolved ? 'unique-admissible' : targetSource;
       };
       const failedReservation = () => {
         records.delete(recordKey);
+        if (previousExploration === undefined) delete state.preContractDispatches; else state.preContractDispatches = previousExploration;
         if (previousCallIds) state.dispatchCallIds = previousCallIds; else delete state.dispatchCallIds;
         if (previousBinding) bindings.set(args.task_id, previousBinding);
         return denied('DISPATCH_PERSISTENCE_FAILED', 'could not durably reserve task and settlement headroom; inspect storage/capacity');

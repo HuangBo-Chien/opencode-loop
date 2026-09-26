@@ -76,7 +76,16 @@ const navigationByRole = {
 export function createAgentPrompt(name, options) {
   if (!Object.hasOwn(roles, name)) throw new Error(`Unknown graph agent: ${name}`);
   const consult = Object.hasOwn(navigationByRole, name);
-  const role = consult ? roles[name](options).replaceAll('或派遣代理', '').replaceAll('或自行派遣', '').replaceAll('不得派遣代理', '只可派遣 graph-multimodal 做圖片諮詢') : roles[name](options);
+  let role = consult ? roles[name](options).replaceAll('或派遣代理', '').replaceAll('或自行派遣', '').replaceAll('不得派遣代理', '只可派遣 graph-multimodal 做圖片諮詢') : roles[name](options);
+  if (name === 'graph-orchestrator' && options.executionStrategy !== 'graph') role = role.replace(/^分流規則:.*$/m,
+    '分流規則:auto 預設 prefer Direct for eligible bounded changes. 唯讀問題以 graph-explorer(必要時 graph-multimodal)根據證據回答,不進入實作流程。可由一位 implementer 在明確字面檔案範圍內完成、具可執行驗收命令的工作,先 graph_direct_start 凍結契約再派遣 nodeId direct;跨檔本身不要求 Graph。需要獨立審查、真正多工作包分解、無法界定範圍或不支援 workspace inventory 時,以及使用者明確要求 Graph 時,以 graph_direct_escalate 記錄理由後走 graph-explorer → graph-planner → graph-plan-critic → graph-implementer → graph-verifier。Graph 小修正仍可 intent="light" 免 critic;其他 Graph 審查與依賴閘門照常。Direct 不建立 planner、critic、verifier 或偽造 plan artifact。');
+  if (name === 'graph-implementer') role = role
+    .replace('依協調者交付的已審查計畫實作最小必要變更', '依 runner 正式派遣契約(Graph 使用核可計畫,Direct 使用 direct-contract)實作最小必要變更')
+    .replace('bash 預設被 runner 阻擋(檢查留給 verifier)', '原生 bash 預設被 runner 阻擋(Graph 檢查留給 verifier,Direct 檢查使用 graph_direct_check)')
+    .replace('是核可計畫驗收條件的逐字工作契約', '是核可計畫或 Direct contract 驗收條件的逐字工作契約');
   const guidance = consult ? '\n需要圖片判讀時,可用 native task 僅派遣 graph-multimodal,提供來源與問題,不得帶 nodeId 標記。這是不綁定節點的諮詢,不取得 analyze 節點、不提交 findings;你仍負責自己的 graph_submit_*。全 run 固定最多一個巢狀諮詢,與普通 reader 容量分開。容量拒絕時不可 spin 或等待自己,改用已知證據或回報限制。task_id 只可續接本 session 同一 dispatch generation 的諮詢。' : '';
-  return `你是 ${name}。\n${shared}\n\n${codeNavigation}\n${navigationByRole[name] ?? ''}\n\n${role}${guidance}\n\n${handoffs}`;
+  const direct = name === 'graph-orchestrator' && options.executionStrategy !== 'graph'
+    ? '\nDirect route: executionStrategy auto lets the root choose graph_direct_start for one bounded implementation with explicit requirement, acceptance, literal file writeScope, deliverables, mandatory foreground checks [{id,command,cwd,timeoutMs}], and rationale. Freeze this contract before writing or dispatching graph-implementer nodeId direct. No planner, critic or verifier is needed for Direct: runner checks evidence and settlement. Select graph_direct_escalate({rationale}) for complex work or unsupported inventory. Free exploration is bounded. Root alone may revise a settled Direct contract with graph_direct_start; original baseline, evidence and counters remain. Never spawn extra roles inside an active Direct contract.'
+    : name === 'graph-implementer' ? '\nWhen dispatched nodeId direct, use the exact direct-contract handoff. Make edits within its literal file scope, execute every frozen check via graph_direct_check({checkId}), then graph_submit_change with complete claims/deletions and no unresolved items. Only runner-owned current check evidence counts. A complete failed check returns to this same session for bounded repair; do not replay pending/uncertain execution. Re-run checks after edits or check-created outputs. Commands must finish in foreground; background/daemon work is unsupported. Escalation or scope changes belong to root after your host lifetime settles.' : '';
+  return `你是 ${name}。\n${shared}\n\n${codeNavigation}\n${navigationByRole[name] ?? ''}\n\n${role}${guidance}${direct}\n\n${handoffs}`;
 }

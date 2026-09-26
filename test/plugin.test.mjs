@@ -104,6 +104,9 @@ test('registers exactly seven runner-gated agents, preserving native definitions
   assert.deepEqual(Object.keys(hooks).sort(), ['chat.message', 'config', 'event', 'permission.ask', 'tool', 'tool.definition', 'tool.execute.after', 'tool.execute.before']);
   assert.deepEqual(Object.keys(hooks.tool).sort(), [
     'graph_artifact_read',
+    'graph_direct_check',
+    'graph_direct_escalate',
+    'graph_direct_start',
     'graph_inspect',
     'graph_journal_promote',
     'graph_journal_read',

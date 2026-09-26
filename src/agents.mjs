@@ -3,11 +3,11 @@ import { createAgentPrompt } from './prompts.mjs';
 import { resolveToolPermissions, validateMcpToolPermissions } from './tool-permissions.mjs';
 
 const SUBMIT_TOOL_BY_AGENT = Object.freeze({
-  'graph-orchestrator': ['graph_run_resume', 'graph_run_new', 'graph_run_decide'],
+  'graph-orchestrator': ['graph_run_resume', 'graph_run_new', 'graph_run_decide', 'graph_direct_start', 'graph_direct_escalate'],
   'graph-explorer': ['graph_submit_findings'],
   'graph-planner': ['graph_submit_plan'],
   'graph-plan-critic': ['graph_submit_review'],
-  'graph-implementer': ['graph_submit_change'],
+  'graph-implementer': ['graph_submit_change', 'graph_direct_check'],
   'graph-verifier': ['graph_submit_verification'],
   'graph-multimodal': ['graph_submit_findings'],
 });

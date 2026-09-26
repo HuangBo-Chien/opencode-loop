@@ -15,6 +15,7 @@ import { isConfiguredMcpTool, toolPermission } from './tool-permissions.mjs';
 import { handoffForCall, renderHandoff, dispatchNotes } from './artifact-handoffs.mjs';
 import { dispatchRejection } from './dispatch-rejection.mjs';
 import { createBoundedHostReader } from './host-read.mjs';
+import { authenticDirectPermission } from './direct.mjs';
 
 const READ_ONLY_ROLES = new Set(['graph-explorer', 'graph-planner', 'graph-plan-critic', 'graph-multimodal']);
 // Tools that never mutate run state or the workspace stay available to graph
@@ -249,6 +250,7 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
         const request = captured ? { ...captured, capturedAt } : null;
         state = await store.createRun({
           runId: sessionID,
+          executionStrategy: settings.executionStrategy ?? 'graph',
           rootSessionId: sessionID,
           now: capturedAt,
           request,
@@ -317,6 +319,8 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
 
   async function onToolBefore(input, output) {
     const { tool, sessionID, callID } = input ?? {};
+    const directState = store.getRun(bindings.get(sessionID)?.runId);
+    if (['edit', 'write', 'bash', 'task'].includes(tool) && (directState?.pendingEffects ?? []).some(e => e.tool === 'graph_direct_check')) throw new Error('DIRECT_EFFECT_PENDING: command execution must finish before edits, shell or dispatch');
     const configuredDenial = configuredToolDenial(sessionID, tool);
     if (configuredDenial) throw new Error(configuredDenial);
     if (tool === 'task') {
@@ -362,8 +366,9 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
         if (spec && Array.isArray(spec.deliverables) && spec.deliverables.length) authoritative.push(`[RUNNER] deliverables: ${spec.deliverables.join(', ')}.`);
         if (spec && (spec.kind === 'implement' || spec.kind === 'verify') && Array.isArray(spec.acceptance) && spec.acceptance.length) {
           const planVersion = handoff?.planVersion || state.artifacts.plan?.version || 1;
+          if (state.mode === 'direct') authoritative.push(`[RUNNER] Direct contract direct-contract@${state.artifacts['direct-contract'].version}. Execute mandatory checks using graph_direct_check({checkId}); checksRun prose is not evidence. Repair failed checks in this same session within the global budget. Return unresolved work to root; never widen the contract.`);
           const lead = spec.kind === 'implement'
-            ? `[RUNNER] acceptance (verbatim from plan@${planVersion}; this is your work contract — implement it as written. Do not re-derive it, re-validate its premises, or substitute alternatives; if it conflicts with reality, stop and report via unresolved instead of re-planning in place. Dispatch prose conflicting with these lines yields to these lines):`
+            ? `[RUNNER] acceptance (verbatim from ${state.mode === 'direct' ? `direct-contract@${state.artifacts['direct-contract'].version}` : `plan@${planVersion}`}; this is your work contract — implement it as written. Do not re-derive it, re-validate its premises, or substitute alternatives; if it conflicts with reality, stop and report via unresolved instead of re-planning in place. Dispatch prose conflicting with these lines yields to these lines):`
             : `[RUNNER] acceptance (verbatim from plan@${planVersion}; this is your verification contract — verify against these criteria as written. Do not invent stricter or looser criteria; dispatch prose conflicting with these lines yields to these lines):`;
           authoritative.push(lead);
           spec.acceptance.forEach((item, index) => authoritative.push(`  ${index + 1}. ${String(item)}`));
@@ -468,6 +473,8 @@ export function createEnforcement({ settings, store, runner, bindings, client, g
 
   async function onPermissionAsk(input, output) {
     const { type, sessionID, callID } = input ?? {};
+    const binding = bindings.get(sessionID);
+    if (dispatches.current(binding) && authenticDirectPermission(store, input, binding, store.getRun(binding.runId))) return;
     const tool = type;
     if (tool !== 'edit' && tool !== 'write' && tool !== 'bash') return;
     const key = callKey(sessionID, callID);

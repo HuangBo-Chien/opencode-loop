@@ -125,6 +125,7 @@ export function createStatusTool(options, journalService, lessonService = null, 
       return JSON.stringify({
         package: 'opencode-loop', version,
         workflowMode: 'gated',
+        executionStrategy: options.executionStrategy ?? 'auto',
         enforcement: 'tool-execute-hooks',
         enforcementScope: 'GRAPH_MANAGED_SESSIONS',
         dispatch: { taskSchema: getTaskSchema(), rejectionMode: 'tool-error-before-child', targetField: 'nodeId' },

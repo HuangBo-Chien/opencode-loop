@@ -64,10 +64,10 @@ export default async function GraphPlugin(context, options = {}) {
   const getToolPermissions = () => toolPermissions;
   const getSubagentDepth = () => hostConfig?.subagent_depth ?? 1;
   const taskDefinition = createTaskDefinitionHook();
-  const enforcement = createEnforcement({ settings: { worktree, journal: settings.journal, lessons: settings.lessons }, store, runner, bindings, client: context.client, lessons: lessonService, getToolPermissions, getSubagentDepth });
+  const enforcement = createEnforcement({ settings: { ...settings, worktree }, store, runner, bindings, client: context.client, lessons: lessonService, getToolPermissions, getSubagentDepth });
   const settlement = createSettlementController({ store, exclusive: enforcement.dispatches.exclusive,
-    reconcile: enforcement.reconcileSettlement, timeoutMs: settings.settlementTimeoutMs });
-  const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches, accounting });
+    reconcile: enforcement.reconcileSettlement, timeoutMs: settings.settlementTimeoutMs, worktree, stateDirectory: settings.stateDirectory });
+  const { tools } = createSubmitTools({ store, runner, bindings, worktree, dispatches: enforcement.dispatches, accounting, settings });
   const journalTools = createJournalTools({
     journalService,
     store,
